@@ -16,6 +16,7 @@ use crate::index::{self, Index, Location};
 use crate::options::{Fsync, Options};
 use crate::rebuild::Rebuilt;
 use crate::recover;
+use crate::replicate::{self, Chunk};
 use crate::retain::{self, Retained};
 use crate::segment::{self, SegmentWriter};
 use crate::subscribe::Subscription;
@@ -90,6 +91,10 @@ pub(crate) struct Inner {
     pub(crate) head: AtomicU64,
     /// Base of the first kept segment; positions below it were dropped.
     pub(crate) floor: AtomicU64,
+    /// The database's identity; replicas and backups carry it.
+    pub(crate) db_id: Mutex<Uuid>,
+    /// The fencing epoch a leader writes under.
+    pub(crate) epoch: AtomicU64,
     /// Serialises backup and retention against each other. Writers never
     /// take it.
     pub(crate) maintenance: Mutex<()>,
@@ -138,6 +143,9 @@ impl Db {
             }
             (index, 0, 0, writer)
         };
+        // Databases written before identities existed get one here.
+        let db_id = index.ensure_db_id()?;
+        let epoch = index.epoch()?;
 
         Ok(Db {
             inner: Arc::new(Inner {
@@ -147,6 +155,8 @@ impl Db {
                 writer: Mutex::new(writer),
                 head: AtomicU64::new(head),
                 floor: AtomicU64::new(floor),
+                db_id: Mutex::new(db_id),
+                epoch: AtomicU64::new(epoch),
                 maintenance: Mutex::new(()),
                 head_watch: (Mutex::new(head), Condvar::new()),
                 #[cfg(feature = "tokio")]
@@ -177,6 +187,72 @@ impl Db {
         self.inner.floor.load(Ordering::Acquire)
     }
 
+    /// The database's identity: minted when it was created, carried by
+    /// its backups, shared by its replicas.
+    pub fn id(&self) -> Uuid {
+        *self.inner.db_id.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The fencing epoch (0 until a promotion). Daemons compare it with
+    /// the epoch a writer sends; the library only stores it.
+    pub fn epoch(&self) -> u64 {
+        self.inner.epoch.load(Ordering::Acquire)
+    }
+
+    /// Durably sets the epoch.
+    pub fn set_epoch(&self, epoch: u64) -> Result<()> {
+        self.inner.index.set_epoch(epoch)?;
+        self.inner.epoch.store(epoch, Ordering::Release);
+        Ok(())
+    }
+
+    /// Makes an empty database take on another's identity, so it can
+    /// replicate from it. [`Error::NotEmpty`] once anything was written.
+    pub fn adopt_id(&self, id: Uuid) -> Result<()> {
+        let _w = self.inner.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let head = self.head();
+        if head != 0 || self.floor() != 0 {
+            return Err(Error::NotEmpty { head });
+        }
+        self.inner.index.set_db_id(id)?;
+        *self.inner.db_id.lock().unwrap_or_else(|p| p.into_inner()) = id;
+        Ok(())
+    }
+
+    /// The stored crc32 of the record at `position`: a cheap way for two
+    /// copies of a database to check they hold the same history up to
+    /// there. `None` past the head or below the floor.
+    pub fn fingerprint(&self, position: u64) -> Result<Option<u32>> {
+        let Some(loc) = self.inner.index.locate(position)? else {
+            return Ok(None);
+        };
+        let path = self.inner.layout.segment(loc.base);
+        let file = self.inner.file(loc.base)?;
+        let frame = segment::read_bytes_at(&file, &path, loc.offset, segment::FRAME_LEN)?;
+        Ok(Some(u32::from_be_bytes(frame[4..8].try_into().unwrap())))
+    }
+
+    /// The next chunk a replica at `from` should apply: whole transactions
+    /// from `from` on, at least one and about `max_events` events (a single
+    /// longer transaction is sent whole). `None` when `from` is the head.
+    pub fn replication_chunk(&self, from: u64, max_events: usize) -> Result<Option<Chunk>> {
+        replicate::chunk(&self.inner, from, max_events)
+    }
+
+    /// Appends a chunk taken from another copy of this database. `from`
+    /// must be the head ([`Error::ReplicationGap`] otherwise); returns the
+    /// new head, which is `to`.
+    pub fn apply_chunk(&self, from: u64, to: u64, frames: &[u8]) -> Result<u64> {
+        replicate::apply(&self.inner, from, to, frames)
+    }
+
+    /// Removes the identity: the state of a database written before
+    /// identities existed. For tests of the upgrade path; reopen after.
+    #[doc(hidden)]
+    pub fn debug_forget_id(&self) -> Result<()> {
+        self.inner.index.forget_db_id()
+    }
+
     /// Head, floor, and what the segment directory holds.
     pub fn info(&self) -> Result<Info> {
         let dir = self.inner.layout.segments_dir();
@@ -192,6 +268,8 @@ impl Db {
             floor: self.floor(),
             segments: listed.len(),
             bytes,
+            db_id: self.id(),
+            epoch: self.epoch(),
         })
     }
 
@@ -567,6 +645,8 @@ pub struct Info {
     pub segments: usize,
     /// Bytes those files take.
     pub bytes: u64,
+    pub db_id: Uuid,
+    pub epoch: u64,
 }
 
 impl Inner {

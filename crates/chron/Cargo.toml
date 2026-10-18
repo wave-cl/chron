@@ -13,7 +13,7 @@ tokio = ["dep:tokio"]
 
 [dependencies]
 redb = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
 bytes = { workspace = true }
 crc32fast = { workspace = true }
 thiserror = { workspace = true }

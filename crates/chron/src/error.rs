@@ -83,6 +83,23 @@ pub enum Error {
         head: u64,
     },
 
+    /// `adopt_id` on a database that already holds events.
+    #[error("the database is not empty (head {head}); only an empty one can adopt an identity")]
+    NotEmpty { head: u64 },
+
+    /// A replication chunk that does not start at the head.
+    #[error("replication chunk starts at {from} but the head is {head}")]
+    ReplicationGap { from: u64, head: u64 },
+
+    /// Data from another database: a backup or chunk whose identity is
+    /// not this database's.
+    #[error("{what} is from database {theirs}; this is database {ours}")]
+    WrongDatabase {
+        what: String,
+        theirs: Uuid,
+        ours: Uuid,
+    },
+
     /// The redb index failed.
     #[error("index: {0}")]
     Index(#[from] redb::Error),

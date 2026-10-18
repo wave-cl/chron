@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use crate::db::{Layout, Lock};
 use crate::error::{Error, Result};
-use crate::index::{AGG_INDEX, AGG_LEN, FLOOR_KEY, HEAD_KEY, Index, META, POS, TAG};
+use crate::index::{
+    AGG_INDEX, AGG_LEN, DB_ID_KEY, FLOOR_KEY, HEAD_KEY, Index, META, META_BYTES, POS, TAG,
+};
 use crate::options::{Fsync, Options};
 use crate::recover::{Item, Records};
 use crate::segment;
@@ -95,7 +97,26 @@ fn validated_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     Ok(out)
 }
 
+/// Where the rebuilt index's identity comes from.
+enum IdSource {
+    /// The existing index's identity, if it has one.
+    Existing,
+    /// This one; `None` lets the next open mint a fresh identity.
+    Given(Option<Uuid>),
+}
+
+/// Rebuilds, keeping the identity the existing index holds (if any).
 pub(crate) fn rebuild(path: &Path, opts: &Options) -> Result<Rebuilt> {
+    rebuild_from(path, opts, IdSource::Existing)
+}
+
+/// Rebuilds, writing `id` as the identity when given; without one the
+/// next open mints a fresh identity.
+pub(crate) fn rebuild_with_id(path: &Path, opts: &Options, id: Option<Uuid>) -> Result<Rebuilt> {
+    rebuild_from(path, opts, IdSource::Given(id))
+}
+
+fn rebuild_from(path: &Path, opts: &Options, id: IdSource) -> Result<Rebuilt> {
     let layout = Layout::new(path);
     let dir = layout.segments_dir();
     fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, "mkdir", e))?;
@@ -106,6 +127,21 @@ pub(crate) fn rebuild(path: &Path, opts: &Options) -> Result<Rebuilt> {
         fs::remove_file(&tmp).map_err(|e| Error::io(&tmp, "remove", e))?;
     }
     let segments = validated_segments(&dir)?;
+    // Only after the segments passed: opening the old index may rewrite
+    // its file, and a refused rebuild must leave it untouched.
+    let id = match id {
+        IdSource::Given(id) => id,
+        IdSource::Existing => {
+            let index_file = layout.index_file();
+            if index_file.exists() {
+                Index::open(&index_file, Fsync::Never)
+                    .and_then(|i| i.db_id())
+                    .unwrap_or(None)
+            } else {
+                None
+            }
+        }
+    };
 
     let index = Index::create(&tmp, Fsync::Never)?;
     let mut lens: HashMap<Uuid, u64> = HashMap::new();
@@ -219,6 +255,15 @@ pub(crate) fn rebuild(path: &Path, opts: &Options) -> Result<Rebuilt> {
         let mut meta = txn.open_table(META)?;
         meta.insert(HEAD_KEY, head)?;
         meta.insert(FLOOR_KEY, floor)?;
+        let mut bytes = txn.open_table(META_BYTES)?;
+        match id {
+            Some(id) => {
+                bytes.insert(DB_ID_KEY, id.as_bytes().as_slice())?;
+            }
+            None => {
+                bytes.remove(DB_ID_KEY)?;
+            }
+        }
     }
     txn.commit()?;
     drop(index);

@@ -22,6 +22,12 @@ pub(crate) const AGG_INDEX: TableDefinition<(&[u8; 16], u64), u64> =
 pub(crate) const POS: TableDefinition<u64, (u64, u64, u32)> = TableDefinition::new("pos");
 /// (tag, position) → ().
 pub(crate) const TAG: TableDefinition<(&[u8], u64), ()> = TableDefinition::new("tag");
+/// Byte-valued metadata: `"db_id"` → the database's 16-byte identity.
+pub(crate) const META_BYTES: TableDefinition<&str, &[u8]> = TableDefinition::new("meta_bytes");
+
+pub(crate) const DB_ID_KEY: &str = "db_id";
+/// `"epoch"` → the fencing epoch; absent means 0.
+pub(crate) const EPOCH_KEY: &str = "epoch";
 
 pub(crate) const HEAD_KEY: &str = "head";
 /// `"floor"` → base of the first kept segment; absent means 0.
@@ -98,7 +104,13 @@ impl Index {
         };
         let txn = index.begin_write_durable()?;
         {
-            txn.open_table(META)?.insert(HEAD_KEY, 0)?;
+            {
+                let mut meta = txn.open_table(META)?;
+                meta.insert(HEAD_KEY, 0)?;
+                meta.insert(EPOCH_KEY, 0)?;
+            }
+            txn.open_table(META_BYTES)?
+                .insert(DB_ID_KEY, Uuid::new_v4().as_bytes().as_slice())?;
             txn.open_table(AGG_LEN)?;
             txn.open_table(AGG_INDEX)?;
             txn.open_table(POS)?;
@@ -139,6 +151,63 @@ impl Index {
             .open_table(META)?
             .get(HEAD_KEY)?
             .map_or(0, |v| v.value()))
+    }
+
+    /// The database's identity, if this index has one (indexes written
+    /// before identities existed have none).
+    pub(crate) fn db_id(&self) -> Result<Option<Uuid>> {
+        let txn = self.begin_read()?;
+        let table = match txn.open_table(META_BYTES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(table
+            .get(DB_ID_KEY)?
+            .and_then(|v| <[u8; 16]>::try_from(v.value()).ok())
+            .map(Uuid::from_bytes))
+    }
+
+    /// The identity, minting and durably storing one if absent.
+    pub(crate) fn ensure_db_id(&self) -> Result<Uuid> {
+        if let Some(id) = self.db_id()? {
+            return Ok(id);
+        }
+        let id = Uuid::new_v4();
+        self.set_db_id(id)?;
+        Ok(id)
+    }
+
+    pub(crate) fn set_db_id(&self, id: Uuid) -> Result<()> {
+        let txn = self.begin_write_durable()?;
+        txn.open_table(META_BYTES)?
+            .insert(DB_ID_KEY, id.as_bytes().as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Removes the identity: the state of an index written before
+    /// identities existed. For tests.
+    pub(crate) fn forget_db_id(&self) -> Result<()> {
+        let txn = self.begin_write_durable()?;
+        txn.open_table(META_BYTES)?.remove(DB_ID_KEY)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn epoch(&self) -> Result<u64> {
+        let txn = self.begin_read()?;
+        Ok(txn
+            .open_table(META)?
+            .get(EPOCH_KEY)?
+            .map_or(0, |v| v.value()))
+    }
+
+    pub(crate) fn set_epoch(&self, epoch: u64) -> Result<()> {
+        let txn = self.begin_write_durable()?;
+        txn.open_table(META)?.insert(EPOCH_KEY, epoch)?;
+        txn.commit()?;
+        Ok(())
     }
 
     pub(crate) fn floor(&self) -> Result<u64> {
@@ -304,6 +373,23 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let i = Index::create(&d.path().join("index.redb"), Fsync::Never).unwrap();
         (d, i)
+    }
+
+    #[test]
+    fn identity_and_epoch_persist_and_upgrade() {
+        let (d, i) = index();
+        let id = i.db_id().unwrap().unwrap();
+        assert_eq!(i.ensure_db_id().unwrap(), id);
+        assert_eq!(i.epoch().unwrap(), 0);
+        i.set_epoch(7).unwrap();
+        i.forget_db_id().unwrap();
+        drop(i);
+        let i = Index::open(&d.path().join("index.redb"), Fsync::Never).unwrap();
+        assert_eq!(i.db_id().unwrap(), None);
+        assert_eq!(i.epoch().unwrap(), 7);
+        let minted = i.ensure_db_id().unwrap();
+        assert_ne!(minted, id);
+        assert_eq!(i.db_id().unwrap(), Some(minted));
     }
 
     #[test]

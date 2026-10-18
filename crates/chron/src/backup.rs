@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::db::{Inner, Layout};
 use crate::error::{Error, Result};
@@ -64,6 +65,9 @@ pub struct BackupMeta {
     /// Size of the archive file; 0 until it is complete.
     #[serde(default)]
     pub bytes: u64,
+    /// The identity of the database the archive came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_id: Option<Uuid>,
 }
 
 fn now_nanos() -> i64 {
@@ -257,6 +261,7 @@ pub(crate) fn write_full(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
         created_at_unix_nanos: now_nanos(),
         files: plan.segments.len() as u64,
         bytes: 0,
+        db_id: Some(*inner.db_id.lock().unwrap_or_else(|p| p.into_inner())),
     };
     let mut w = Writer::create(archive, &meta)?;
     for (base, path, len) in &plan.segments {
@@ -269,7 +274,7 @@ pub(crate) fn write_full(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
 }
 
 /// The frames of positions `from..to`, back to back.
-fn frames_between(inner: &Inner, from: u64, to: u64) -> Result<Vec<u8>> {
+pub(crate) fn frames_between(inner: &Inner, from: u64, to: u64) -> Result<Vec<u8>> {
     use std::os::unix::fs::FileExt;
     let mut out = Vec::new();
     if from >= to {
@@ -342,6 +347,7 @@ pub(crate) fn write_incremental(inner: &Inner, archive: &Path, since: u64) -> Re
         created_at_unix_nanos: now_nanos(),
         files: 1,
         bytes: 0,
+        db_id: Some(*inner.db_id.lock().unwrap_or_else(|p| p.into_inner())),
     };
     let mut w = Writer::create(archive, &meta)?;
     w.entry_header(KIND_RECORDS, "records", frames.len() as u64)?;
@@ -562,7 +568,7 @@ fn restore_into(
     }
     reader.finish()?;
     // The index last: a damaged archive never leaves a half-built database.
-    let rebuilt = rebuild::rebuild(staging, opts)?;
+    let rebuilt = rebuild::rebuild_with_id(staging, opts, meta.db_id)?;
     if rebuilt.head != meta.head || rebuilt.floor != meta.floor || rebuilt.dropped != 0 {
         return Err(Error::corrupt(
             staging,
@@ -604,6 +610,16 @@ pub(crate) fn apply(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
     let frames = frames.ok_or_else(|| Error::corrupt(archive, reader.at, "no records entry"))?;
     reader.finish()?;
 
+    let ours = *inner.db_id.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(theirs) = meta.db_id
+        && theirs != ours
+    {
+        return Err(Error::WrongDatabase {
+            what: archive.display().to_string(),
+            theirs,
+            ours,
+        });
+    }
     let _m = inner.maintenance.lock().unwrap_or_else(|p| p.into_inner());
     txn::import_frames(inner, archive, &frames, base_head, meta.head)?;
     Ok(meta)

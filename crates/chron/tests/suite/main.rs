@@ -10,6 +10,7 @@ mod reads;
 mod rebuild;
 mod recovery;
 mod reopen;
+mod replicate;
 mod retention;
 mod rotation;
 mod subscribe;

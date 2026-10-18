@@ -25,6 +25,7 @@ mod index;
 mod options;
 mod rebuild;
 mod recover;
+mod replicate;
 mod retain;
 mod segment;
 mod subscribe;
@@ -39,6 +40,7 @@ pub use event::{
 };
 pub use options::{Fsync, Options};
 pub use rebuild::Rebuilt;
+pub use replicate::Chunk;
 pub use retain::Retained;
 pub use subscribe::Subscription;
 pub use txn::{AppendResult, Committed, Expected, Transaction};
