@@ -285,12 +285,16 @@ fn tls_and_mtls_flags() {
     };
     let m = Daemon::start_with(move |o| o.tls = Some(tls));
     let paths = p2.write_to(m.dir.path());
+    // Without a client certificate the handshake fails after the connect;
+    // which status reports it depends on timing, so only the refusal is
+    // asserted.
     m.chron()
         .args(["--tls-ca"])
         .arg(&paths.ca)
         .args(["--tls-domain", "localhost", "head"])
         .assert()
-        .code(2);
+        .failure()
+        .stdout("");
     m.chron()
         .args(["--tls-ca"])
         .arg(&paths.ca)

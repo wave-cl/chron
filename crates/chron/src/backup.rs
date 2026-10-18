@@ -23,7 +23,7 @@ use crate::db::{Inner, Layout};
 use crate::error::{Error, Result};
 use crate::options::Options;
 use crate::rebuild;
-use crate::segment::{self, HEADER_LEN};
+use crate::segment::{self, HEADER_LEN, SegmentHeader};
 use crate::txn;
 
 const MAGIC: &[u8; 8] = b"CHRONBAK";
@@ -267,6 +267,13 @@ pub(crate) fn write_full(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
     for (base, path, len) in &plan.segments {
         let name = format!("segments/{}", segment::file_name(*base));
         w.entry_header(KIND_SEGMENT, &name, *len)?;
+        if *len == HEADER_LEN {
+            // A segment holding no committed record: the writer may have
+            // created the file and not yet written its header, so the
+            // header is produced here rather than read.
+            w.bytes(&SegmentHeader { base: *base }.encode())?;
+            continue;
+        }
         let file = inner.file(*base)?;
         w.copy_file(&file, path, *len)?;
     }
