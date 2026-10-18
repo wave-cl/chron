@@ -455,11 +455,13 @@ async fn promote_at_start_campaigns() {
     c.wait_following(f1, l, SOON).await;
     let head = fill(&c.client(l).await, 3).await;
     c.wait_heads(head, SOON).await;
+    let epoch = c.node(l).data_epoch();
     c.stop(f1).await;
     c.restart_with(f1, |o| o.promote = true).await;
-    Cluster::wait_until("the promoted node leading", SOON, || c.leader() == Some(f1)).await;
+    c.wait("the promoted node leading", SOON, || c.leader() == Some(f1))
+        .await;
     c.wait_following(l, f1, SOON).await;
-    assert_eq!(c.node(f1).data_epoch(), 2);
+    assert_eq!(c.node(f1).data_epoch(), epoch + 1);
     c.stop_all().await;
 }
 
@@ -545,7 +547,13 @@ async fn a_diverged_old_leader_cuts_back_and_rejoins() {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with("diverged-"))
             .collect();
-        assert_eq!(archives, ["diverged-1-5-8.chronbak"], "{archives:?}");
+        // The epoch in the name is the old leader's, whatever the
+        // initial election took.
+        assert_eq!(archives.len(), 1, "{archives:?}");
+        assert!(
+            archives[0].starts_with("diverged-") && archives[0].ends_with("-5-8.chronbak"),
+            "{archives:?}"
+        );
         let meta = chron::inspect_backup(dir.join(&archives[0])).unwrap();
         assert_eq!((meta.base_head, meta.head), (Some(5), 8));
         assert_eq!(c.node(l).data_epoch(), c.node(l2).data_epoch());
