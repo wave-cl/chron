@@ -6,6 +6,10 @@ crates share one version.
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.2.0 - 2026-10-18
+
 ### chron-db
 
 - Group commit: transactions committed concurrently are landed together
