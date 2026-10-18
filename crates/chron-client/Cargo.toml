@@ -1,0 +1,28 @@
+[package]
+name = "chron-client"
+description = "chron: a typed async client for chrond over gRPC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chron = { workspace = true }
+chron-proto = { workspace = true, features = ["convert"] }
+bytes = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true, features = ["tls-native-roots"] }
+tonic-health = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+chrond = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"

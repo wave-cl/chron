@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/chron", "crates/chron-proto", "crates/chrond", "crates/chron-cli"]
+members = [
+    "crates/chron",
+    "crates/chron-proto",
+    "crates/chrond",
+    "crates/chron-cli",
+    "crates/chron-client",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +19,7 @@ repository = "https://github.com/wave-cl/chron"
 chron = { path = "crates/chron" }
 chron-proto = { path = "crates/chron-proto" }
 chrond = { path = "crates/chrond" }
+chron-client = { path = "crates/chron-client" }
 
 redb = "4"
 uuid = "1"
