@@ -1,6 +1,6 @@
 [package]
 name = "chrond"
-description = "chron: the gRPC daemon serving one database"
+description = "chron: the gRPC daemon serving the databases under a data directory"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
