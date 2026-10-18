@@ -409,3 +409,94 @@ async fn a_leader_at_its_floor_accepts_a_replica_without_checking_the_fingerprin
     replica.stop().await;
     leader.stop().await;
 }
+
+/// Fence takes the write gate's write side, ApplyBackup its read side
+/// with the role check inside: a fence issued while an apply is in flight
+/// waits for it, and nothing applies after the fence returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_backup_racing_fence_never_lands_after_the_fence() {
+    let mut s = Server::start_with(with_backup_dir).await;
+    fill(&mut s.client, agg(1), 3).await;
+    s.client
+        .backup(pb::BackupRequest {
+            archive: "full.chronbak".into(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    // An incremental 3..5 from a restored copy, so this daemon (head 3)
+    // can apply it.
+    let backups = s.dir.path().join("backups");
+    let copy = s.dir.path().join("copy");
+    chron::restore_backup(backups.join("full.chronbak"), &copy, &chron::Options::new()).unwrap();
+    {
+        let db = chron::Db::open(&copy, chron::Options::new().fsync(chron::Fsync::Never)).unwrap();
+        let mut t = db.transaction();
+        t.append(
+            agg(1),
+            chron::Expected::Any,
+            vec![chron::NewEvent::new("four"), chron::NewEvent::new("five")],
+        );
+        t.commit().unwrap();
+        db.backup_since(backups.join("inc.chronbak"), 3).unwrap();
+    }
+
+    let pause = chrond::node::WritePause::new();
+    *s.running.as_ref().unwrap().node.write_pause.lock().unwrap() = Some(pause.clone());
+    // A failed assertion must not leave the apply parked on the barrier
+    // (the runtime would wait for it forever): release it on unwind.
+    struct Release(std::sync::Arc<chrond::node::WritePause>, bool);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if !self.1 {
+                let p = self.0.clone();
+                std::thread::spawn(move || p.proceed.wait());
+            }
+        }
+    }
+    let mut release = Release(pause.clone(), false);
+    let mut c = s.client.clone();
+    let apply = tokio::spawn(async move {
+        c.apply_backup(pb::ApplyBackupRequest {
+            archive: "inc.chronbak".into(),
+        })
+        .await
+    });
+    let p = pause.clone();
+    tokio::task::spawn_blocking(move || p.entered.wait())
+        .await
+        .unwrap();
+    // The apply has passed its role check and holds the gate. A fence
+    // issued now must wait for it.
+    let mut c = s.client.clone();
+    let fence = tokio::spawn(async move { c.fence(pb::FenceRequest { epoch: 1 }).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !fence.is_finished(),
+        "the fence waited for the apply in flight"
+    );
+    assert_eq!(s.info().await.role(), pb::Role::Leader);
+    release.1 = true;
+    let p = pause.clone();
+    tokio::task::spawn_blocking(move || p.proceed.wait())
+        .await
+        .unwrap();
+    let applied = apply.await.unwrap().unwrap().into_inner();
+    assert_eq!(applied.head, 5);
+    fence.await.unwrap().unwrap();
+    let info = s.info().await;
+    assert_eq!((info.role(), info.head), (pb::Role::Fenced, 5));
+    // After the fence nothing applies, in flight or new.
+    let head_after_fence = info.head;
+    let err = s
+        .client
+        .apply_backup(pb::ApplyBackupRequest {
+            archive: "inc.chronbak".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(err.message().contains("fenced"), "{}", err.message());
+    assert_eq!(s.info().await.head, head_after_fence);
+    s.stop().await;
+}

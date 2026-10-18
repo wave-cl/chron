@@ -52,6 +52,25 @@ pub const FENCED_MARKER: &str = "fenced";
 /// with `--replicate-from` or promoted.
 pub const REPLICA_MARKER: &str = "replica";
 
+/// A rendezvous for tests: the next guarded write signals `entered`
+/// after its role check, then waits for `proceed` before writing. Both
+/// are two-party barriers; the test is the other party.
+#[cfg(feature = "test-util")]
+pub struct WritePause {
+    pub entered: std::sync::Barrier,
+    pub proceed: std::sync::Barrier,
+}
+
+#[cfg(feature = "test-util")]
+impl WritePause {
+    pub fn new() -> Arc<WritePause> {
+        Arc::new(WritePause {
+            entered: std::sync::Barrier::new(2),
+            proceed: std::sync::Barrier::new(2),
+        })
+    }
+}
+
 /// How a replica reaches its leader.
 #[derive(Debug, Clone)]
 pub struct Upstream {
@@ -69,6 +88,9 @@ pub struct Node {
     /// Required on the administrative calls when set.
     pub admin_token: Option<Arc<[u8]>>,
     diverged_warned: Mutex<Option<Instant>>,
+    /// A test's pause inside the next guarded write (feature `test-util`).
+    #[cfg(feature = "test-util")]
+    pub write_pause: Mutex<Option<Arc<WritePause>>>,
     role: watch::Sender<Role>,
     /// Readers check the role and epoch and commit; writers flip the role.
     write_gate: RwLock<()>,
@@ -97,6 +119,8 @@ impl Node {
             backup_dir,
             admin_token: admin_token.map(|t| Arc::from(t.as_bytes())),
             diverged_warned: Mutex::new(None),
+            #[cfg(feature = "test-util")]
+            write_pause: Mutex::new(None),
             role: watch::Sender::new(Role::Leader),
             write_gate: RwLock::new(()),
             upstream,
@@ -259,6 +283,16 @@ impl Node {
         let _gate = self.write_gate.read().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = self.write_refusal() {
             return Err(s);
+        }
+        #[cfg(feature = "test-util")]
+        if let Some(p) = self
+            .write_pause
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            p.entered.wait();
+            p.proceed.wait();
         }
         f(&self.db)
     }
