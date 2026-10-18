@@ -3,14 +3,31 @@
 An event-sourcing database: a Rust library, a gRPC daemon, a typed client
 and a CLI.
 
-| Crate | What |
+| Crate (crates.io) | What |
 |---|---|
-| `chron` | the embeddable library |
+| `chron-db` | the embeddable library; its Rust name is `chron` (`use chron::Db`) |
 | `chron-proto` | the `chron.v1` gRPC contract and generated code |
 | `chrond` | the daemon: one database behind that service, as a leader or a replica |
 | `chron-client` | a typed async client in the library's vocabulary |
 | `chron-cli` | the `chron` binary: client and offline maintenance |
-| `examples/bank` | accounts as aggregates, embedded or through a daemon |
+| `examples/bank` | accounts as aggregates, embedded or through a daemon (not published) |
+
+## Install
+
+```
+cargo add chron-db                 # the library; code says `use chron::...`
+cargo add chron-client             # the client; no protoc needed
+cargo install chrond chron-cli     # the daemon and the `chron` binary
+```
+
+The crates.io name `chron` belongs to another crate, so the library is
+published as `chron-db` with its library target named `chron`. A project
+that also depends on that other `chron` renames one of them, for example
+`chron = { package = "chron-db", version = "0.1" }`. Prebuilt `chrond` and
+`chron` binaries for Linux (x86_64 and aarch64, static musl) and macOS
+(Apple silicon and Intel) are attached to each
+[GitHub Release](https://github.com/wave-cl/chron/releases) with a
+`SHA256SUMS` file.
 
 ## The library
 
@@ -348,21 +365,50 @@ record before it is gone; the leader accepts it without that check.
 
 ## Development
 
-`protoc` must be installed (`brew install protobuf` or
-`apt-get install protobuf-compiler`).
+The gRPC code generated from `crates/chron-proto/proto/chron/v1/chron.proto`
+is committed under `crates/chron-proto/src/generated/`, so building needs
+no `protoc`. After editing the `.proto`, regenerate with `protoc` installed
+(`brew install protobuf` or `apt-get install protobuf-compiler`):
+
+```
+CHRON_PROTO_REGEN=1 cargo build -p chron-proto
+```
+
+CI fails when the committed file does not match the `.proto`.
 
 ```
 cargo fmt --all --check
-cargo clippy -p chron --all-targets -- -D warnings                    # the library without features
+cargo clippy -p chron-db --all-targets -- -D warnings                 # the library without features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace --all-features --no-fail-fast
 cargo doc --workspace --no-deps                                       # warning-free; the library denies missing docs
-cargo bench -p chron   # criterion: append in both fsync modes, the three reads
+cargo bench -p chron-db   # criterion: append in both fsync modes, the three reads
 cargo run -p bank -- open alice   # the example: deposit <id> 50, withdraw, balances [--follow], history <id>; --addr for a daemon
 ```
 
-CI runs the first four on every push and pull request. The suite
-includes property tests against a model of the semantics, a crash test
-that kills a child process mid-commit and reopens, injected-failure
-tests for a commit that fails after writing, TLS and token tests against
-generated certificates, and replication tests with two daemons.
+CI runs the first four on every push and pull request, then
+`cargo package --workspace --locked` so the crates are known to package.
+The suite includes property tests against a model of the semantics, a
+crash test that kills a child process mid-commit and reopens,
+injected-failure tests for a commit that fails after writing, TLS and
+token tests against generated certificates, and replication tests with
+two daemons.
+
+### Releasing
+
+The workspace's crates share one version. Write the release notes under
+`## Unreleased` in `CHANGELOG.md`, then:
+
+```
+scripts/release.sh 0.2.0            # bumps, moves the changelog, runs the gate, commits, tags
+git push origin main && git push origin v0.2.0
+```
+
+`main` goes first so the tag's workflow finds its commit there. The tag
+triggers `.github/workflows/release.yml`: it checks the tag against the
+version, runs the gate, builds `chrond` and `chron` for the four targets,
+publishes the five crates to crates.io in dependency order (`cargo
+publish --workspace`, with the repository secret `CARGO_REGISTRY_TOKEN`:
+a crates.io token allowed to publish new and update crates, set once with
+`gh secret set CARGO_REGISTRY_TOKEN`), and creates the GitHub Release
+with the tarballs, `SHA256SUMS` and the changelog section as notes.

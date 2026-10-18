@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+keywords = ["event-sourcing", "event-store", "cli", "grpc"]
+categories = ["command-line-utilities", "database"]
 
 [[bin]]
 name = "chron"

@@ -168,8 +168,8 @@ name = "bank"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chron",
  "chron-client",
+ "chron-db",
  "chrond",
  "clap",
  "futures",
@@ -299,23 +299,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "chron"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "crc32fast",
- "criterion",
- "proptest",
- "redb",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "chron-cli"
 version = "0.1.0"
 dependencies = [
@@ -323,8 +306,8 @@ dependencies = [
  "assert_cmd",
  "base64",
  "bytes",
- "chron",
  "chron-client",
+ "chron-db",
  "chrond",
  "clap",
  "predicates",
@@ -341,7 +324,7 @@ name = "chron-client"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "chron",
+ "chron-db",
  "chron-proto",
  "chrond",
  "futures",
@@ -355,11 +338,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "chron-db"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "criterion",
+ "proptest",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "chron-proto"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "chron",
+ "chron-db",
  "prost",
  "tonic",
  "tonic-prost",
@@ -372,8 +372,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
- "chron",
  "chron-client",
+ "chron-db",
  "chron-proto",
  "clap",
  "http",

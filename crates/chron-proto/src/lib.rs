@@ -3,7 +3,10 @@
 
 pub mod v1 {
     #![allow(clippy::all, missing_docs)]
-    tonic::include_proto!("chron.v1");
+    // Generated from `proto/chron/v1/chron.proto` and committed, so no
+    // `protoc` is needed to build; `CHRON_PROTO_REGEN=1 cargo build -p
+    // chron-proto` regenerates it (see build.rs).
+    include!("generated/chron.v1.rs");
 }
 
 #[cfg(feature = "convert")]

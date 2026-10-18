@@ -6,6 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/chron-proto"
+keywords = ["event-sourcing", "grpc", "tonic", "protobuf"]
+categories = ["network-programming", "database"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 # Conversions between the wire types and the chron library's types.

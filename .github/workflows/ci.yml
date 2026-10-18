@@ -17,8 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+      # No protoc here on purpose: the generated gRPC code is committed,
+      # and this job proves nothing in the workspace needs the compiler.
       # cargo resolves rust-toolchain.toml (1.98.0, clippy, rustfmt) itself;
       # the version is printed so a green run shows what it checked with.
       - uses: dtolnay/rust-toolchain@stable
@@ -31,6 +32,26 @@ jobs:
       # The library on its own: a workspace build unifies the daemon's
       # `chron/tokio` onto it, so only a package-scoped build proves the
       # feature-less library compiles.
-      - run: cargo clippy -p chron --all-targets -- -D warnings
+      - run: cargo clippy -p chron-db --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo nextest run --workspace --all-features --no-fail-fast
+
+      # Every push proves the five crates package: readme paths, versions
+      # on path dependencies, stripped dev-dependencies.
+      - run: cargo package --workspace --locked
+      - name: the proto crate ships the .proto and the generated code
+        run: |
+          cargo package --list -p chron-proto | tee /tmp/proto-files
+          grep -q '^proto/chron/v1/chron.proto$' /tmp/proto-files
+          grep -q '^src/generated/chron.v1.rs$' /tmp/proto-files
+
+  # The committed generated code must match the .proto.
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: CHRON_PROTO_REGEN=1 cargo build -p chron-proto
+      - run: git diff --exit-code -- crates/chron-proto/src/generated

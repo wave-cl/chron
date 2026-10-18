@@ -1,0 +1,116 @@
+# A `vX.Y.Z` tag (made by scripts/release.sh, pushed after main) builds
+# the binaries, publishes the crates and creates the GitHub Release.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: the tag matches the workspace version
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^version = \"$v\"$" Cargo.toml; then
+            echo "tag $GITHUB_REF_NAME but Cargo.toml says: $(grep '^version = ' Cargo.toml)"
+            exit 1
+          fi
+          grep -q "^## $v " CHANGELOG.md || { echo "CHANGELOG.md has no section for $v"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p chron-db --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo nextest run --workspace --all-features --no-fail-fast
+
+  binaries:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked -p chrond -p chron-cli --target ${{ matrix.target }}
+      - name: smoke
+        run: |
+          out=target/${{ matrix.target }}/release
+          "$out/chron" --version
+          "$out/chrond" --version
+      - name: pack
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          name="chron-$v-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/chron" "target/${{ matrix.target }}/release/chrond" LICENSE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          ls -l "dist/$name.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # In dependency order: chron-db, chron-proto, chron-client, chrond,
+      # chron-cli (the bank example is publish = false).
+      - run: cargo publish --workspace --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums and notes
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          # The CHANGELOG section for this version: from its heading to the next.
+          awk -v v="$v" '/^## /{p = ($2 == v)} p' CHANGELOG.md > notes.md
+          test -s notes.md
+          cat notes.md
+      - run: gh release create "$GITHUB_REF_NAME" --title "chron ${GITHUB_REF_NAME#v}" --notes-file notes.md dist/*.tar.gz dist/SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}

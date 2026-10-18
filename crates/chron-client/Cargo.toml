@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/chron-client"
+keywords = ["event-sourcing", "event-store", "grpc", "client", "async"]
+categories = ["database", "asynchronous"]
 
 [dependencies]
 chron = { workspace = true }
@@ -19,7 +23,10 @@ tonic-health = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-chrond = { workspace = true, features = ["test-util"] }
+# A path-only dev-dependency (no version): cargo strips it from the
+# published manifest, which breaks the chrond -> chron-client -> chrond
+# cycle that a workspace publish could not order otherwise.
+chrond = { path = "../chrond", features = ["test-util"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 

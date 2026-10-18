@@ -1,11 +1,24 @@
 [package]
-name = "chron"
+name = "chron-db"
 description = "Embeddable event-sourcing log: append-only segments + redb indexes, multi-aggregate atomic transactions, tags"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/chron-db"
+keywords = ["event-sourcing", "event-store", "database", "append-only", "cqrs"]
+categories = ["database-implementations"]
+
+# The crates.io name `chron` is taken; the library target keeps the name
+# so code says `use chron::`.
+[lib]
+name = "chron"
+path = "src/lib.rs"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 # Async head notifications: `Db::wait_for_async`, `Subscription::next_async`.

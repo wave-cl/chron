@@ -17,10 +17,12 @@ license = "MIT"
 repository = "https://github.com/wave-cl/chron"
 
 [workspace.dependencies]
-chron = { path = "crates/chron" }
-chron-proto = { path = "crates/chron-proto" }
-chrond = { path = "crates/chrond" }
-chron-client = { path = "crates/chron-client" }
+# The library publishes as `chron-db` (the crates.io name `chron` is
+# taken); its library target is still `chron`, so code says `use chron::`.
+chron = { package = "chron-db", path = "crates/chron", version = "0.1.0" }
+chron-proto = { path = "crates/chron-proto", version = "0.1.0" }
+chrond = { path = "crates/chrond", version = "0.1.0" }
+chron-client = { path = "crates/chron-client", version = "0.1.0" }
 
 redb = "4"
 uuid = "1"
