@@ -4,6 +4,7 @@ mod backup;
 mod concurrency;
 mod crash;
 mod free;
+mod group_commit;
 mod limits;
 mod model;
 mod reads;

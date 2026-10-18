@@ -59,6 +59,51 @@ fn reads(c: &mut Criterion) {
     g.finish();
 }
 
+/// Eight threads committing one-event transactions to their own
+/// aggregates: what group commit is for. Wall time per transaction.
+fn append_concurrent(c: &mut Criterion) {
+    const THREADS: u64 = 8;
+    let mut g = c.benchmark_group("append-concurrent");
+    for (fsync, name) in [(Fsync::Never, "never"), (Fsync::Always, "always")] {
+        let (_dir, db) = db(fsync);
+        g.throughput(Throughput::Elements(1));
+        g.bench_with_input(BenchmarkId::new("8-threads", name), &db, |b, db| {
+            b.iter_custom(|iters| {
+                let per = iters.div_ceil(THREADS);
+                let start = std::time::Instant::now();
+                std::thread::scope(|s| {
+                    for t in 0..THREADS {
+                        let db = db.clone();
+                        s.spawn(move || {
+                            let agg = Uuid::from_u128(100 + u128::from(t));
+                            for i in 0..per {
+                                let mut txn = db.transaction();
+                                txn.append_one(agg, Expected::Any, event(i));
+                                txn.commit().unwrap();
+                            }
+                        });
+                    }
+                });
+                start.elapsed()
+            })
+        });
+        let st = db.stats();
+        eprintln!(
+            "append-concurrent/{name}: batches {} transactions {} events {} fsyncs {} mean fsync {:.1} us",
+            st.batches,
+            st.transactions,
+            st.events,
+            st.fsyncs,
+            if st.fsyncs > 0 {
+                st.fsync_nanos as f64 / st.fsyncs as f64 / 1000.0
+            } else {
+                0.0
+            }
+        );
+    }
+    g.finish();
+}
+
 fn short() -> Criterion {
     Criterion::default()
         .sample_size(10)
@@ -69,6 +114,6 @@ fn short() -> Criterion {
 criterion_group! {
     name = benches;
     config = short();
-    targets = append, reads
+    targets = append, append_concurrent, reads
 }
 criterion_main!(benches);

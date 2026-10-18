@@ -1,6 +1,6 @@
 //! The database handle: open, read, and the shared state the writer uses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -101,6 +101,10 @@ pub(crate) struct Inner {
     /// take it.
     pub(crate) maintenance: Mutex<()>,
     pub(crate) fail_next_commit: std::sync::atomic::AtomicBool,
+    /// Transactions that joined a commit and wait for the writer lock's
+    /// holder to land them. Lock order: the writer lock, then this.
+    pub(crate) commits: Mutex<VecDeque<txn::Pending>>,
+    pub(crate) counters: Counters,
     head_watch: (Mutex<u64>, Condvar),
     #[cfg(feature = "tokio")]
     pub(crate) head_tx: tokio::sync::watch::Sender<u64>,
@@ -167,6 +171,8 @@ impl Db {
                 epoch: AtomicU64::new(epoch),
                 maintenance: Mutex::new(()),
                 fail_next_commit: std::sync::atomic::AtomicBool::new(false),
+                commits: Mutex::new(VecDeque::new()),
+                counters: Counters::default(),
                 head_watch: (Mutex::new(head), Condvar::new()),
                 #[cfg(feature = "tokio")]
                 head_tx: tokio::sync::watch::channel(head).0,
@@ -628,6 +634,31 @@ impl Db {
         self.inner.debug_fail_next_commit();
     }
 
+    /// Running totals of the commit path: batches, transactions, events,
+    /// fsyncs and the time they took. Concurrent commits land together,
+    /// so `batches` is at most `transactions`.
+    pub fn stats(&self) -> Stats {
+        self.inner.stats()
+    }
+
+    /// Holds the writer lock until the returned value is dropped;
+    /// commits from other threads queue behind it and land as one batch
+    /// when it is released. For tests.
+    #[doc(hidden)]
+    pub fn debug_hold_writer(&self) -> WriterHold<'_> {
+        WriterHold(self.inner.lock_writer())
+    }
+
+    /// How many transactions are queued for the writer lock's holder.
+    #[doc(hidden)]
+    pub fn debug_pending_commits(&self) -> usize {
+        self.inner
+            .commits
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
     /// Where the index places `position`: `(segment base, offset, frame
     /// length)`. For tests of segment rotation.
     #[doc(hidden)]
@@ -834,6 +865,28 @@ impl Inner {
         Ok(f)
     }
 
+    /// The writer lock. Every holder releases it through [`WriterGuard`],
+    /// which hands the lock to the next queued committer.
+    pub(crate) fn lock_writer(&self) -> WriterGuard<'_> {
+        WriterGuard {
+            inner: self,
+            w: Some(self.writer.lock().unwrap_or_else(|p| p.into_inner())),
+        }
+    }
+
+    /// The writer lock if nobody holds it.
+    pub(crate) fn try_lock_writer(&self) -> Option<WriterGuard<'_>> {
+        let w = match self.writer.try_lock() {
+            Ok(w) => w,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(WriterGuard {
+            inner: self,
+            w: Some(w),
+        })
+    }
+
     /// A durable index write with the segment bytes synced first, so the
     /// index never vouches for data that is not on disk. Takes the writer
     /// lock; `f` gets the transaction and this `Inner`.
@@ -841,7 +894,7 @@ impl Inner {
         &self,
         f: impl FnOnce(&Inner, &redb::WriteTransaction) -> Result<T>,
     ) -> Result<T> {
-        let w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let w = self.lock_writer();
         w.sync_data()?;
         let txn = self.index.begin_write_durable()?;
         let out = f(self, &txn)?;
@@ -855,6 +908,17 @@ impl Inner {
     #[doc(hidden)]
     pub fn debug_fail_next_commit(&self) {
         self.fail_next_commit.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn stats(&self) -> Stats {
+        let c = &self.counters;
+        Stats {
+            batches: c.batches.load(Ordering::Relaxed),
+            transactions: c.transactions.load(Ordering::Relaxed),
+            events: c.events.load(Ordering::Relaxed),
+            fsyncs: c.fsyncs.load(Ordering::Relaxed),
+            fsync_nanos: c.fsync_nanos.load(Ordering::Relaxed),
+        }
     }
 
     /// Drops cached handles on segments about to be removed.
@@ -876,7 +940,7 @@ impl Inner {
 
     /// Starts a new segment at `base`. The commit that filled the old one
     /// already succeeded, so a failure here just keeps writing to it.
-    pub(crate) fn roll(&self, w: &mut MutexGuard<'_, SegmentWriter>, base: u64) {
+    pub(crate) fn roll(&self, w: &mut SegmentWriter, base: u64) {
         // The old segment is closed for good: cut any leftovers of a
         // failed commit and make it durable, whatever the fsync policy,
         // since nothing will sync it later. A new segment's header and
@@ -885,10 +949,77 @@ impl Inner {
             return;
         }
         if let Ok(next) = SegmentWriter::create(&self.layout.segments_dir(), base, true) {
-            **w = next;
+            *w = next;
         }
     }
 }
+
+/// Holds the writer lock. On release it nominates the first queued
+/// committer, under the queue lock, before the mutex is freed: a
+/// committer that joins the queue after that check finds the lock free
+/// and takes it itself, so nobody waits for a leader that is not coming.
+pub(crate) struct WriterGuard<'a> {
+    inner: &'a Inner,
+    w: Option<MutexGuard<'a, SegmentWriter>>,
+}
+
+impl std::ops::Deref for WriterGuard<'_> {
+    type Target = SegmentWriter;
+
+    fn deref(&self) -> &SegmentWriter {
+        self.w.as_ref().expect("held until drop")
+    }
+}
+
+impl std::ops::DerefMut for WriterGuard<'_> {
+    fn deref_mut(&mut self) -> &mut SegmentWriter {
+        self.w.as_mut().expect("held until drop")
+    }
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        let queue = self.inner.commits.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(front) = queue.front() {
+            front.nominate();
+        }
+        drop(self.w.take());
+        drop(queue);
+    }
+}
+
+/// Running totals of the commit path, read by [`Db::stats`].
+#[derive(Default)]
+pub(crate) struct Counters {
+    pub(crate) batches: AtomicU64,
+    pub(crate) transactions: AtomicU64,
+    pub(crate) events: AtomicU64,
+    pub(crate) fsyncs: AtomicU64,
+    pub(crate) fsync_nanos: AtomicU64,
+}
+
+/// What the commit path has done since the database was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct Stats {
+    /// Index commits that landed transactions: one per batch. An applied
+    /// backup or replication chunk counts one per transaction.
+    pub batches: u64,
+    /// Transactions landed through those batches.
+    pub transactions: u64,
+    /// Events landed through them.
+    pub events: u64,
+    /// Segment syncs on the commit path (one per batch under
+    /// [`Fsync::Always`], none under [`Fsync::Never`]).
+    pub fsyncs: u64,
+    /// Time spent in those syncs, in nanoseconds.
+    pub fsync_nanos: u64,
+}
+
+/// Holds the writer lock from a test, so that commits from other threads
+/// queue up and land as one batch when it is dropped.
+#[doc(hidden)]
+pub struct WriterHold<'a>(#[allow(dead_code)] WriterGuard<'a>);
 
 impl Drop for Inner {
     fn drop(&mut self) {

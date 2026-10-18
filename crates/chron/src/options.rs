@@ -29,6 +29,14 @@ pub struct Options {
     /// places every record where it is. Costs a full read of the data;
     /// off by default, when only the tail is checked.
     pub verify_all_segments: bool,
+    /// Transactions committed concurrently are landed together: one
+    /// segment write, one fsync, one index commit for up to this many of
+    /// them. `1` lands every transaction on its own. Each transaction is
+    /// still checked and acknowledged by itself.
+    pub group_commit_max_txns: usize,
+    /// A batch stops growing once its frames reach this many bytes; a
+    /// single transaction larger than this is a batch of its own.
+    pub group_commit_max_bytes: usize,
 }
 
 impl Default for Options {
@@ -38,6 +46,8 @@ impl Default for Options {
             max_record_bytes: 16 * 1024 * 1024,
             fsync: Fsync::Always,
             verify_all_segments: false,
+            group_commit_max_txns: 64,
+            group_commit_max_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -70,6 +80,19 @@ impl Options {
     /// Sets whether every segment is read and checked on open.
     pub fn verify_all_segments(mut self, verify: bool) -> Self {
         self.verify_all_segments = verify;
+        self
+    }
+
+    /// How many concurrently committed transactions one batch may land;
+    /// `1` disables grouping (at least 1).
+    pub fn group_commit_max_txns(mut self, n: usize) -> Self {
+        self.group_commit_max_txns = n.max(1);
+        self
+    }
+
+    /// The byte size at which a batch stops growing.
+    pub fn group_commit_max_bytes(mut self, bytes: usize) -> Self {
+        self.group_commit_max_bytes = bytes;
         self
     }
 }

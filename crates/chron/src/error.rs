@@ -7,6 +7,44 @@ use crate::txn::Expected;
 /// Every fallible operation in this crate returns this.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    /// A second copy of a failure, for the other waiters of a batch that
+    /// failed as a whole: the same variant where one can be rebuilt (the
+    /// `op`, path and kind of an I/O error; the text of an index error),
+    /// otherwise an I/O error carrying this error's text. `Error` is not
+    /// `Clone` because its sources are not.
+    pub(crate) fn redescribe(&self) -> Error {
+        match self {
+            Error::Io { path, op, source } => Error::Io {
+                path: path.clone(),
+                op,
+                source: std::io::Error::new(source.kind(), source.to_string()),
+            },
+            Error::Index(e) => {
+                Error::Index(redb::Error::from(std::io::Error::other(e.to_string())))
+            }
+            Error::Corrupt {
+                path,
+                offset,
+                reason,
+            } => Error::Corrupt {
+                path: path.clone(),
+                offset: *offset,
+                reason: reason.clone(),
+            },
+            Error::Inconsistent { position, reason } => Error::Inconsistent {
+                position: *position,
+                reason: reason.clone(),
+            },
+            other => Error::Io {
+                path: PathBuf::new(),
+                op: "commit",
+                source: std::io::Error::other(other.to_string()),
+            },
+        }
+    }
+}
+
 /// Errors raised by the database.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

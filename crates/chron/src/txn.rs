@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::MutexGuard;
 use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use redb::ReadableTable;
@@ -175,10 +175,13 @@ fn now_nanos() -> i64 {
     }
 }
 
-fn check_shape(appends: &[PendingAppend], max_record: usize) -> Result<()> {
+/// Checks the shape of a transaction before any lock is taken and returns
+/// an upper bound on its encoded size (tags are deduplicated later).
+fn check_shape(appends: &[PendingAppend], max_record: usize) -> Result<usize> {
     if appends.is_empty() {
         return Err(Error::EmptyTransaction);
     }
+    let mut bytes = 0usize;
     for a in appends {
         if a.events.is_empty() {
             return Err(Error::EmptyAppend {
@@ -205,9 +208,10 @@ fn check_shape(appends: &[PendingAppend], max_record: usize) -> Result<()> {
                     max: max_record,
                 });
             }
+            bytes = bytes.saturating_add(size);
         }
     }
-    Ok(())
+    Ok(bytes)
 }
 
 /// Lands one transaction whose frames are already encoded in `buf`: writes
@@ -215,19 +219,24 @@ fn check_shape(appends: &[PendingAppend], max_record: usize) -> Result<()> {
 /// and the new head in `wtxn`, commits (the commit point), publishes the
 /// head and rolls the segment when it is full. Called under the writer
 /// lock.
+/// Lands one batch of whole transactions, encoded back to back in `buf`:
+/// one segment write, one sync, one index commit. `txns` is how many
+/// transactions the batch holds, for the counters.
+#[allow(clippy::too_many_arguments)]
 fn land(
     inner: &Inner,
-    w: &mut MutexGuard<'_, SegmentWriter>,
+    w: &mut SegmentWriter,
     wtxn: redb::WriteTransaction,
     buf: &[u8],
     entries: &[Entry],
     lens: &HashMap<Uuid, u64>,
     new_head: u64,
+    txns: u64,
 ) -> Result<()> {
     // Bytes first, synced before the index commit vouches for them.
     let base = w.base();
     let at = w.write_at_end(buf)?;
-    let landed = land_index(inner, w, wtxn, base, at, buf, entries, lens, new_head);
+    let landed = land_index(inner, w, wtxn, base, at, buf, entries, lens, new_head, txns);
     if landed.is_err() {
         // Leftover bytes past the logical end would survive a later,
         // shorter commit and a roll; cut them now.
@@ -239,7 +248,7 @@ fn land(
 #[allow(clippy::too_many_arguments)]
 fn land_index(
     inner: &Inner,
-    w: &mut MutexGuard<'_, SegmentWriter>,
+    w: &mut SegmentWriter,
     wtxn: redb::WriteTransaction,
     base: u64,
     at: u64,
@@ -247,9 +256,16 @@ fn land_index(
     entries: &[Entry],
     lens: &HashMap<Uuid, u64>,
     new_head: u64,
+    txns: u64,
 ) -> Result<()> {
     if inner.opts.fsync == Fsync::Always {
+        let t = Instant::now();
         w.sync_data()?;
+        inner.counters.fsyncs.fetch_add(1, Ordering::Relaxed);
+        inner
+            .counters
+            .fsync_nanos
+            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
     if inner.fail_next_commit.swap(false, Ordering::AcqRel) {
         return Err(Error::io(
@@ -280,6 +296,15 @@ fn land_index(
     }
     // Commit point.
     wtxn.commit()?;
+    inner.counters.batches.fetch_add(1, Ordering::Relaxed);
+    inner
+        .counters
+        .transactions
+        .fetch_add(txns, Ordering::Relaxed);
+    inner
+        .counters
+        .events
+        .fetch_add(entries.len() as u64, Ordering::Relaxed);
 
     w.advance(buf.len() as u64);
     inner.publish_head(new_head);
@@ -311,7 +336,7 @@ pub(crate) fn import_frames(
     base_head: u64,
     expect_head: u64,
 ) -> Result<u64> {
-    let mut w = inner.writer.lock().unwrap_or_else(|p| p.into_inner());
+    let mut w = inner.lock_writer();
     let head = inner.head.load(Ordering::Acquire);
     if head != base_head {
         return Err(Error::WrongBaseHead {
@@ -409,61 +434,296 @@ pub(crate) fn import_frames(
             &g.entries,
             &g.lens,
             g.new_head,
+            1,
         )?;
     }
     Ok(position)
 }
 
-pub(crate) fn commit(inner: &Inner, appends: Vec<PendingAppend>, mode: Mode) -> Result<Committed> {
-    check_shape(&appends, inner.opts.max_record_bytes)?;
+/// A transaction waiting to be landed by whoever holds the writer lock.
+pub(crate) struct Pending {
+    appends: Vec<PendingAppend>,
+    /// Upper bound on the encoded size, from `check_shape`.
+    bytes: usize,
+    slot: Arc<Slot>,
+}
 
-    // The single writer lock, held to the end.
-    let mut w = inner.writer.lock().unwrap_or_else(|p| p.into_inner());
-    let head = inner.head.load(Ordering::Acquire);
+impl Pending {
+    pub(crate) fn nominate(&self) {
+        self.slot.nominate();
+    }
+}
 
-    // One redb write transaction: it checks the expectations and, after the
-    // bytes are on disk, records them. Dropping it without commit aborts.
-    let wtxn = inner.index.begin_write()?;
-    let mut lens: HashMap<Uuid, u64> = HashMap::new();
-    let mut first_indices = Vec::with_capacity(appends.len());
-    {
-        let agg_len = wtxn.open_table(AGG_LEN)?;
-        for a in &appends {
-            let Some(id) = a.aggregate else {
-                first_indices.push(0);
-                continue;
-            };
-            let cur = match lens.get(&id) {
-                Some(l) => *l,
-                None => agg_len.get(id.as_bytes())?.map_or(0, |v| v.value()),
-            };
-            if mode == Mode::Commit && !a.expected.holds(cur) {
-                return Err(Error::ExpectedLength {
-                    aggregate: id,
-                    expected: a.expected,
-                    actual: cur,
-                });
+enum SlotState {
+    Waiting,
+    /// The lock's last holder left and this waiter is first in line: it
+    /// must take the lock and lead.
+    Nominated,
+    Done(Result<Committed>),
+}
+
+/// One committer's result cell.
+struct Slot {
+    state: Mutex<SlotState>,
+    cv: Condvar,
+}
+
+enum Waited {
+    Done(Result<Committed>),
+    Nominated,
+}
+
+impl Slot {
+    fn new() -> Arc<Slot> {
+        Arc::new(Slot {
+            state: Mutex::new(SlotState::Waiting),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn wait(&self) -> Waited {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            match std::mem::replace(&mut *st, SlotState::Waiting) {
+                SlotState::Done(r) => return Waited::Done(r),
+                SlotState::Nominated => return Waited::Nominated,
+                SlotState::Waiting => {
+                    st = self.cv.wait(st).unwrap_or_else(|p| p.into_inner());
+                }
             }
-            first_indices.push(cur);
-            lens.insert(id, cur + a.events.len() as u64);
         }
     }
 
-    // Encode every record into one buffer.
+    fn nominate(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(*st, SlotState::Waiting) {
+            *st = SlotState::Nominated;
+            self.cv.notify_one();
+        }
+    }
+
+    fn set(&self, r: Result<Committed>) {
+        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = SlotState::Done(r);
+        self.cv.notify_one();
+    }
+
+    fn take_done(&self) -> Option<Result<Committed>> {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        match std::mem::replace(&mut *st, SlotState::Waiting) {
+            SlotState::Done(r) => Some(r),
+            other => {
+                *st = other;
+                None
+            }
+        }
+    }
+}
+
+/// Commits one transaction. The holder of the writer lock lands every
+/// queued transaction in batches; a committer that finds the lock taken
+/// joins the queue and waits for its result, or for the lock to be
+/// handed to it.
+pub(crate) fn commit(inner: &Inner, appends: Vec<PendingAppend>, mode: Mode) -> Result<Committed> {
+    let bytes = check_shape(&appends, inner.opts.max_record_bytes)?;
+
+    if mode == Mode::WriteWithoutCommit {
+        let mut w = inner.lock_writer();
+        let head = inner.head.load(Ordering::Acquire);
+        let wtxn = inner.index.begin_write()?;
+        let plan = {
+            let agg_len = wtxn.open_table(AGG_LEN)?;
+            match plan_txn(&agg_len, &HashMap::new(), &appends, false)? {
+                Ok(p) => p,
+                Err((e, _)) => return Err(e),
+            }
+        };
+        drop(wtxn);
+        let mut buf = Vec::new();
+        let mut body = Vec::new();
+        let mut entries = Vec::new();
+        let mut position = head;
+        let committed = encode_txn(
+            appends,
+            &plan.first_indices,
+            now_nanos(),
+            &mut position,
+            &mut buf,
+            &mut body,
+            &mut entries,
+        );
+        w.write_at_end(&buf)?;
+        w.sync_data()?;
+        return Ok(committed);
+    }
+
+    let slot = Slot::new();
+    inner
+        .commits
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push_back(Pending {
+            appends,
+            bytes,
+            slot: slot.clone(),
+        });
+    if let Some(w) = inner.try_lock_writer() {
+        return lead(inner, w, &slot);
+    }
+    match slot.wait() {
+        Waited::Done(r) => r,
+        Waited::Nominated => {
+            let w = inner.lock_writer();
+            lead(inner, w, &slot)
+        }
+    }
+}
+
+/// Lands batches until this committer's own transaction is done, then
+/// releases the lock (handing it to the next queued committer).
+fn lead(inner: &Inner, mut w: crate::db::WriterGuard<'_>, slot: &Slot) -> Result<Committed> {
+    loop {
+        if let Some(r) = slot.take_done() {
+            return r;
+        }
+        let batch = drain(inner, w.len());
+        if batch.is_empty() {
+            // Cannot happen: this committer's entry is queued until it
+            // is done. Guard against a spin all the same.
+            if let Some(r) = slot.take_done() {
+                return r;
+            }
+            continue;
+        }
+        run_batch(inner, &mut w, batch);
+    }
+}
+
+/// Takes the next batch from the queue: in arrival order, up to the
+/// configured number of transactions and bytes, and not past the point
+/// where the segment is full (so a segment overshoots by at most one
+/// transaction, as before).
+fn drain(inner: &Inner, segment_len: u64) -> Vec<Pending> {
+    let mut queue = inner.commits.lock().unwrap_or_else(|p| p.into_inner());
+    let max_txns = inner.opts.group_commit_max_txns.max(1);
+    let max_bytes = inner.opts.group_commit_max_bytes;
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(next) = queue.front() {
+        if !out.is_empty() {
+            if out.len() >= max_txns {
+                break;
+            }
+            if bytes.saturating_add(next.bytes) > max_bytes {
+                break;
+            }
+            if segment_len.saturating_add(bytes as u64) >= inner.opts.segment_max_bytes {
+                break;
+            }
+        }
+        let p = queue.pop_front().expect("front was Some");
+        bytes = bytes.saturating_add(p.bytes);
+        out.push(p);
+    }
+    out
+}
+
+/// Delivers every result of a batch when dropped, so a panic inside the
+/// batch leaves no waiter parked.
+struct SlotFiller {
+    slots: Vec<Arc<Slot>>,
+    results: Vec<Option<Result<Committed>>>,
+}
+
+impl SlotFiller {
+    fn set(&mut self, i: usize, r: Result<Committed>) {
+        self.results[i] = Some(r);
+    }
+}
+
+impl Drop for SlotFiller {
+    fn drop(&mut self) {
+        for (slot, r) in self.slots.iter().zip(self.results.drain(..)) {
+            slot.set(r.unwrap_or_else(|| {
+                Err(Error::Io {
+                    path: std::path::PathBuf::new(),
+                    op: "commit",
+                    source: std::io::Error::other("the committing thread panicked"),
+                })
+            }));
+        }
+    }
+}
+
+/// What a transaction's expectation check decided.
+struct Plan {
+    first_indices: Vec<u64>,
+    /// The lengths this transaction leaves its aggregates at.
+    lens: HashMap<Uuid, u64>,
+}
+
+/// Checks a transaction's expectations against the committed lengths
+/// as the batch so far leaves them (`overlay`). `Err((error, against_
+/// committed))` is a refused expectation; `against_committed` says
+/// whether the length it failed against is the committed one (so the
+/// refusal stands whatever happens to the batch) or one another
+/// transaction of this batch produced.
+fn plan_txn(
+    agg_len: &impl ReadableTable<&'static [u8; 16], u64>,
+    overlay: &HashMap<Uuid, u64>,
+    appends: &[PendingAppend],
+    check: bool,
+) -> Result<std::result::Result<Plan, (Error, bool)>> {
+    let mut lens: HashMap<Uuid, u64> = HashMap::new();
+    let mut first_indices = Vec::with_capacity(appends.len());
+    for a in appends {
+        let Some(id) = a.aggregate else {
+            first_indices.push(0);
+            continue;
+        };
+        let (cur, from_overlay) = match lens.get(&id).or_else(|| overlay.get(&id)) {
+            Some(l) => (*l, overlay.contains_key(&id)),
+            None => (agg_len.get(id.as_bytes())?.map_or(0, |v| v.value()), false),
+        };
+        if check && !a.expected.holds(cur) {
+            return Ok(Err((
+                Error::ExpectedLength {
+                    aggregate: id,
+                    expected: a.expected,
+                    actual: cur,
+                },
+                !from_overlay,
+            )));
+        }
+        first_indices.push(cur);
+        lens.insert(id, cur + a.events.len() as u64);
+    }
+    Ok(Ok(Plan {
+        first_indices,
+        lens,
+    }))
+}
+
+/// Encodes one transaction's records after the ones already in `buf`,
+/// advancing `position`, and returns what the committer is told.
+fn encode_txn(
+    appends: Vec<PendingAppend>,
+    first_indices: &[u64],
+    recorded_at: i64,
+    position: &mut u64,
+    buf: &mut Vec<u8>,
+    body: &mut Vec<u8>,
+    entries: &mut Vec<Entry>,
+) -> Committed {
     let total: usize = appends.iter().map(|a| a.events.len()).sum();
-    let recorded_at = now_nanos();
-    let mut buf = Vec::new();
-    let mut body = Vec::new();
-    let mut entries = Vec::with_capacity(total);
+    let first = *position;
     let mut results = Vec::with_capacity(appends.len());
-    let mut position = head;
     let mut seq = 0usize;
-    for (a, first_index) in appends.into_iter().zip(first_indices) {
+    for (a, &first_index) in appends.into_iter().zip(first_indices) {
         let count = a.events.len() as u64;
         let free = a.aggregate.is_none();
         results.push(AppendResult {
             aggregate: a.aggregate,
-            first_position: position,
+            first_position: *position,
             first_index,
             count,
             new_len: if free { 0 } else { first_index + count },
@@ -480,7 +740,7 @@ pub(crate) fn commit(inner: &Inner, appends: Vec<PendingAppend>, mode: Mode) -> 
             tags.sort();
             tags.dedup();
             let rec = Event {
-                position,
+                position: *position,
                 aggregate: a.aggregate,
                 index: if free { 0 } else { first_index + j as u64 },
                 recorded_at,
@@ -490,39 +750,146 @@ pub(crate) fn commit(inner: &Inner, appends: Vec<PendingAppend>, mode: Mode) -> 
                 payload: ev.payload,
             };
             body.clear();
-            event::encode_body(&rec, &mut body);
+            event::encode_body(&rec, body);
             let rel_offset = buf.len() as u64;
-            segment::frame_record(&body, &mut buf);
+            segment::frame_record(body, buf);
             entries.push(Entry {
-                position,
+                position: *position,
                 rel_offset,
                 frame_len: (FRAME_LEN + body.len()) as u32,
                 aggregate: rec.aggregate,
                 index: rec.index,
                 tags: rec.tags,
             });
-            position += 1;
+            *position += 1;
             seq += 1;
         }
     }
-    let new_head = position;
-
-    if mode == Mode::WriteWithoutCommit {
-        w.write_at_end(&buf)?;
-        w.sync_data()?;
-        return Ok(Committed {
-            first: head,
-            last: new_head - 1,
-            next: new_head,
-            appends: results,
-        });
-    }
-    land(inner, &mut w, wtxn, &buf, &entries, &lens, new_head)?;
-
-    Ok(Committed {
-        first: head,
-        last: new_head - 1,
-        next: new_head,
+    Committed {
+        first,
+        last: *position - 1,
+        next: *position,
         appends: results,
-    })
+    }
+}
+
+/// Lands one batch: every transaction is checked in order against the
+/// committed state as the batch so far leaves it; a refused one gets its
+/// error and consumes nothing; the rest are written, synced and indexed
+/// together and each acknowledged with its own result. A failure of the
+/// write or the index commit fails every accepted transaction.
+fn run_batch(inner: &Inner, w: &mut SegmentWriter, batch: Vec<Pending>) {
+    let n = batch.len();
+    let mut filler = SlotFiller {
+        slots: batch.iter().map(|p| p.slot.clone()).collect(),
+        results: (0..n).map(|_| None).collect(),
+    };
+    let fail_all = |filler: &mut SlotFiller, e: Error, which: &[usize]| {
+        let mut first = Some(e);
+        for &i in which {
+            let err = match first.take() {
+                Some(e) => e,
+                None => filler.results[i]
+                    .as_ref()
+                    .and_then(|r| r.as_ref().err())
+                    .map(Error::redescribe)
+                    .unwrap_or_else(|| Error::Io {
+                        path: std::path::PathBuf::new(),
+                        op: "commit",
+                        source: std::io::Error::other("the batch failed"),
+                    }),
+            };
+            filler.set(i, Err(err));
+        }
+    };
+
+    let head = inner.head.load(Ordering::Acquire);
+    let wtxn = match inner.index.begin_write() {
+        Ok(t) => t,
+        Err(e) => {
+            let all: Vec<usize> = (0..n).collect();
+            fail_all(&mut filler, e, &all);
+            return;
+        }
+    };
+    let mut overlay: HashMap<Uuid, u64> = HashMap::new();
+    let mut buf = Vec::new();
+    let mut body = Vec::new();
+    let mut entries = Vec::new();
+    let mut position = head;
+    let mut accepted: Vec<usize> = Vec::new();
+    let mut overlay_rejected: Vec<usize> = Vec::new();
+    let mut committed: Vec<Option<Committed>> = (0..n).map(|_| None).collect();
+    {
+        let agg_len = match wtxn.open_table(AGG_LEN) {
+            Ok(t) => t,
+            Err(e) => {
+                let all: Vec<usize> = (0..n).collect();
+                fail_all(&mut filler, Error::from(e), &all);
+                return;
+            }
+        };
+        for (i, p) in batch.into_iter().enumerate() {
+            let plan = match plan_txn(&agg_len, &overlay, &p.appends, true) {
+                Ok(Ok(plan)) => plan,
+                Ok(Err((e, against_committed))) => {
+                    filler.set(i, Err(e));
+                    if !against_committed {
+                        overlay_rejected.push(i);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    let rest: Vec<usize> = (i..n).collect();
+                    fail_all(&mut filler, e, &rest);
+                    return;
+                }
+            };
+            overlay.extend(plan.lens.iter().map(|(k, v)| (*k, *v)));
+            committed[i] = Some(encode_txn(
+                p.appends,
+                &plan.first_indices,
+                now_nanos(),
+                &mut position,
+                &mut buf,
+                &mut body,
+                &mut entries,
+            ));
+            accepted.push(i);
+        }
+    }
+    if accepted.is_empty() {
+        drop(wtxn);
+        return;
+    }
+    match land(
+        inner,
+        w,
+        wtxn,
+        &buf,
+        &entries,
+        &overlay,
+        position,
+        accepted.len() as u64,
+    ) {
+        Ok(()) => {
+            for i in accepted {
+                filler.set(i, Ok(committed[i].take().expect("planned")));
+            }
+        }
+        Err(e) => {
+            // The first accepted transaction keeps the original error; the
+            // others, and any refusal that was judged against lengths this
+            // batch did not land, get a copy.
+            let mut which = accepted;
+            which.extend(overlay_rejected);
+            which.sort_unstable();
+            let first = which[0];
+            let copies: Vec<Error> = which.iter().skip(1).map(|_| e.redescribe()).collect();
+            filler.set(first, Err(e));
+            for (i, err) in which.into_iter().skip(1).zip(copies) {
+                filler.set(i, Err(err));
+            }
+        }
+    }
 }
