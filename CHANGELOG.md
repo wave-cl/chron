@@ -6,6 +6,10 @@ crates share one version.
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.3.0 - 2026-10-18
+
 ### chron-db
 
 - `Db::truncate_to(position)`: drops the records from a transaction
