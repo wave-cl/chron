@@ -212,6 +212,12 @@ fn apply_refuses_a_damaged_archive_and_the_wrong_kind() {
         Err(Error::Corrupt { .. })
     ));
     assert_eq!(snapshot(&r), before);
+    // Intact frames, missing trailer: only the archive crc can tell.
+    let cut = d.path().join("cut.chronbak");
+    fs::copy(&inc, &cut).unwrap();
+    chop(&cut, 2);
+    assert!(matches!(r.apply_backup(&cut), Err(Error::Corrupt { .. })));
+    assert_eq!(snapshot(&r), before);
     r.apply_backup(&inc).unwrap();
     assert_eq!(r.head(), db.head());
 }
