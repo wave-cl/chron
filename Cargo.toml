@@ -18,7 +18,12 @@ thiserror = "2"
 tempfile = "3"
 crc32fast = "1"
 uuid = { version = "1", features = ["v4"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [[test]]
 name = "suite"
 path = "tests/suite/main.rs"
+
+[[bench]]
+name = "chron"
+harness = false
