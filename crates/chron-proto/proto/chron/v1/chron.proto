@@ -1,0 +1,167 @@
+syntax = "proto3";
+
+package chron.v1;
+
+// An event as recorded. `aggregate` is 16 bytes; absent for a free event
+// (one appended to no aggregate), whose `index` is then 0.
+message Event {
+  uint64 position = 1;
+  optional bytes aggregate = 2;
+  uint64 index = 3;
+  int64 recorded_at_unix_nanos = 4;
+  bool first_in_txn = 5;
+  bool last_in_txn = 6;
+  repeated bytes tags = 7;
+  bytes metadata = 8;
+  bytes payload = 9;
+}
+
+message NewEvent {
+  repeated bytes tags = 1;
+  bytes metadata = 2;
+  bytes payload = 3;
+}
+
+// What an append asserts about the aggregate's length. Unset means `any`.
+message Expected {
+  message Any {}
+  message New {}
+  oneof kind {
+    Any any = 1;
+    New new = 2;
+    uint64 exact = 3;
+  }
+}
+
+// One append of a transaction. `aggregate` absent: free events, for which
+// `expected` must be unset or `any`.
+message Append {
+  optional bytes aggregate = 1;
+  Expected expected = 2;
+  repeated NewEvent events = 3;
+}
+
+message CommitRequest { repeated Append appends = 1; }
+
+message AppendResult {
+  optional bytes aggregate = 1;
+  uint64 first_position = 2;
+  uint64 first_index = 3;
+  uint64 count = 4;
+  uint64 new_len = 5;
+}
+
+// Positions of the transaction's first and last event, the head after it,
+// and one result per append.
+message CommitResponse {
+  uint64 first = 1;
+  uint64 last = 2;
+  uint64 next = 3;
+  repeated AppendResult appends = 4;
+}
+
+// For every finite read, `limit` 0 means "to the end". Forward, `from` is
+// the first index or position returned; backward, the inclusive upper
+// bound, newest first, and the maximum uint64 means "from the end".
+message ReadAggregateRequest {
+  bytes aggregate = 1;
+  uint64 from_index = 2;
+  uint64 limit = 3;
+  bool backward = 4;
+}
+
+message ReadAllRequest {
+  uint64 from = 1;
+  uint64 limit = 2;
+  bool backward = 3;
+}
+
+message ReadTagRequest {
+  bytes tag = 1;
+  uint64 from = 2;
+  uint64 limit = 3;
+  bool backward = 4;
+}
+
+message AggregateLenRequest { bytes aggregate = 1; }
+message AggregateLenResponse { uint64 len = 1; }
+
+message HeadRequest {}
+message HeadResponse { uint64 head = 1; }
+
+// Events from `from` (which may be past the head: the stream then waits
+// for it), then live ones as they are committed. With `tag`, only events
+// carrying it. Never ends on its own.
+message SubscribeRequest {
+  uint64 from = 1;
+  optional bytes tag = 2;
+}
+
+message FlushRequest {}
+message FlushResponse {}
+
+message Options {
+  uint64 segment_max_bytes = 1;
+  uint64 max_record_bytes = 2;
+  bool fsync = 3;
+  bool verify_all_segments = 4;
+}
+
+message InfoRequest {}
+message InfoResponse {
+  string path = 1;
+  uint64 head = 2;
+  uint64 floor = 3;
+  uint64 segments = 4;
+  uint64 bytes = 5;
+  Options options = 6;
+}
+
+// A backup written by the daemon to `archive` on its own filesystem: full
+// without `since`, incremental from `since` with it.
+message BackupRequest {
+  string archive = 1;
+  optional uint64 since = 2;
+}
+
+message BackupMeta {
+  bool incremental = 1;
+  optional uint64 base_head = 2;
+  uint64 head = 3;
+  uint64 floor = 4;
+  int64 created_at_unix_nanos = 5;
+  uint64 files = 6;
+  uint64 bytes = 7;
+}
+
+message ApplyBackupRequest { string archive = 1; }
+
+message RetainRequest { uint64 floor = 1; }
+message RetainResponse {
+  uint64 floor = 1;
+  uint64 segments_removed = 2;
+  uint64 bytes_freed = 3;
+}
+
+// The whole database over one service.
+//
+// Status codes: an append whose expectation fails is FAILED_PRECONDITION
+// with the metadata `chron-actual-length` and `chron-aggregate`; a
+// malformed request is INVALID_ARGUMENT; a position past the head or below
+// the floor is OUT_OF_RANGE; a locked directory, a wrong backup base head
+// or an existing restore target is FAILED_PRECONDITION; damage and I/O
+// failures are INTERNAL.
+service Chron {
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc ReadAggregate(ReadAggregateRequest) returns (stream Event);
+  rpc ReadAll(ReadAllRequest) returns (stream Event);
+  rpc ReadTag(ReadTagRequest) returns (stream Event);
+  rpc AggregateLen(AggregateLenRequest) returns (AggregateLenResponse);
+  rpc Head(HeadRequest) returns (HeadResponse);
+  rpc Subscribe(SubscribeRequest) returns (stream Event);
+  rpc Flush(FlushRequest) returns (FlushResponse);
+  rpc Info(InfoRequest) returns (InfoResponse);
+  rpc Backup(BackupRequest) returns (BackupMeta);
+  rpc ApplyBackup(ApplyBackupRequest) returns (BackupMeta);
+  rpc Retain(RetainRequest) returns (RetainResponse);
+}
