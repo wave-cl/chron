@@ -683,16 +683,18 @@ fn status_exit_codes() {
         .assert()
         .success();
     let replica = Daemon::start_replica_of(&leader);
+    // An unknown lag counts as healthy, so wait for the head itself.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let ok = replica
+        let out = replica
             .chron()
-            .args(["status", "--max-lag", "0"])
+            .args(["head"])
             .assert()
+            .success()
             .get_output()
-            .status
-            .success();
-        if ok {
+            .stdout
+            .clone();
+        if String::from_utf8(out).unwrap().trim() == "1" {
             break;
         }
         assert!(
@@ -701,6 +703,11 @@ fn status_exit_codes() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    replica
+        .chron()
+        .args(["status", "--max-lag", "0"])
+        .assert()
+        .success();
     replica
         .running
         .as_ref()
