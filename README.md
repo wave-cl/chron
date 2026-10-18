@@ -29,7 +29,17 @@ let committed = txn.commit()?;          // Err(Error::ExpectedLength{..}) if `cu
 let events = db.read_aggregate(order, 0, 100)?;     // from index 0
 let everything = db.read_all(committed.first, 100)?; // from a global position
 let audit = db.read_tag("audit", 0, 100)?;            // the tagged subset, in global order
+let newest = db.read_all_backward(u64::MAX, 10)?;     // the last ten, newest first
+
+for event in db.subscribe_tag("orders", 0) {          // every order event so far, then live
+    let event = event?;
+    println!("{} {:?}", event.position, event.payload);
+}
 ```
+
+Every read has a backward twin (`read_all_backward`,
+`read_aggregate_backward`, `read_tag_backward`) that takes an inclusive
+upper bound and returns newest first; `u64::MAX` means "from the end".
 
 ## Guarantees
 
@@ -52,6 +62,11 @@ let audit = db.read_tag("audit", 0, 100)?;            // the tagged subset, in g
 - **One writer, many readers.** `Db` is cheap to clone and shared between
   threads; commits serialise on one lock, reads never take it. A `LOCK`
   file refuses a second process.
+- **Live subscriptions.** `subscribe(from)` and `subscribe_tag(tag, from)`
+  return a `Subscription`: an iterator that catches up through the index
+  and then blocks for new commits. `next_timeout` serves threads that also
+  watch a stop flag; `position()` is the checkpoint to resume from. A
+  subscription keeps the database open.
 
 ## Layout on disk
 
@@ -63,6 +78,20 @@ let audit = db.read_tag("audit", 0, 100)?;            // the tagged subset, in g
   segments/<base>.seg       64-byte header, then framed records (length, crc32, body)
 ```
 
+## Checking and repairing
+
+- `Options::verify_all_segments(true)` reads every segment on open, checking
+  each record's CRC, that positions run consecutively, and that the index
+  places every record where it is. Off by default, when only the tail is
+  checked.
+- `Db::rebuild_index(path, &opts)` rebuilds `index.redb` from the segment
+  files alone, for a missing or damaged index. It takes `LOCK` (no `Db`
+  may be open), writes the new index beside the old one and renames it
+  into place only when complete. Every complete transaction in the
+  segments is indexed, including a trailing one whose commit was never
+  acknowledged; a torn trailing transaction is dropped and the next open
+  truncates its bytes. Damage anywhere else is reported, never repaired.
+
 ## Limits
 
 Tags are at most 255 bytes and 255 per event. One event's record is at most
@@ -72,8 +101,7 @@ split across segments.
 
 ## Not in this version
 
-Index rebuild from segments, backward reads, subscriptions, backups,
-segment deletion, a server, a CLI.
+Backups, segment deletion, a server, a CLI.
 
 ## Development
 
@@ -81,4 +109,7 @@ segment deletion, a server, a CLI.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo nextest run --workspace --no-fail-fast
+cargo bench            # criterion: append in both fsync modes, the three reads
 ```
+
+CI runs the first three on every push and pull request.
