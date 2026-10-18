@@ -7,18 +7,24 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Async head notifications: `Db::wait_for_async`, `Subscription::next_async`.
+tokio = ["dep:tokio"]
+
 [dependencies]
 redb = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 crc32fast = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"], optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 crc32fast = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 criterion = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [[test]]
 name = "suite"

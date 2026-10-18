@@ -163,6 +163,104 @@ fn subscription_across_a_segment_roll() {
     assert!(segments(d.path()).len() > 3);
 }
 
+#[cfg(feature = "tokio")]
+mod tokio_api {
+    use std::time::Duration;
+
+    use chron::{Event, Expected};
+
+    use crate::common::*;
+
+    const LIVE: Duration = Duration::from_secs(10);
+    const QUIET: Duration = Duration::from_millis(50);
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_async_catches_up_then_streams_live() {
+        let d = tmp();
+        let db = open(d.path());
+        fill(&db, agg(1), 5);
+        let writer = db.clone();
+        let h = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(QUIET);
+            for i in 5..10 {
+                let mut t = writer.transaction();
+                t.append_one(agg(1), Expected::Exact(i), ev(&format!("e{i}")));
+                t.commit().unwrap();
+            }
+        });
+        let mut sub = db.subscribe(0);
+        let mut got: Vec<Event> = Vec::new();
+        for _ in 0..10 {
+            got.push(
+                tokio::time::timeout(LIVE, sub.next_async())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        h.await.unwrap();
+        assert_eq!(positions(&got), (0..10).collect::<Vec<_>>());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_async_is_cancel_safe() {
+        let d = tmp();
+        let db = open(d.path());
+        fill(&db, agg(1), 2);
+        let mut sub = db.subscribe(db.head());
+        assert!(tokio::time::timeout(QUIET, sub.next_async()).await.is_err());
+        assert_eq!(sub.position(), 2);
+        fill(&db, agg(1), 1);
+        let got = tokio::time::timeout(LIVE, sub.next_async())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.position, 2);
+        assert_eq!(sub.position(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_async_tag_filters_and_sees_free_events() {
+        let d = tmp();
+        let db = open(d.path());
+        let mut t = db.transaction();
+        t.append_one(agg(1), Expected::New, tagged("a", &["t"]));
+        t.append_free(vec![ev("plain"), tagged("f", &["t"])]);
+        t.commit().unwrap();
+        let mut sub = db.subscribe_tag("t", 0);
+        let a = tokio::time::timeout(LIVE, sub.next_async())
+            .await
+            .unwrap()
+            .unwrap();
+        let f = tokio::time::timeout(LIVE, sub.next_async())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((a.position, f.position), (0, 2));
+        assert!(f.is_free());
+        assert!(tokio::time::timeout(QUIET, sub.next_async()).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_async_returns_the_published_head() {
+        let d = tmp();
+        let db = open(d.path());
+        assert_eq!(db.wait_for_async(0).await, 0);
+        let writer = db.clone();
+        let h = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(QUIET);
+            fill(&writer, agg(1), 3);
+        });
+        assert_eq!(
+            tokio::time::timeout(LIVE, db.wait_for_async(3))
+                .await
+                .unwrap(),
+            3
+        );
+        h.await.unwrap();
+    }
+}
+
 #[test]
 fn small_batches_stay_dense_and_position_counts_the_buffer() {
     let d = tmp();

@@ -87,6 +87,8 @@ pub(crate) struct Inner {
     pub(crate) writer: Mutex<SegmentWriter>,
     pub(crate) head: AtomicU64,
     head_watch: (Mutex<u64>, Condvar),
+    #[cfg(feature = "tokio")]
+    pub(crate) head_tx: tokio::sync::watch::Sender<u64>,
     files: Mutex<HashMap<u64, Arc<File>>>,
     _lock: Lock,
 }
@@ -138,6 +140,8 @@ impl Db {
                 writer: Mutex::new(writer),
                 head: AtomicU64::new(head),
                 head_watch: (Mutex::new(head), Condvar::new()),
+                #[cfg(feature = "tokio")]
+                head_tx: tokio::sync::watch::channel(head).0,
                 files: Mutex::new(HashMap::new()),
                 _lock: lock,
             }),
@@ -348,6 +352,18 @@ impl Db {
         *head
     }
 
+    /// Waits until the head is at least `min_head`. Returns the head seen
+    /// last. Cancel-safe.
+    #[cfg(feature = "tokio")]
+    pub async fn wait_for_async(&self, min_head: u64) -> u64 {
+        let mut rx = self.inner.head_tx.subscribe();
+        match rx.wait_for(|h| *h >= min_head).await {
+            Ok(h) => *h,
+            // The sender lives in `Inner`, which `self` keeps alive.
+            Err(_) => self.head(),
+        }
+    }
+
     /// Writes (and fsyncs) the transaction's records without committing
     /// them to the index: the state a crash between the segment write and
     /// the index commit leaves. For tests of recovery only; the `Db` must be
@@ -468,6 +484,8 @@ impl Inner {
         let (lock, cv) = &self.head_watch;
         *lock.lock().unwrap_or_else(|p| p.into_inner()) = head;
         cv.notify_all();
+        #[cfg(feature = "tokio")]
+        self.head_tx.send_replace(head);
     }
 
     /// Starts a new segment at `base`. The commit that filled the old one

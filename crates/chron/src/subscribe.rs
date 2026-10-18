@@ -35,6 +35,8 @@ pub struct Subscription {
     cursor: u64,
     buffer: VecDeque<Event>,
     batch: usize,
+    #[cfg(feature = "tokio")]
+    head_rx: tokio::sync::watch::Receiver<u64>,
 }
 
 impl Subscription {
@@ -47,12 +49,16 @@ impl Subscription {
     }
 
     fn new(db: Db, filter: Filter, from: u64) -> Self {
+        #[cfg(feature = "tokio")]
+        let head_rx = db.inner.head_tx.subscribe();
         Subscription {
             db,
             filter,
             cursor: from,
             buffer: VecDeque::new(),
             batch: DEFAULT_BATCH,
+            #[cfg(feature = "tokio")]
+            head_rx,
         }
     }
 
@@ -74,6 +80,27 @@ impl Subscription {
     /// passes.
     pub fn next_timeout(&mut self, timeout: Duration) -> Result<Option<Event>> {
         self.next_until(Instant::now().checked_add(timeout))
+    }
+
+    /// The next event, awaiting a commit once caught up. Never ends: the
+    /// database lives as long as this subscription. Cancel-safe at its one
+    /// await, so `tokio::time::timeout(d, sub.next_async())` loses nothing
+    /// when it elapses. The catch-up reads run inline on the calling task;
+    /// lower [`batch`](Subscription::batch) when records are very large.
+    #[cfg(feature = "tokio")]
+    pub async fn next_async(&mut self) -> Result<Event> {
+        loop {
+            if let Some(ev) = self.buffer.pop_front() {
+                return Ok(ev);
+            }
+            self.fill()?;
+            if !self.buffer.is_empty() {
+                continue;
+            }
+            let min = self.cursor.saturating_add(1);
+            // Err only if the sender is gone, which `self.db` prevents.
+            let _ = self.head_rx.wait_for(|h| *h >= min).await;
+        }
     }
 
     /// One catch-up step: reads the next batch into the buffer and moves
