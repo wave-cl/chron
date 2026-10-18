@@ -159,7 +159,7 @@ async fn info_flush_backup_apply_retain_promote_fence_typed() {
     assert!(!info.fsync, "the fixture runs without fsync");
     assert!(!info.options.verify_all_segments);
     let meta = f.client.backup("full.chronbak", None).await.unwrap();
-    assert!(f.dir.path().join("backups/full.chronbak").exists());
+    assert!(f.dir.path().join("backups/default/full.chronbak").exists());
     assert_eq!(
         (meta.head, meta.format, meta.db_id),
         (1, 1, Some(info.db_id))
@@ -211,5 +211,59 @@ async fn commit_with_epoch_checks_the_token() {
     f.client.commit_with_epoch(txn, 2).await.unwrap();
     assert!(f.client.health("chron.v1.Chron").await.unwrap());
     assert!(f.client.health("").await.unwrap());
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn database_config_and_rebinding_route_calls() {
+    let f = Fixture::start().await;
+    f.client
+        .append(agg(1), Expected::New, vec![NewEvent::new("d0")])
+        .await
+        .unwrap();
+    let created = f.client.create_database("orders").await.unwrap();
+    assert_eq!((created.name.as_str(), created.head), ("orders", 0));
+    assert!(matches!(
+        f.client.create_database("orders").await,
+        Err(ClientError::AlreadyExists(_))
+    ));
+    let orders = f.client.database("orders");
+    assert_eq!(orders.database_name(), Some("orders"));
+    assert_eq!(orders.head().await.unwrap(), 0);
+    orders
+        .append(agg(1), Expected::New, vec![NewEvent::new("o0")])
+        .await
+        .unwrap();
+    assert_eq!(
+        (orders.head().await.unwrap(), f.client.head().await.unwrap()),
+        (1, 1)
+    );
+    assert_eq!(orders.info().await.unwrap().database, "orders");
+    assert_eq!(f.client.info().await.unwrap().database, "default");
+    let configured = chron_client::Client::connect(
+        format!("http://{}", f.addr()),
+        ClientConfig {
+            database: Some("orders".into()),
+            ..ClientConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(payloads(&configured.read_all(0, 0).await.unwrap()), ["o0"]);
+    let listed: Vec<String> = f
+        .client
+        .list_databases()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert_eq!(listed, ["default", "orders"]);
+    f.client.drop_database("orders").await.unwrap();
+    assert!(matches!(orders.head().await, Err(ClientError::NotFound(_))));
+    assert!(matches!(
+        f.client.database("Bad Name").head().await,
+        Err(ClientError::InvalidArgument(_))
+    ));
     f.stop().await;
 }

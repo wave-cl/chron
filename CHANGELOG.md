@@ -21,6 +21,24 @@ crates share one version.
 - Open segment files are bounded by `Options::max_open_segments` (64),
   least recently used closed first.
 
+### chrond, chron-proto, chron-client, chron-cli
+
+- Several databases per daemon. A call names its database with the
+  metadata `chron-db: <name>`; absent means `default`, so 0.1.0 clients
+  keep working. New RPCs CreateDatabase, ListDatabases and DropDatabase
+  (admin; create and drop on the leader only); `Info.database`. A replica
+  mirrors every database of its leader and discovers new ones
+  (`--discover-interval`). Promotion raises every database's epoch.
+- Layout: `<data_dir>/<name>/` per database; a 0.1.0 data directory is
+  moved into `default/` on the first start (`Info.path` changes
+  accordingly). Backups over the daemon now live under
+  `<backup_dir>/<name>/`, so `default`'s move from `<backup_dir>/` to
+  `<backup_dir>/default/`.
+- Client: `ClientConfig.database`, `Client::database(name)`,
+  `create_database`, `list_databases`, `drop_database`, `DatabaseInfo`,
+  `ClientError::{NotFound, AlreadyExists}`. CLI: `--db` (`CHRON_DB`),
+  `chron db create|list|drop`.
+
 ## 0.1.0 - 2026-10-18
 
 The first release: an embeddable event-sourcing library, a gRPC daemon

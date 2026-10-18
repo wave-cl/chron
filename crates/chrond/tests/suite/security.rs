@@ -323,9 +323,9 @@ async fn backup_names_are_confined_to_the_backup_dir() {
         })
         .await
         .unwrap();
-    assert!(s.dir.path().join("backups/ok.chronbak").exists());
+    assert!(s.dir.path().join("backups/default/ok.chronbak").exists());
     assert_eq!(
-        std::fs::read_dir(s.dir.path().join("backups"))
+        std::fs::read_dir(s.dir.path().join("backups/default"))
             .unwrap()
             .count(),
         1,

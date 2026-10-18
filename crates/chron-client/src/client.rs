@@ -60,6 +60,9 @@ pub struct ClientConfig {
     /// Largest message accepted from, or sent to, the daemon; default
     /// 64 MiB, matching the daemon's default.
     pub max_message_bytes: usize,
+    /// The database every call goes to (`chron-db` metadata); `None` is
+    /// the daemon's `default`. [`Client::database`] rebinds a client.
+    pub database: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -71,6 +74,7 @@ impl Default for ClientConfig {
             connect_timeout: Duration::from_secs(3),
             request_timeout: None,
             max_message_bytes: 64 * 1024 * 1024,
+            database: None,
         }
     }
 }
@@ -103,6 +107,8 @@ impl std::fmt::Display for Role {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Info {
+    /// The database the call was addressed to.
+    pub database: String,
     /// The database directory on the daemon's filesystem.
     pub path: String,
     /// One past the last committed position.
@@ -144,14 +150,37 @@ pub struct Promoted {
     pub head: u64,
 }
 
-/// Adds the bearer token, when there is one.
-#[derive(Clone)]
-struct Auth(Option<MetadataValue<Ascii>>);
+/// One of the daemon's databases, as `list_databases` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DatabaseInfo {
+    /// Its name.
+    pub name: String,
+    /// One past its last committed position.
+    pub head: u64,
+    /// Its first readable position.
+    pub floor: u64,
+    /// Its epoch.
+    pub epoch: u64,
+    /// Its identity.
+    pub db_id: Uuid,
+}
 
-impl Interceptor for Auth {
+/// Adds the bearer token and the database name, when set.
+#[derive(Clone)]
+struct Headers {
+    auth: Option<MetadataValue<Ascii>>,
+    db: Option<MetadataValue<Ascii>>,
+}
+
+impl Interceptor for Headers {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
-        if let Some(v) = &self.0 {
+        if let Some(v) = &self.auth {
             req.metadata_mut().insert("authorization", v.clone());
+        }
+        if let Some(v) = &self.db {
+            req.metadata_mut()
+                .insert(chron_proto::DATABASE_HEADER, v.clone());
         }
         Ok(req)
     }
@@ -162,7 +191,7 @@ impl Interceptor for Auth {
 /// fenced or stopped).
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + Send + 'static>>;
 
-type Inner = ChronClient<InterceptedService<Channel, Auth>>;
+type Inner = ChronClient<InterceptedService<Channel, Headers>>;
 
 /// One replication chunk as the leader sent it.
 #[derive(Debug, Clone)]
@@ -181,9 +210,15 @@ pub struct ReplicationChunk {
 pub type ChunkStream =
     Pin<Box<dyn Stream<Item = Result<ReplicationChunk, ClientError>> + Send + 'static>>;
 
-/// A connection to one daemon. Cheap to clone; every method takes `&self`.
+/// A connection to one daemon, bound to one of its databases. Cheap to
+/// clone; every method takes `&self`.
 #[derive(Clone)]
 pub struct Client {
+    channel: Channel,
+    token: Option<MetadataValue<Ascii>>,
+    admin_token: Option<MetadataValue<Ascii>>,
+    max_message_bytes: usize,
+    database: Option<String>,
     inner: Inner,
     admin: Inner,
     health: HealthClient<Channel>,
@@ -191,17 +226,47 @@ pub struct Client {
 
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Client")
+        write!(
+            f,
+            "Client({})",
+            self.database.as_deref().unwrap_or("default")
+        )
     }
 }
 
-fn auth(token: Option<&str>) -> Result<Auth, ClientError> {
-    Ok(Auth(match token {
+fn auth(token: Option<&str>) -> Result<Option<MetadataValue<Ascii>>, ClientError> {
+    Ok(match token {
         Some(t) => Some(format!("Bearer {t}").parse().map_err(|_| {
             ClientError::InvalidArgument("the token is not valid header text".into())
         })?),
         None => None,
-    }))
+    })
+}
+
+fn db_header(database: Option<&str>) -> Result<Option<MetadataValue<Ascii>>, ClientError> {
+    Ok(match database {
+        Some(d) => Some(d.parse().map_err(|_| {
+            ClientError::InvalidArgument(format!("{d:?} is not a valid database name"))
+        })?),
+        None => None,
+    })
+}
+
+fn build(
+    channel: &Channel,
+    auth: &Option<MetadataValue<Ascii>>,
+    db: &Option<MetadataValue<Ascii>>,
+    n: usize,
+) -> Inner {
+    ChronClient::with_interceptor(
+        channel.clone(),
+        Headers {
+            auth: auth.clone(),
+            db: db.clone(),
+        },
+    )
+    .max_decoding_message_size(n)
+    .max_encoding_message_size(n)
 }
 
 /// One finite read: what, from where, how many, which way.
@@ -259,20 +324,48 @@ impl Client {
         }
         let channel = endpoint.connect().await?;
         let n = config.max_message_bytes;
-        let inner = ChronClient::with_interceptor(channel.clone(), auth(config.token.as_deref())?)
-            .max_decoding_message_size(n)
-            .max_encoding_message_size(n);
-        let admin = ChronClient::with_interceptor(
-            channel.clone(),
-            auth(config.admin_token.as_deref().or(config.token.as_deref()))?,
-        )
-        .max_decoding_message_size(n)
-        .max_encoding_message_size(n);
+        let token = auth(config.token.as_deref())?;
+        let admin_token = auth(config.admin_token.as_deref().or(config.token.as_deref()))?;
+        let db = db_header(config.database.as_deref())?;
         Ok(Client {
-            inner,
-            admin,
-            health: HealthClient::new(channel),
+            inner: build(&channel, &token, &db, n),
+            admin: build(&channel, &admin_token, &db, n),
+            health: HealthClient::new(channel.clone()),
+            channel,
+            token,
+            admin_token,
+            max_message_bytes: n,
+            database: config.database,
         })
+    }
+
+    /// The same connection bound to the database `name`: every call of
+    /// the returned client carries `chron-db: name`. A name that is not
+    /// valid header text makes every call fail with
+    /// [`ClientError::InvalidArgument`].
+    pub fn database(&self, name: impl Into<String>) -> Client {
+        let name = name.into();
+        let db = db_header(Some(&name)).unwrap_or_else(|_| {
+            // Unrepresentable: send something the daemon will refuse.
+            Some(MetadataValue::from_static("-invalid-"))
+        });
+        let n = self.max_message_bytes;
+        Client {
+            inner: build(&self.channel, &self.token, &db, n),
+            admin: build(&self.channel, &self.admin_token, &db, n),
+            health: self.health.clone(),
+            channel: self.channel.clone(),
+            token: self.token.clone(),
+            admin_token: self.admin_token.clone(),
+            max_message_bytes: n,
+            database: Some(name),
+        }
+    }
+
+    /// The database this client is bound to, `None` for the daemon's
+    /// `default`.
+    pub fn database_name(&self) -> Option<&str> {
+        self.database.as_deref()
     }
 
     fn rpc(&self) -> Inner {
@@ -598,6 +691,7 @@ impl Client {
         let db_id = Uuid::from_slice(&i.db_id)
             .map_err(|_| ClientError::Decode("Info carries no database identity".into()))?;
         Ok(Info {
+            database: i.database,
             path: i.path,
             head: i.head,
             floor: i.floor,
@@ -714,6 +808,41 @@ impl Client {
         })))
     }
 
+    /// Creates the empty database `name` on the daemon (the leader). An
+    /// admin call; [`ClientError::AlreadyExists`] when it exists.
+    pub async fn create_database(&self, name: &str) -> Result<DatabaseInfo, ClientError> {
+        let r = self
+            .admin()
+            .create_database(pb::CreateDatabaseRequest {
+                name: name.to_string(),
+            })
+            .await?
+            .into_inner();
+        database_info(r.database.unwrap_or_default())
+    }
+
+    /// Every database of the daemon. An admin call.
+    pub async fn list_databases(&self) -> Result<Vec<DatabaseInfo>, ClientError> {
+        let r = self
+            .admin()
+            .list_databases(pb::ListDatabasesRequest {})
+            .await?
+            .into_inner();
+        r.databases.into_iter().map(database_info).collect()
+    }
+
+    /// Drops the database `name` on the daemon (the leader); `default`
+    /// cannot be dropped. An admin call; [`ClientError::NotFound`] when
+    /// there is no such database.
+    pub async fn drop_database(&self, name: &str) -> Result<(), ClientError> {
+        self.admin()
+            .drop_database(pb::DropDatabaseRequest {
+                name: name.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Whether `service` reports SERVING: `""` for the daemon as a whole,
     /// `"chron.v1.Chron"` for the service, `"chron.v1.Chron.leader"` only
     /// while the node leads. Needs no token.
@@ -728,4 +857,15 @@ impl Client {
             .into_inner();
         Ok(r.status() == ServingStatus::Serving)
     }
+}
+
+fn database_info(d: pb::DatabaseInfo) -> Result<DatabaseInfo, ClientError> {
+    Ok(DatabaseInfo {
+        name: d.name,
+        head: d.head,
+        floor: d.floor,
+        epoch: d.epoch,
+        db_id: Uuid::from_slice(&d.db_id)
+            .map_err(|_| ClientError::Decode("a database without an identity".into()))?,
+    })
 }

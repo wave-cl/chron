@@ -1,6 +1,7 @@
-//! `chrond`: one chron database behind the `chron.v1` gRPC service, as a
-//! leader or as a replica of another daemon. [`start`] serves it; the
-//! `chrond` binary wraps that with flags and signal handling.
+//! `chrond`: the chron databases under one data directory behind the
+//! `chron.v1` gRPC service, as a leader or as a replica of another daemon.
+//! [`start`] serves them; the `chrond` binary wraps that with flags and
+//! signal handling.
 
 mod auth;
 mod codec;
@@ -12,7 +13,7 @@ pub mod testing;
 mod trace;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,15 +29,18 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 
-use crate::node::{FENCED_MARKER, Node, PROMOTED_MARKER, REPLICA_MARKER, Role, Upstream};
+use crate::node::{DbNode, FENCED_MARKER, Node, PROMOTED_MARKER, REPLICA_MARKER, Role, Upstream};
 
 /// The health service name that is SERVING only while this node is the
 /// leader (`chron.v1.Chron` itself is SERVING in every role).
 pub const LEADER_HEALTH_SERVICE: &str = "chron.v1.Chron.leader";
 
-/// How the daemon opens and serves its database.
+/// How the daemon opens and serves its databases.
 #[derive(Debug, Clone)]
 pub struct Options {
+    /// Holds one directory per database (`default` always); a 0.1.0
+    /// directory that is itself a database is moved into `default/` on
+    /// the first start.
     pub data_dir: PathBuf,
     pub listen: SocketAddr,
     /// `false` for [`Fsync::Never`].
@@ -76,6 +80,9 @@ pub struct Options {
     /// HTTP/2 ping interval and how long to wait for its answer.
     pub keepalive_interval: Duration,
     pub keepalive_timeout: Duration,
+    /// How often a replica asks its leader for the list of databases
+    /// (it also asks whenever a puller reconnects).
+    pub discover_interval: Duration,
 }
 
 /// PEM bytes for the server's certificate chain and key, and optionally
@@ -119,6 +126,7 @@ impl Options {
             concurrency_per_connection: 256,
             keepalive_interval: Duration::from_secs(30),
             keepalive_timeout: Duration::from_secs(10),
+            discover_interval: Duration::from_secs(10),
         }
     }
 }
@@ -127,7 +135,7 @@ impl Options {
 /// [`shutdown`](Running::shutdown).
 pub struct Running {
     pub local_addr: SocketAddr,
-    /// The database being served; tests commit through it directly.
+    /// The `default` database; tests commit through it directly.
     pub db: Db,
     pub node: Arc<Node>,
     health: HealthReporter,
@@ -135,10 +143,11 @@ pub struct Running {
     server: JoinHandle<Result<(), tonic::transport::Error>>,
 }
 
-/// Opens (and recovers) the database, settles the node's role, binds
-/// `opts.listen` (port 0 picks a free port) and serves until
-/// [`Running::shutdown`]. A replica whose leader is unreachable starts
-/// disconnected and keeps trying; one its leader refuses does not start.
+/// Opens (and recovers) every database under `data_dir`, settles the
+/// node's role, binds `opts.listen` (port 0 picks a free port) and serves
+/// until [`Running::shutdown`]. A replica whose leader is unreachable
+/// starts disconnected and keeps trying; one its leader refuses does not
+/// start.
 pub async fn start(opts: Options) -> anyhow::Result<Running> {
     let mut db_opts = chron::Options::new()
         .fsync(if opts.fsync {
@@ -175,16 +184,11 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         }
         None => None,
     };
-    let dir = opts.data_dir.clone();
-    let db = tokio::task::spawn_blocking(move || Db::open(&dir, db_opts))
-        .await
-        .context("open task")?
-        .with_context(|| format!("cannot open the database at {}", opts.data_dir.display()))?;
-    if opts.max_message_bytes < db.options().max_record_bytes {
+    if opts.max_message_bytes < db_opts.max_record_bytes {
         anyhow::bail!(
             "max_message_bytes ({}) is below the database's max_record_bytes ({})",
             opts.max_message_bytes,
-            db.options().max_record_bytes
+            db_opts.max_record_bytes
         );
     }
     if opts.replicate_tls.is_some()
@@ -204,14 +208,21 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         max_message_bytes: opts.max_message_bytes,
     });
     let node = Arc::new(Node::new(
-        db.clone(),
         opts.data_dir.clone(),
         backup_dir,
         opts.admin_token.as_deref(),
         upstream,
         opts.max_message_bytes,
+        db_opts,
+        opts.discover_interval,
         cancel.clone(),
     ));
+    let dir = opts.data_dir.clone();
+    tokio::task::spawn_blocking(move || migrate_layout(&dir))
+        .await
+        .context("migration task")??;
+    open_all(&node).await?;
+    let db = node.default_db().db.clone();
 
     settle_role(&node, &opts).await?;
 
@@ -256,7 +267,8 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
             .add_service(svc)
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown),
     );
-    tracing::info!(%local_addr, path = %db.path().display(), head = db.head(), role = ?node.role(), epoch = db.epoch(), "listening");
+    let names: Vec<String> = node.databases().iter().map(|d| d.name.clone()).collect();
+    tracing::info!(%local_addr, data_dir = %opts.data_dir.display(), databases = %names.join(","), head = db.head(), role = ?node.role(), epoch = db.epoch(), "listening");
     Ok(Running {
         local_addr,
         db,
@@ -265,6 +277,103 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         cancel,
         server,
     })
+}
+
+/// A 0.1.0 data directory holds one database at its root; the layout is
+/// now one directory per database. The root's `index.redb` and
+/// `segments` move into `default/` (each rename is idempotent, so a crash
+/// midway resumes), a stale root `LOCK` goes, markers stay at the root.
+fn migrate_layout(data_dir: &Path) -> anyhow::Result<()> {
+    let index = data_dir.join("index.redb");
+    let segments = data_dir.join("segments");
+    if !index.exists() && !segments.exists() {
+        return Ok(());
+    }
+    let target = data_dir.join(chron_proto::DEFAULT_DATABASE);
+    std::fs::create_dir_all(&target)
+        .with_context(|| format!("cannot create {}", target.display()))?;
+    for (from, name) in [(&index, "index.redb"), (&segments, "segments")] {
+        if !from.exists() {
+            continue;
+        }
+        let to = target.join(name);
+        if to.exists() {
+            anyhow::bail!(
+                "both {} and {} exist: the 0.1.0 layout was only half moved into default/; resolve by hand",
+                from.display(),
+                to.display()
+            );
+        }
+        std::fs::rename(from, &to)
+            .with_context(|| format!("cannot move {} to {}", from.display(), to.display()))?;
+    }
+    match std::fs::remove_file(data_dir.join("LOCK")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("remove the root LOCK"),
+    }
+    for d in [data_dir, target.as_path()] {
+        std::fs::File::open(d)?.sync_all()?;
+    }
+    tracing::info!(data_dir = %data_dir.display(), "moved the 0.1.0 layout into default/");
+    Ok(())
+}
+
+/// Opens every database directory under `data_dir` (creating `default`
+/// when missing) and settles their epochs on the highest one.
+async fn open_all(node: &Arc<Node>) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&node.data_dir)
+        .with_context(|| format!("cannot create {}", node.data_dir.display()))?;
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&node.data_dir)
+        .with_context(|| format!("cannot read {}", node.data_dir.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if chron_proto::valid_database_name(&name) {
+            names.push(name);
+        } else {
+            tracing::warn!(entry = %name, "not a database name; ignored");
+        }
+    }
+    if !names.iter().any(|n| n == chron_proto::DEFAULT_DATABASE) {
+        names.push(chron_proto::DEFAULT_DATABASE.to_string());
+    }
+    names.sort();
+    for name in names {
+        let n = node.clone();
+        let name2 = name.clone();
+        let db = tokio::task::spawn_blocking(move || n.open_database(&name2))
+            .await
+            .context("open task")?
+            .with_context(|| {
+                format!(
+                    "cannot open the database at {}",
+                    node.database_dir(&name).display()
+                )
+            })?;
+        node.insert(DbNode::new(name, db, &node.cancel));
+    }
+    let max = node
+        .databases()
+        .iter()
+        .map(|d| d.db.epoch())
+        .max()
+        .unwrap_or(0);
+    for d in node.databases() {
+        if d.db.epoch() < max {
+            tracing::warn!(database = %d.name, from = d.db.epoch(), to = max, "raising a lagging epoch to the daemon's");
+            let db = d.db.clone();
+            tokio::task::spawn_blocking(move || db.set_epoch(max))
+                .await
+                .context("epoch task")?
+                .context("raise a lagging epoch")?;
+        }
+    }
+    Ok(())
 }
 
 /// Reads the markers and settles the role: a replica (connected or not),
@@ -281,15 +390,21 @@ async fn settle_role(node: &Arc<Node>, opts: &Options) -> anyhow::Result<()> {
                 node.marker(PROMOTED_MARKER).display()
             );
         }
-        let stream = match replica::connect_and_check(node).await {
-            Ok(s) => Some(s),
-            Err(replica::CheckError::Unreachable(e)) => {
-                tracing::warn!(error = %e, "starting disconnected; retrying");
-                replica::record_error(node, e);
-                None
-            }
-            Err(replica::CheckError::Refused(e)) => anyhow::bail!("cannot replicate: {e}"),
-        };
+        let mut streams = Vec::new();
+        for dbn in node.databases() {
+            let stream = match replica::connect_and_check(node, &dbn).await {
+                Ok(s) => Some(s),
+                Err(replica::CheckError::Unreachable(e)) => {
+                    tracing::warn!(database = %dbn.name, error = %e, "starting disconnected; retrying");
+                    replica::record_error(&dbn, e);
+                    None
+                }
+                Err(replica::CheckError::Refused(e)) => {
+                    anyhow::bail!("cannot replicate {}: {e}", dbn.name)
+                }
+            };
+            streams.push((dbn, stream));
+        }
         node.write_marker_text(
             REPLICA_MARKER,
             &format!("leader {}\n", node.leader_addr().unwrap_or("?")),
@@ -298,7 +413,10 @@ async fn settle_role(node: &Arc<Node>, opts: &Options) -> anyhow::Result<()> {
         node.set_role(Role::Replica);
         node.remove_marker(FENCED_MARKER)
             .context("remove the fenced marker")?;
-        *node.puller.lock().await = Some(replica::spawn(node.clone(), stream));
+        for (dbn, stream) in streams {
+            *dbn.puller.lock().await = Some(replica::spawn(node.clone(), dbn.clone(), stream));
+        }
+        *node.discoverer.lock().await = Some(replica::spawn_discoverer(node.clone()));
         return Ok(());
     }
     if let Some(text) = node.marker_text(REPLICA_MARKER) {
@@ -312,11 +430,17 @@ async fn settle_role(node: &Arc<Node>, opts: &Options) -> anyhow::Result<()> {
                 "{dir} is a replica of {leader}; start it with --replicate-from, or promote it with --promote"
             );
         }
-        let db = node.db.clone();
-        let epoch = db.epoch() + 1;
+        let n = node.clone();
+        let epoch = node
+            .databases()
+            .iter()
+            .map(|d| d.db.epoch())
+            .max()
+            .unwrap_or(0)
+            + 1;
         node.write_marker(PROMOTED_MARKER, epoch)
             .context("write the promoted marker")?;
-        tokio::task::spawn_blocking(move || db.set_epoch(epoch))
+        tokio::task::spawn_blocking(move || n.raise_all_epochs(epoch))
             .await
             .context("epoch task")?
             .context("raise the epoch")?;
@@ -331,15 +455,15 @@ async fn settle_role(node: &Arc<Node>, opts: &Options) -> anyhow::Result<()> {
         anyhow::bail!("{dir} is not a replica; nothing to promote");
     }
     if let Some(e) = node.read_marker(PROMOTED_MARKER)
-        && e > node.db.epoch()
+        && e > node.epoch()
     {
-        // A crash between the marker and the epoch.
-        let db = node.db.clone();
-        tokio::task::spawn_blocking(move || db.set_epoch(e))
+        // A crash between the marker and the epochs.
+        let n = node.clone();
+        tokio::task::spawn_blocking(move || n.raise_all_epochs(e))
             .await
             .context("epoch task")?
             .context("raise the epoch to the promoted marker's")?;
-        tracing::warn!(epoch = e, "raised the epoch to the promoted marker's");
+        tracing::warn!(epoch = e, "raised every epoch to the promoted marker's");
     }
     if let Some(by) = node.read_marker(FENCED_MARKER) {
         node.set_fenced_by(Some(by));
@@ -391,8 +515,13 @@ impl Running {
         self.health
             .set_service_status(LEADER_HEALTH_SERVICE, ServingStatus::NotServing)
             .await;
-        if let Some(p) = self.node.puller.lock().await.take() {
-            p.stop().await;
+        if let Some(d) = self.node.discoverer.lock().await.take() {
+            d.stop().await;
+        }
+        for dbn in self.node.databases() {
+            if let Some(p) = dbn.puller.lock().await.take() {
+                p.stop().await;
+            }
         }
         if let Some(f) = self
             .node
@@ -410,11 +539,15 @@ impl Running {
                 .and_then(|r| r.context("server")),
             Err(_) => Err(anyhow::anyhow!("the server did not stop within 10 s")),
         };
-        let db = self.db;
-        let flushed = tokio::task::spawn_blocking(move || db.flush())
-            .await
-            .context("flush task")
-            .and_then(|r| r.context("flush"));
+        let mut flushed = Ok(());
+        for dbn in self.node.databases() {
+            let db = dbn.db.clone();
+            let r = tokio::task::spawn_blocking(move || db.flush())
+                .await
+                .context("flush task")
+                .and_then(|r| r.with_context(|| format!("flush {}", dbn.name)));
+            flushed = flushed.and(r);
+        }
         stopped.and(flushed)
     }
 }

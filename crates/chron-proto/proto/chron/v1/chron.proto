@@ -139,7 +139,29 @@ message InfoResponse {
   optional uint64 fenced_by = 14;
   // Whether commits are synced to disk before they are acknowledged.
   bool fsync = 15;
+  // The database this call was addressed to (`chron-db`, or `default`).
+  string database = 16;
 }
+
+// One of the daemon's databases.
+message DatabaseInfo {
+  string name = 1;
+  uint64 head = 2;
+  uint64 floor = 3;
+  uint64 epoch = 4;
+  bytes db_id = 5;
+}
+
+// A new, empty database named `name` (`[a-z0-9_-]{1,64}`). ALREADY_EXISTS
+// when one exists; FAILED_PRECONDITION on a replica or a fenced node.
+message CreateDatabaseRequest { string name = 1; }
+message CreateDatabaseResponse { DatabaseInfo database = 1; }
+message ListDatabasesRequest {}
+message ListDatabasesResponse { repeated DatabaseInfo databases = 1; }
+// Closes and removes the database; `default` cannot be dropped. Streams
+// on it end with UNAVAILABLE. NOT_FOUND when there is no such database.
+message DropDatabaseRequest { string name = 1; }
+message DropDatabaseResponse {}
 
 // A backup written by the daemon as the bare file name `archive` under its
 // backup directory (`--backup-dir`; refused without one): full without
@@ -203,7 +225,11 @@ message RetainResponse {
   uint64 bytes_freed = 3;
 }
 
-// The whole database over one service.
+// Every database of one daemon over one service. A call names its
+// database with the metadata `chron-db: <name>` (`[a-z0-9_-]{1,64}`);
+// absent, it goes to the database `default`, which always exists. An
+// unknown name is NOT_FOUND, a bad one INVALID_ARGUMENT. ListDatabases,
+// Promote and Fence are daemon-wide and ignore the header.
 //
 // Status codes: an append whose expectation fails is FAILED_PRECONDITION
 // with the metadata `chron-actual-length` and `chron-aggregate`; a
@@ -234,4 +260,7 @@ service Chron {
   rpc Replicate(ReplicateRequest) returns (stream ReplicationChunk);
   rpc Promote(PromoteRequest) returns (PromoteResponse);
   rpc Fence(FenceRequest) returns (FenceResponse);
+  rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
+  rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
+  rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
 }

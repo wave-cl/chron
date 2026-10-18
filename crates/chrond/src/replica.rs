@@ -1,5 +1,6 @@
-//! The replica side: connect to the leader, check the two histories agree,
-//! then pull chunks for as long as the daemon runs.
+//! The replica side: connect to the leader, check the two histories agree
+//! database by database, then pull chunks for as long as the daemon runs;
+//! and a discovery task that follows the leader's list of databases.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,12 +10,12 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::node::{Node, Role, Upstream};
+use crate::node::{DbNode, Node, Role, Upstream};
 
 const BACKOFF_MIN: Duration = Duration::from_millis(200);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
-/// A bound on the leader's answer to `Info`, so a hung leader cannot hang
-/// the puller or a start.
+/// A bound on the leader's answer to `Info` or `ListDatabases`, so a hung
+/// leader cannot hang the puller or a start.
 const INFO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Why a replica could not follow its leader.
@@ -73,20 +74,27 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| e.to_string())
 }
 
-/// Connects to the leader and checks this database can follow it: same
-/// identity (an empty database adopts the leader's), an epoch no newer
-/// than the leader's, a head no further, and the same record before it.
-/// Nothing is written here until the leader has accepted the stream.
-/// Returns the open chunk stream.
-pub async fn connect_and_check(node: &Arc<Node>) -> Result<ChunkStream, CheckError> {
+/// Connects to the leader and checks this database can follow the
+/// leader's database of the same name: same identity (an empty database
+/// adopts the leader's), an epoch no newer than the leader's, a head no
+/// further, and the same record before it. Nothing is written here until
+/// the leader has accepted the stream. Returns the open chunk stream.
+pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<ChunkStream, CheckError> {
     let up = node
         .upstream
         .as_ref()
         .ok_or_else(|| CheckError::Refused("no leader configured".into()))?;
     let addr = up.addr.as_str();
-    let client = connect(up).await?;
+    let client = connect(up).await?.database(&dbn.name);
     let info = match tokio::time::timeout(INFO_TIMEOUT, client.info()).await {
-        Ok(r) => r.map_err(|e| unreachable(addr, e))?,
+        Ok(Ok(i)) => i,
+        Ok(Err(ClientError::NotFound(_))) => {
+            return Err(CheckError::Refused(format!(
+                "{addr} has no database {}: it was dropped there; the local copy is kept",
+                dbn.name
+            )));
+        }
+        Ok(Err(e)) => return Err(unreachable(addr, e)),
         Err(_) => {
             return Err(CheckError::Unreachable(format!(
                 "{addr} did not answer Info within {INFO_TIMEOUT:?}"
@@ -100,13 +108,14 @@ pub async fn connect_and_check(node: &Arc<Node>) -> Result<ChunkStream, CheckErr
         )));
     }
     let leader_id = info.db_id;
-    let db = node.db.clone();
+    let db = dbn.db.clone();
     let (head, floor, id, epoch) = (db.head(), db.floor(), db.id(), db.epoch());
     let empty = head == 0 && floor == 0;
     if id != leader_id && !empty {
         return Err(CheckError::Refused(format!(
-            "{} is database {id}; {addr} serves database {leader_id}; a replica must be restored from a backup of the leader",
-            node.data_dir.display()
+            "{} is database {id}; {addr} serves database {leader_id} as {}; a replica must be restored from a backup of the leader",
+            node.database_dir(&dbn.name).display(),
+            dbn.name
         )));
     }
     if epoch > info.epoch {
@@ -152,7 +161,7 @@ pub async fn connect_and_check(node: &Arc<Node>) -> Result<ChunkStream, CheckErr
     Ok(stream)
 }
 
-/// The pull loop's handle.
+/// A pull or discovery loop's handle.
 pub struct Puller {
     cancel: CancellationToken,
     handle: JoinHandle<()>,
@@ -165,19 +174,24 @@ impl Puller {
     }
 }
 
-/// Pulls from `initial` (or reconnects first, when it is `None`) until
-/// stopped. On exit the node is recorded as disconnected.
-pub fn spawn(node: Arc<Node>, initial: Option<ChunkStream>) -> Puller {
-    let cancel = node.cancel.child_token();
+/// Pulls `dbn` from `initial` (or reconnects first, when it is `None`)
+/// until stopped. On exit the database is recorded as disconnected.
+pub fn spawn(node: Arc<Node>, dbn: Arc<DbNode>, initial: Option<ChunkStream>) -> Puller {
+    let cancel = dbn.cancel.child_token();
     let task_cancel = cancel.clone();
     let handle = tokio::spawn(async move {
-        pull(&node, initial, &task_cancel).await;
-        node.record_replica(|r| r.connected = false);
+        pull(&node, &dbn, initial, &task_cancel).await;
+        dbn.record_replica(|r| r.connected = false);
     });
     Puller { cancel, handle }
 }
 
-async fn pull(node: &Arc<Node>, initial: Option<ChunkStream>, cancel: &CancellationToken) {
+async fn pull(
+    node: &Arc<Node>,
+    dbn: &Arc<DbNode>,
+    initial: Option<ChunkStream>,
+    cancel: &CancellationToken,
+) {
     let mut stream = initial;
     let mut backoff = BACKOFF_MIN;
     loop {
@@ -191,31 +205,32 @@ async fn pull(node: &Arc<Node>, initial: Option<ChunkStream>, cancel: &Cancellat
                 backoff = (backoff * 2).min(BACKOFF_MAX);
                 let checked = tokio::select! {
                     _ = cancel.cancelled() => return,
-                    c = connect_and_check(node) => c,
+                    c = connect_and_check(node, dbn) => c,
                 };
                 match checked {
                     Ok(s) => {
                         backoff = BACKOFF_MIN;
+                        node.discover_now.notify_one();
                         break s;
                     }
-                    Err(e) => record_error(node, e.message().to_string()),
+                    Err(e) => record_error(dbn, e.message().to_string()),
                 }
             },
         };
-        node.record_replica(|r| {
+        dbn.record_replica(|r| {
             r.connected = true;
             r.last_error = None;
         });
-        match tail(node, s, cancel).await {
+        match tail(node, dbn, s, cancel).await {
             Ok(()) => return,
-            Err(e) => record_error(node, e),
+            Err(e) => record_error(dbn, e),
         }
     }
 }
 
-pub fn record_error(node: &Node, e: String) {
-    tracing::warn!(error = %e, "replication");
-    node.record_replica(|r| {
+pub fn record_error(dbn: &DbNode, e: String) {
+    tracing::warn!(database = %dbn.name, error = %e, "replication");
+    dbn.record_replica(|r| {
         r.connected = false;
         r.last_error = Some(e);
     });
@@ -225,6 +240,7 @@ pub fn record_error(node: &Node, e: String) {
 /// chunk being applied is never abandoned midway.
 async fn tail(
     node: &Arc<Node>,
+    dbn: &Arc<DbNode>,
     mut stream: ChunkStream,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
@@ -236,7 +252,7 @@ async fn tail(
         let c = msg
             .ok_or_else(|| "the leader closed the stream".to_string())?
             .map_err(|e| format!("the leader's stream failed: {e}"))?;
-        let db = node.db.clone();
+        let db = dbn.db.clone();
         if c.db_id != Some(db.id()) {
             return Err("the leader's stream carries another database's identity".into());
         }
@@ -260,9 +276,101 @@ async fn tail(
                 "applied a chunk to {to} but the head is {new_head}"
             ));
         }
-        node.record_replica(|r| r.leader_head = Some(c.head));
+        dbn.record_replica(|r| r.leader_head = Some(c.head));
         if node.role() != Role::Replica {
             return Ok(());
         }
     }
+}
+
+/// Follows the leader's list of databases: at spawn, every
+/// `discover_interval`, and whenever a puller reconnects. A database the
+/// leader has and this daemon does not is created locally and pulled; one
+/// the leader no longer lists stops being pulled and is kept, read-only.
+pub fn spawn_discoverer(node: Arc<Node>) -> Puller {
+    let cancel = node.cancel.child_token();
+    let task_cancel = cancel.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            let outcome = tokio::select! {
+                _ = task_cancel.cancelled() => return,
+                r = discover(&node) => r,
+            };
+            match outcome {
+                Ok(()) => {
+                    *node
+                        .discovery_error
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = None
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "database discovery");
+                    *node
+                        .discovery_error
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(e);
+                }
+            }
+            tokio::select! {
+                _ = task_cancel.cancelled() => return,
+                _ = tokio::time::sleep(node.discover_interval) => {}
+                _ = node.discover_now.notified() => {}
+            }
+        }
+    });
+    Puller { cancel, handle }
+}
+
+async fn discover(node: &Arc<Node>) -> Result<(), String> {
+    let up = node.upstream.as_ref().ok_or("no leader configured")?;
+    let client = connect(up).await.map_err(|e| e.to_string())?;
+    let listed = match tokio::time::timeout(INFO_TIMEOUT, client.list_databases()).await {
+        Ok(r) => r.map_err(|e| format!("ListDatabases on {}: {e}", up.addr))?,
+        Err(_) => return Err(format!("{} did not answer ListDatabases", up.addr)),
+    };
+    let names: std::collections::HashSet<String> = listed.into_iter().map(|d| d.name).collect();
+    if node.role() != Role::Replica {
+        return Ok(());
+    }
+    for name in &names {
+        if !chron_proto::valid_database_name(name) {
+            tracing::warn!(database = %name, "the leader lists a database with an invalid name; skipped");
+            continue;
+        }
+        let dbn = match node.get(name) {
+            Some(d) => d,
+            None => {
+                let n = node.clone();
+                let name2 = name.clone();
+                let db = tokio::task::spawn_blocking(move || n.open_database(&name2))
+                    .await
+                    .map_err(|e| format!("open task: {e}"))?
+                    .map_err(|e| format!("cannot create the database {name}: {e}"))?;
+                let dbn = DbNode::new(name.clone(), db, &node.cancel);
+                node.insert(dbn.clone());
+                tracing::info!(database = %name, "created to mirror the leader");
+                dbn
+            }
+        };
+        let mut puller = dbn.puller.lock().await;
+        if puller.is_none() {
+            *puller = Some(spawn(node.clone(), dbn.clone(), None));
+        }
+    }
+    for dbn in node.databases() {
+        if names.contains(&dbn.name) {
+            continue;
+        }
+        let mut puller = dbn.puller.lock().await;
+        if let Some(p) = puller.take() {
+            p.stop().await;
+            let msg = "dropped on the leader; the local copy is kept".to_string();
+            tracing::warn!(database = %dbn.name, "{msg}");
+            dbn.record_replica(|r| {
+                r.connected = false;
+                r.last_error = Some(msg);
+            });
+        }
+    }
+    Ok(())
 }

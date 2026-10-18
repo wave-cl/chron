@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-/// Serves one chron database over gRPC.
+/// Serves the chron databases under a data directory over gRPC.
 #[derive(Parser, Debug)]
 #[command(name = "chrond", version, about)]
 struct Cli {
@@ -104,6 +104,10 @@ struct Cli {
     /// Seconds to wait for a ping's answer before closing the connection.
     #[arg(long, env = "CHROND_KEEPALIVE_TIMEOUT", default_value_t = 10)]
     keepalive_timeout: u64,
+    /// Seconds between a replica's requests for the leader's list of
+    /// databases (it also asks whenever a puller reconnects).
+    #[arg(long, env = "CHROND_DISCOVER_INTERVAL", default_value_t = 10)]
+    discover_interval: u64,
 }
 
 fn read(path: &PathBuf, what: &str) -> anyhow::Result<Vec<u8>> {
@@ -164,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
     opts.backup_dir = cli.backup_dir;
     opts.keepalive_interval = std::time::Duration::from_secs(cli.keepalive_interval);
     opts.keepalive_timeout = std::time::Duration::from_secs(cli.keepalive_timeout);
+    opts.discover_interval = std::time::Duration::from_secs(cli.discover_interval.max(1));
     opts.max_message_bytes = cli.max_message_bytes;
     opts.request_timeout = cli.request_timeout.map(std::time::Duration::from_secs);
     opts.concurrency_per_connection = cli.concurrency_per_connection;

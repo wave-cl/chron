@@ -20,7 +20,7 @@ impl Fixture {
         opts.fsync = false;
         f(&mut opts);
         let running = chrond::start(opts).await.expect("the daemon starts");
-        let scheme = if running.node.db.path().exists() && config.tls.is_some() {
+        let scheme = if running.db.path().exists() && config.tls.is_some() {
             "https"
         } else {
             "http"

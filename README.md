@@ -131,6 +131,12 @@ files stay open for reading; the least recently used is closed first.
   segments/<base>.seg       64-byte header, then framed records (length, crc32, body)
 ```
 
+A daemon's data directory holds one such directory per database
+(`<data_dir>/<name>/`, `default` always) with its markers (`promoted`,
+`fenced`, `replica`) at the root. A 0.1.0 data directory, which was one
+database at the root, is moved into `default/` on the daemon's first
+start.
+
 Every database has an **identity** (a UUID, `db.id()`), kept by backups,
 restores and index rebuilds, and an **epoch** (`db.epoch()`) that
 replication raises on every promotion. `db.info()` reports head, floor,
@@ -212,8 +218,12 @@ let mut live = client.subscribe_tag("orders", committed.next).await?;
 
 `chron-client` speaks the library's types and shapes: the same six reads
 with `limit` 0 for everything, each with a `_stream` variant,
-`subscribe` / `subscribe_tag`, `info`, `flush`, and the admin calls
-(`backup`, `apply_backup`, `retain`, `promote`, `fence`, `replicate`).
+`subscribe` / `subscribe_tag`, `info`, `flush`, the admin calls
+(`backup`, `apply_backup`, `retain`, `promote`, `fence`, `replicate`)
+and `create_database` / `list_databases` / `drop_database`. A client is
+bound to one database: `ClientConfig.database`, or
+`client.database("orders")` for another binding over the same
+connection.
 Errors are typed: `Conflict`, `Fenced { epoch }`, `PositionOutOfRange
 { position, head }`, `BelowFloor { position, floor }`, `Unauthenticated`,
 `PermissionDenied`, `ResourceExhausted`, `Unavailable`. `ClientConfig`
@@ -253,7 +263,17 @@ is flushed.
 The service is `chron.v1.Chron` in
 `crates/chron-proto/proto/chron/v1/chron.proto`: commit, the six reads
 (server-streamed, `limit` 0 for everything), subscribe, head, aggregate
-length, info, flush, backup, apply, retain, replicate, promote and fence.
+length, info, flush, backup, apply, retain, replicate, promote, fence,
+and CreateDatabase, ListDatabases and DropDatabase. One daemon serves
+**several databases**: a call names its database with the metadata
+`chron-db: <name>` (`[a-z0-9_-]{1,64}`); absent, it goes to `default`,
+which always exists and cannot be dropped, so a client that knows
+nothing of databases keeps working. An unknown name is `NOT_FOUND`, a
+bad one `INVALID_ARGUMENT`, creating an existing one `ALREADY_EXISTS`.
+Databases are created and dropped on the leader (admin calls); dropping
+one ends its streams with `UNAVAILABLE` and removes its directory.
+Options (fsync, record limit) are daemon-wide; backups go to
+`<backup_dir>/<name>/<file>`.
 A failed expectation is `FAILED_PRECONDITION` with the metadata
 `chron-actual-length` and `chron-aggregate`; a write refused by the node's
 role or epoch is `FAILED_PRECONDITION` with `chron-epoch`; bad requests
@@ -296,6 +316,7 @@ chron backup <NAME> [--since N] | apply <NAME>       # names under the daemon's 
 chron retain <FLOOR>
 chron health [--service NAME]                        # exit 0 SERVING, 1 NOT_SERVING, 2 unreachable
 chron promote | fence <EPOCH>                        # replication
+chron db create <NAME> | db list | db drop <NAME>    # databases; --db NAME (CHRON_DB) addresses one
 chron append --epoch N … | commit --epoch N …        # fencing token
 chron rebuild-index <DIR> | verify <DIR> | restore <ARCHIVE> <DIR> | inspect <ARCHIVE>   # offline, no daemon
 ```
@@ -305,7 +326,7 @@ daemon; `https://` enables TLS with `--tls-ca`, `--tls-cert`/`--tls-key`
 and `--tls-domain` (`CHRON_TLS_*`); `--token` (`CHRON_TOKEN`) and
 `--admin-token` (`CHRON_ADMIN_TOKEN`) send the bearer tokens;
 `--max-message-bytes` (`CHRON_MAX_MESSAGE_BYTES`) matches the daemon's
-limit. The offline commands take `--max-record-bytes` when the database
+limit; `--db` (`CHRON_DB`) addresses a database other than `default`. The offline commands take `--max-record-bytes` when the database
 was written with a non-default limit, and refuse a directory that holds
 no database. `--json` prints one JSON object per line, with `payload`,
 `metadata` and `tags` as strings when they are UTF-8 and as
@@ -317,12 +338,20 @@ files and bad base64) or an unreachable daemon.
 
 ## Replication
 
-A daemon started with `--replicate-from` is a **replica**: it checks that
-it is a copy of the leader (same identity, a head no further than the
-leader's, the same record before its head; an empty database adopts the
-leader's identity), then pulls whole transactions and applies them
-through the normal commit path, reconnecting with backoff when the
-leader goes away. A leader that is merely unreachable lets the replica
+A daemon started with `--replicate-from` is a **replica** of the whole
+leader daemon: for every database it checks that it holds a copy of the
+leader's database of the same name (same identity, a head no further
+than the leader's, the same record before its head; an empty database
+adopts the leader's identity), then pulls whole transactions and applies
+them through the normal commit path, reconnecting with backoff when the
+leader goes away. It asks the leader for its list of databases at
+start, every `--discover-interval` (10 s) and whenever a puller
+reconnects: a database created on the leader is created and followed on
+the replica; one dropped on the leader is kept on the replica, read-only,
+with `last_replication_error` saying so (remove its directory by hand).
+The replication token must be the leader's admin token when it has one.
+Every database of a daemon carries the same epoch; promotion raises them
+all. A leader that is merely unreachable lets the replica
 start disconnected; a leader that *refuses* it (another database, a
 diverged history) fails the start. A replica serves reads,
 subscriptions, backups and retention; it refuses writes with "read-only
@@ -364,8 +393,9 @@ record before it is gone; the leader accepts it without that check.
 - An incremental apply or replication chunk interrupted mid-way (a crash
   between the segment write and the index commit) is rolled back on the
   next open; the caller retries from the head the error reports.
-- A crates.io release, automatic failover and more than one leader are
-  not in this version.
+- Per-database options (fsync, record limit) are daemon-wide, and
+  `default` cannot be dropped.
+- Automatic failover and more than one leader are not in this version.
 
 ## Development
 

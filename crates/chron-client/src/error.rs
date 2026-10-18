@@ -64,6 +64,12 @@ pub enum ClientError {
     /// The call needs the daemon's admin token.
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+    /// No such database.
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// A database of that name exists.
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
     /// The daemon is fenced, stopping, or the connection failed.
     #[error("unavailable: {0}")]
     Unavailable(String),
@@ -125,6 +131,8 @@ impl From<Status> for ClientError {
             }
             Code::InvalidArgument => ClientError::InvalidArgument(s.message().to_string()),
             Code::PermissionDenied => ClientError::PermissionDenied(s.message().to_string()),
+            Code::NotFound => ClientError::NotFound(s.message().to_string()),
+            Code::AlreadyExists => ClientError::AlreadyExists(s.message().to_string()),
             Code::Unauthenticated => ClientError::Unauthenticated(s.message().to_string()),
             Code::Unavailable => ClientError::Unavailable(s.message().to_string()),
             Code::ResourceExhausted => ClientError::ResourceExhausted(s.message().to_string()),

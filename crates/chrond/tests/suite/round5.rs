@@ -426,7 +426,7 @@ async fn apply_backup_racing_fence_never_lands_after_the_fence() {
         .unwrap();
     // An incremental 3..5 from a restored copy, so this daemon (head 3)
     // can apply it.
-    let backups = s.dir.path().join("backups");
+    let backups = s.dir.path().join("backups/default");
     let copy = s.dir.path().join("copy");
     chron::restore_backup(backups.join("full.chronbak"), &copy, &chron::Options::new()).unwrap();
     {

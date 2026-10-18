@@ -64,6 +64,11 @@ enum Commands {
     Promote,
     /// Tell a leader that a newer epoch exists; it refuses writes from then on.
     Fence { epoch: u64 },
+    /// Create, list or drop the daemon's databases.
+    Db {
+        #[command(subcommand)]
+        cmd: DbCommands,
+    },
     /// Offline: rebuild a database's index from its segment files.
     RebuildIndex {
         path: std::path::PathBuf,
@@ -85,6 +90,16 @@ enum Commands {
     },
     /// Offline: print a backup's header.
     Inspect { archive: std::path::PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+enum DbCommands {
+    /// Create an empty database (1 to 64 of a-z, 0-9, _ and -).
+    Create { name: String },
+    /// Every database with its head, floor, epoch and id.
+    List,
+    /// Drop a database and its data; `default` cannot be dropped.
+    Drop { name: String },
 }
 
 #[tokio::main]
@@ -129,6 +144,11 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Health { service } => cmd::admin::health(conn, format, &service).await,
         Commands::Promote => cmd::admin::promote(conn, format).await,
         Commands::Fence { epoch } => cmd::admin::fence(conn, format, epoch).await,
+        Commands::Db { cmd } => match cmd {
+            DbCommands::Create { name } => cmd::admin::db_create(conn, format, &name).await,
+            DbCommands::List => cmd::admin::db_list(conn, format).await,
+            DbCommands::Drop { name } => cmd::admin::db_drop(conn, format, &name).await,
+        },
         Commands::RebuildIndex { path, opts } => cmd::offline::rebuild_index(format, &path, &opts),
         Commands::Verify { path, opts } => cmd::offline::verify(format, &path, &opts),
         Commands::Restore { archive, dir, opts } => {

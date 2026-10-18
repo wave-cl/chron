@@ -23,7 +23,8 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
     let i = client::connect(conn).await?.info().await?;
     let o = &i.options;
     let mut human = format!(
-        "path {}\ndb_id {}\nrole {}\nepoch {}\nhead {}\nfloor {}\nsegments {} ({} bytes)\nfsync {}  verify_all_segments {}  segment_max_bytes {}  max_record_bytes {}",
+        "database {}\npath {}\ndb_id {}\nrole {}\nepoch {}\nhead {}\nfloor {}\nsegments {} ({} bytes)\nfsync {}  verify_all_segments {}  segment_max_bytes {}  max_record_bytes {}",
+        i.database,
         i.path,
         i.db_id,
         i.role,
@@ -52,7 +53,7 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
         format,
         human,
         json!({
-            "path": i.path, "db_id": i.db_id.to_string(), "role": i.role.to_string(), "epoch": i.epoch,
+            "database": i.database, "path": i.path, "db_id": i.db_id.to_string(), "role": i.role.to_string(), "epoch": i.epoch,
             "head": i.head, "floor": i.floor, "segments": i.segments, "bytes": i.bytes,
             "fsync": if i.fsync { "always" } else { "never" },
             "options": { "verify_all_segments": o.verify_all_segments,
@@ -166,6 +167,46 @@ pub async fn fence(conn: &Conn, format: Format, epoch: u64) -> anyhow::Result<()
         format,
         format!("fenced; epoch {own}"),
         json!({ "epoch": own }),
+    );
+    Ok(())
+}
+
+pub async fn db_create(conn: &Conn, format: Format, name: &str) -> anyhow::Result<()> {
+    let d = client::connect(conn).await?.create_database(name).await?;
+    print_value(
+        format,
+        format!("created {}", d.name),
+        json!({ "name": d.name, "head": d.head, "floor": d.floor, "epoch": d.epoch, "db_id": d.db_id.to_string() }),
+    );
+    Ok(())
+}
+
+pub async fn db_list(conn: &Conn, format: Format) -> anyhow::Result<()> {
+    let all = client::connect(conn).await?.list_databases().await?;
+    let human = all
+        .iter()
+        .map(|d| {
+            format!(
+                "{}  head {}  floor {}  epoch {}  db_id {}",
+                d.name, d.head, d.floor, d.epoch, d.db_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let value: Vec<serde_json::Value> = all
+        .iter()
+        .map(|d| json!({ "name": d.name, "head": d.head, "floor": d.floor, "epoch": d.epoch, "db_id": d.db_id.to_string() }))
+        .collect();
+    print_value(format, human, json!({ "databases": value }));
+    Ok(())
+}
+
+pub async fn db_drop(conn: &Conn, format: Format, name: &str) -> anyhow::Result<()> {
+    client::connect(conn).await?.drop_database(name).await?;
+    print_value(
+        format,
+        format!("dropped {name}"),
+        json!({ "dropped": name }),
     );
     Ok(())
 }

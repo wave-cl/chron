@@ -15,7 +15,11 @@ async fn info_flush_shutdown_and_lock() {
         .into_inner();
     assert_eq!((info.head, info.floor, info.segments), (3, 0, 1));
     assert!(info.bytes > 64);
-    assert_eq!(info.path, s.data_dir().display().to_string());
+    assert_eq!(info.database, "default");
+    assert_eq!(
+        info.path,
+        s.data_dir().join("default").display().to_string()
+    );
     assert!(!info.options.unwrap().fsync);
     s.client.flush(pb::FlushRequest {}).await.unwrap();
 
@@ -29,7 +33,11 @@ async fn info_flush_shutdown_and_lock() {
     assert!(err.to_string().contains("cannot open"), "{err}");
 
     let _keep = s.stop().await;
-    let db = chron::Db::open(&dir, chron::Options::new().fsync(chron::Fsync::Never)).unwrap();
+    let db = chron::Db::open(
+        dir.join("default"),
+        chron::Options::new().fsync(chron::Fsync::Never),
+    )
+    .unwrap();
     assert_eq!(db.head(), 3, "shutdown flushed");
 }
 
@@ -37,7 +45,7 @@ async fn info_flush_shutdown_and_lock() {
 async fn backup_over_rpc_restores_offline_and_retain_moves_the_floor() {
     let mut s = Server::start_with(with_backup_dir).await;
     fill(&mut s.client, agg(1), 5).await;
-    let archive = s.dir.path().join("backups/full.chronbak");
+    let archive = s.dir.path().join("backups/default/full.chronbak");
     let meta = s
         .client
         .backup(pb::BackupRequest {
@@ -49,7 +57,7 @@ async fn backup_over_rpc_restores_offline_and_retain_moves_the_floor() {
         .into_inner();
     assert_eq!((meta.incremental, meta.head), (false, 5));
     fill(&mut s.client, agg(1), 2).await;
-    let inc = s.dir.path().join("backups/inc.chronbak");
+    let inc = s.dir.path().join("backups/default/inc.chronbak");
     let meta = s
         .client
         .backup(pb::BackupRequest {

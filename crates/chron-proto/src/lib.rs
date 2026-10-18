@@ -26,3 +26,19 @@ pub const POSITION_HEADER: &str = "chron-position";
 pub const FLOOR_HEADER: &str = "chron-floor";
 /// On an `OUT_OF_RANGE` for a position past the head: the head.
 pub const HEAD_HEADER: &str = "chron-head";
+/// Request metadata naming the database a call is for; absent means
+/// [`DEFAULT_DATABASE`].
+pub const DATABASE_HEADER: &str = "chron-db";
+/// The database every daemon has and a call without [`DATABASE_HEADER`]
+/// goes to.
+pub const DEFAULT_DATABASE: &str = "default";
+
+/// Whether `name` may name a database: 1 to 64 bytes of `a-z`, `0-9`,
+/// `_` and `-`.
+pub fn valid_database_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}

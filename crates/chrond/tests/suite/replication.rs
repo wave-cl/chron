@@ -96,7 +96,13 @@ async fn replica_refuses_writes_and_apply_but_backs_up_and_retains() {
         })
         .await
         .unwrap();
-    assert!(replica.dir.path().join("backups/b.chronbak").exists());
+    assert!(
+        replica
+            .dir
+            .path()
+            .join("backups/default/b.chronbak")
+            .exists()
+    );
     replica
         .client
         .retain(pb::RetainRequest { floor: 0 })
@@ -234,7 +240,7 @@ async fn a_replica_of_a_different_database_and_a_diverged_replica_are_refused() 
     .expect("refused");
     assert!(err.to_string().contains("is database"), "{err}");
 
-    let archive = leader.dir.path().join("backups/full.chronbak");
+    let archive = leader.dir.path().join("backups/default/full.chronbak");
     leader
         .client
         .backup(pb::BackupRequest {

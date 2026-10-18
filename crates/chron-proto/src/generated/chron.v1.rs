@@ -212,7 +212,52 @@ pub struct InfoResponse {
     /// Whether commits are synced to disk before they are acknowledged.
     #[prost(bool, tag = "15")]
     pub fsync: bool,
+    /// The database this call was addressed to (`chron-db`, or `default`).
+    #[prost(string, tag = "16")]
+    pub database: ::prost::alloc::string::String,
 }
+/// One of the daemon's databases.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DatabaseInfo {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub head: u64,
+    #[prost(uint64, tag = "3")]
+    pub floor: u64,
+    #[prost(uint64, tag = "4")]
+    pub epoch: u64,
+    #[prost(bytes = "vec", tag = "5")]
+    pub db_id: ::prost::alloc::vec::Vec<u8>,
+}
+/// A new, empty database named `name` (`\[a-z0-9_-\]{1,64}`). ALREADY_EXISTS
+/// when one exists; FAILED_PRECONDITION on a replica or a fenced node.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateDatabaseRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateDatabaseResponse {
+    #[prost(message, optional, tag = "1")]
+    pub database: ::core::option::Option<DatabaseInfo>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListDatabasesRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListDatabasesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub databases: ::prost::alloc::vec::Vec<DatabaseInfo>,
+}
+/// Closes and removes the database; `default` cannot be dropped. Streams
+/// on it end with UNAVAILABLE. NOT_FOUND when there is no such database.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DropDatabaseRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DropDatabaseResponse {}
 /// A backup written by the daemon as the bare file name `archive` under its
 /// backup directory (`--backup-dir`; refused without one): full without
 /// `since`, incremental from `since` with it.
@@ -357,7 +402,11 @@ pub mod chron_client {
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
-    /// The whole database over one service.
+    /// Every database of one daemon over one service. A call names its
+    /// database with the metadata `chron-db: <name>` (`[a-z0-9_-]{1,64}`);
+    /// absent, it goes to the database `default`, which always exists. An
+    /// unknown name is NOT_FOUND, a bad one INVALID_ARGUMENT. ListDatabases,
+    /// Promote and Fence are daemon-wide and ignore the header.
     ///
     /// Status codes: an append whose expectation fails is FAILED_PRECONDITION
     /// with the metadata `chron-actual-length` and `chron-aggregate`; a
@@ -752,6 +801,78 @@ pub mod chron_client {
             req.extensions_mut().insert(GrpcMethod::new("chron.v1.Chron", "Fence"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn create_database(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CreateDatabaseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CreateDatabaseResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/CreateDatabase",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("chron.v1.Chron", "CreateDatabase"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_databases(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListDatabasesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListDatabasesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/ListDatabases",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("chron.v1.Chron", "ListDatabases"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn drop_database(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DropDatabaseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DropDatabaseResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/DropDatabase",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("chron.v1.Chron", "DropDatabase"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -863,8 +984,33 @@ pub mod chron_server {
             &self,
             request: tonic::Request<super::FenceRequest>,
         ) -> std::result::Result<tonic::Response<super::FenceResponse>, tonic::Status>;
+        async fn create_database(
+            &self,
+            request: tonic::Request<super::CreateDatabaseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CreateDatabaseResponse>,
+            tonic::Status,
+        >;
+        async fn list_databases(
+            &self,
+            request: tonic::Request<super::ListDatabasesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListDatabasesResponse>,
+            tonic::Status,
+        >;
+        async fn drop_database(
+            &self,
+            request: tonic::Request<super::DropDatabaseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DropDatabaseResponse>,
+            tonic::Status,
+        >;
     }
-    /// The whole database over one service.
+    /// Every database of one daemon over one service. A call names its
+    /// database with the metadata `chron-db: <name>` (`[a-z0-9_-]{1,64}`);
+    /// absent, it goes to the database `default`, which always exists. An
+    /// unknown name is NOT_FOUND, a bad one INVALID_ARGUMENT. ListDatabases,
+    /// Promote and Fence are daemon-wide and ignore the header.
     ///
     /// Status codes: an append whose expectation fails is FAILED_PRECONDITION
     /// with the metadata `chron-actual-length` and `chron-aggregate`; a
@@ -1602,6 +1748,141 @@ pub mod chron_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = FenceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/CreateDatabase" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateDatabaseSvc<T: Chron>(pub Arc<T>);
+                    impl<
+                        T: Chron,
+                    > tonic::server::UnaryService<super::CreateDatabaseRequest>
+                    for CreateDatabaseSvc<T> {
+                        type Response = super::CreateDatabaseResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CreateDatabaseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::create_database(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CreateDatabaseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/ListDatabases" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListDatabasesSvc<T: Chron>(pub Arc<T>);
+                    impl<
+                        T: Chron,
+                    > tonic::server::UnaryService<super::ListDatabasesRequest>
+                    for ListDatabasesSvc<T> {
+                        type Response = super::ListDatabasesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListDatabasesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::list_databases(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListDatabasesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/DropDatabase" => {
+                    #[allow(non_camel_case_types)]
+                    struct DropDatabaseSvc<T: Chron>(pub Arc<T>);
+                    impl<
+                        T: Chron,
+                    > tonic::server::UnaryService<super::DropDatabaseRequest>
+                    for DropDatabaseSvc<T> {
+                        type Response = super::DropDatabaseResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DropDatabaseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::drop_database(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DropDatabaseSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

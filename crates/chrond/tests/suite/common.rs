@@ -185,6 +185,24 @@ pub async fn plain_channel(addr: std::net::SocketAddr) -> Channel {
         .unwrap()
 }
 
+/// Adds `chron-db: <name>` to every call.
+#[derive(Clone)]
+pub struct DbInterceptor(pub tonic::metadata::MetadataValue<tonic::metadata::Ascii>);
+
+impl tonic::service::Interceptor for DbInterceptor {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        req.metadata_mut().insert("chron-db", self.0.clone());
+        Ok(req)
+    }
+}
+
+pub type DbClient =
+    ChronClient<tonic::service::interceptor::InterceptedService<Channel, DbInterceptor>>;
+
+pub fn with_db(channel: Channel, name: &str) -> DbClient {
+    ChronClient::with_interceptor(channel, DbInterceptor(name.parse().unwrap()))
+}
+
 pub fn with_token(
     channel: Channel,
     token: &str,

@@ -1,6 +1,7 @@
 mod common;
 
 mod commit;
+mod databases;
 mod lifecycle;
 mod reads;
 mod replication;

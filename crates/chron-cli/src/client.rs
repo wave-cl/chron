@@ -35,6 +35,9 @@ pub struct Conn {
     /// fence) when the daemon has a separate one.
     #[arg(long, global = true, env = "CHRON_ADMIN_TOKEN", hide_env_values = true)]
     pub admin_token: Option<String>,
+    /// The database to address; the daemon's `default` when unset.
+    #[arg(long = "db", global = true, env = "CHRON_DB")]
+    pub db: Option<String>,
     /// Largest message to accept from the daemon, in bytes (match the
     /// daemon's --max-message-bytes).
     #[arg(
@@ -89,6 +92,7 @@ impl Conn {
             token: self.token.clone(),
             admin_token: self.admin_token.clone(),
             max_message_bytes: self.max_message_bytes,
+            database: self.db.clone(),
             ..ClientConfig::default()
         })
     }

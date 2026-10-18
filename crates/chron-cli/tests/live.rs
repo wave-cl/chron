@@ -489,7 +489,7 @@ fn info_flush_backup_restore_inspect_and_retain() {
         .assert()
         .success()
         .stdout("flushed\n");
-    let archive = d.dir.path().join("backups/full.chronbak");
+    let archive = d.dir.path().join("backups/default/full.chronbak");
     d.chron()
         .args(["backup", "full.chronbak"])
         .assert()
@@ -560,7 +560,7 @@ fn info_flush_backup_restore_inspect_and_retain() {
         .stdout(predicate::str::contains("rebuilt; head 1"));
     d.chron()
         .args(["verify"])
-        .arg(d.dir.path().join("data"))
+        .arg(d.dir.path().join("data/default"))
         .assert()
         .code(1)
         .stderr(predicate::str::contains("stop the daemon first"));
@@ -602,4 +602,65 @@ fn admin_token_flag_and_env() {
         .args(["retain", "0"])
         .assert()
         .success();
+}
+
+#[test]
+fn db_subcommands_and_the_db_flag() {
+    let d = Daemon::start();
+    d.chron()
+        .args(["db", "create", "orders"])
+        .assert()
+        .success()
+        .stdout("created orders\n");
+    d.chron()
+        .args(["--db", "orders", "append", A, "-d", "o0"])
+        .assert()
+        .success();
+    d.chron().args(["head"]).assert().success().stdout("0\n");
+    d.chron()
+        .args(["--db", "orders", "head"])
+        .assert()
+        .success()
+        .stdout("1\n");
+    d.chron()
+        .env("CHRON_DB", "orders")
+        .args(["head"])
+        .assert()
+        .success()
+        .stdout("1\n");
+    d.chron().args(["db", "list"]).assert().success().stdout(
+        predicate::str::contains("default  head 0").and(predicate::str::contains("orders  head 1")),
+    );
+    d.chron()
+        .args(["--json", "db", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\":\"orders\""));
+    d.chron()
+        .args(["info"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("database default"));
+    d.chron()
+        .args(["--db", "Orders", "head"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("InvalidArgument"));
+    d.chron()
+        .args(["db", "drop", "orders"])
+        .assert()
+        .success()
+        .stdout("dropped orders\n");
+    d.chron()
+        .args(["--db", "orders", "head"])
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::contains("NotFound").and(predicate::str::contains("chron db list")),
+        );
+    d.chron()
+        .args(["db", "drop", "default"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("cannot be dropped"));
 }
