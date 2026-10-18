@@ -186,7 +186,7 @@ impl Chron for ChronService {
         if !r.backward {
             // A bad starting position is the call's status, not the
             // stream's first item.
-            self.db().read_all(r.from, 0).map_err(codec::status)?;
+            self.db().read_all(r.from, 1).map_err(codec::status)?;
         }
         let read = Read::All {
             backward: r.backward,

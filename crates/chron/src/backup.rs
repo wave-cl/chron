@@ -42,6 +42,7 @@ const COPY_CHUNK: usize = 1 << 20;
 /// of events to apply onto a database at the archive's base head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum BackupKind {
     #[default]
     Full,
@@ -236,13 +237,13 @@ fn plan(inner: &Inner) -> Result<Plan> {
         let len = if end_excl <= *base {
             HEADER_LEN
         } else {
-            let loc = inner.index.locate(end_excl - 1)?.ok_or_else(|| {
-                Error::corrupt(
-                    inner.layout.index_file(),
-                    end_excl - 1,
-                    "position below the head is missing from the index",
-                )
-            })?;
+            let loc = inner
+                .index
+                .locate(end_excl - 1)?
+                .ok_or_else(|| Error::Inconsistent {
+                    position: end_excl - 1,
+                    reason: "position below the head is missing from the index".into(),
+                })?;
             if loc.base != *base {
                 return Err(Error::corrupt(
                     path,
@@ -340,12 +341,9 @@ pub(crate) fn frames_between(inner: &Inner, from: u64, to: u64) -> Result<Vec<u8
             continue;
         }
         let locate = |p: u64| -> Result<crate::index::Location> {
-            let loc = inner.index.locate(p)?.ok_or_else(|| {
-                Error::corrupt(
-                    inner.layout.index_file(),
-                    p,
-                    "position missing from the index",
-                )
+            let loc = inner.index.locate(p)?.ok_or_else(|| Error::Inconsistent {
+                position: p,
+                reason: "position missing from the index".into(),
             })?;
             if loc.base != *base {
                 return Err(Error::corrupt(
@@ -364,12 +362,9 @@ pub(crate) fn frames_between(inner: &Inner, from: u64, to: u64) -> Result<Vec<u8
         let start = first.offset;
         let end = last.offset + u64::from(last.frame_len);
         let file = inner.file(*base)?;
-        let span = end.checked_sub(start).ok_or_else(|| {
-            Error::corrupt(
-                inner.layout.index_file(),
-                lo,
-                format!("positions {lo}..{hi} are placed out of order in segment {base}"),
-            )
+        let span = end.checked_sub(start).ok_or_else(|| Error::Inconsistent {
+            position: lo,
+            reason: format!("positions {lo}..{hi} are placed out of order in segment {base}"),
         })?;
         let at = out.len();
         out.resize(at + span as usize, 0);
@@ -569,11 +564,10 @@ pub fn restore_backup(
     let dir = dir.as_ref();
     let (reader, meta) = Reader::open(archive)?;
     if meta.kind != BackupKind::Full {
-        return Err(Error::corrupt(
-            archive,
-            12,
-            "an incremental backup; apply it with Db::apply_backup",
-        ));
+        return Err(Error::WrongBackupKind {
+            archive: archive.to_path_buf(),
+            kind: meta.kind,
+        });
     }
     if dir.exists() {
         return Err(Error::AlreadyExists {
@@ -667,11 +661,10 @@ pub(crate) fn apply(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
         .base_head
         .filter(|_| meta.kind == BackupKind::Incremental)
     else {
-        return Err(Error::corrupt(
-            archive,
-            12,
-            "a full backup; restore it with restore_backup",
-        ));
+        return Err(Error::WrongBackupKind {
+            archive: archive.to_path_buf(),
+            kind: meta.kind,
+        });
     };
     // Everything is read and checked before the database is touched.
     let mut frames = None;

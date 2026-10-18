@@ -41,6 +41,7 @@ impl Expected {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct PendingAppend {
     /// `None` for free events.
     aggregate: Option<Uuid>,
@@ -54,6 +55,7 @@ pub(crate) struct PendingAppend {
 /// Appends are checked at [`commit`](Transaction::commit), in call order.
 /// The same aggregate may be appended to more than once; a later append's
 /// expectation is checked against the length the earlier ones leave.
+#[derive(Debug)]
 pub struct Transaction {
     db: Db,
     appends: Vec<PendingAppend>,

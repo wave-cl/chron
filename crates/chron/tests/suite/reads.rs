@@ -52,7 +52,11 @@ fn read_from_index() {
     assert_eq!(payloads(&got), ["e1"]);
     assert_eq!(indices(&db.read_aggregate(a, 1, 10).unwrap()), [1, 2]);
     assert!(db.read_aggregate(a, 3, 10).unwrap().is_empty());
-    assert!(db.read_aggregate(a, 0, 0).unwrap().is_empty());
+    assert_eq!(
+        indices(&db.read_aggregate(a, 0, 0).unwrap()),
+        [0, 1, 2],
+        "0 is everything"
+    );
     assert!(db.read_aggregate(agg(9), 0, 10).unwrap().is_empty());
     assert_eq!(db.aggregate_len(agg(9)).unwrap(), 0);
 }
@@ -68,7 +72,11 @@ fn read_all_from_position() {
     assert_eq!(got[0].aggregate, Some(agg(2)));
     assert_eq!(positions(&db.read_all(0, 3).unwrap()), [0, 1, 2]);
     assert!(db.read_all(4, 1).unwrap().is_empty());
-    assert!(db.read_all(0, 0).unwrap().is_empty());
+    assert_eq!(
+        positions(&db.read_all(0, 0).unwrap()),
+        [0, 1, 2, 3],
+        "0 is everything"
+    );
     assert!(matches!(
         db.read_all(5, 1),
         Err(Error::PositionOutOfRange {
@@ -102,7 +110,11 @@ fn tag_order_across_aggregates() {
     assert_eq!(payloads(&db.read_tag("t", 0, 2).unwrap()), ["a0", "a1"]);
     assert_eq!(payloads(&db.read_tag("u", 0, 100).unwrap()), ["a1", "b1"]);
     assert!(db.read_tag("v", 0, 100).unwrap().is_empty());
-    assert!(db.read_tag("t", 0, 0).unwrap().is_empty());
+    assert_eq!(
+        payloads(&db.read_tag("t", 0, 0).unwrap()),
+        ["a0", "a1", "c0"],
+        "0 is everything"
+    );
 }
 
 #[test]
@@ -120,7 +132,11 @@ fn read_all_backward() {
     assert_eq!(payloads(&got), ["e2", "e1"]);
     assert_eq!(positions(&db.read_all_backward(0, 5).unwrap()), [0]);
     assert_eq!(positions(&db.read_all_backward(99, 1).unwrap()), [3]);
-    assert!(db.read_all_backward(3, 0).unwrap().is_empty());
+    assert_eq!(
+        positions(&db.read_all_backward(3, 0).unwrap()),
+        [3, 2, 1, 0],
+        "0 is everything"
+    );
 }
 
 #[test]
@@ -151,7 +167,11 @@ fn read_aggregate_backward() {
             .unwrap()
             .is_empty()
     );
-    assert!(db.read_aggregate_backward(a, 2, 0).unwrap().is_empty());
+    assert_eq!(
+        indices(&db.read_aggregate_backward(a, 2, 0).unwrap()),
+        [2, 1, 0],
+        "0 is everything"
+    );
 }
 
 #[test]
@@ -180,7 +200,11 @@ fn read_tag_backward() {
     assert_eq!(positions(&db.read_tag_backward("t", 1, 10).unwrap()), [0]);
     assert_eq!(positions(&db.read_tag_backward("t", 3, 1).unwrap()), [3]);
     assert!(db.read_tag_backward("v", u64::MAX, 10).unwrap().is_empty());
-    assert!(db.read_tag_backward("t", 3, 0).unwrap().is_empty());
+    assert_eq!(
+        positions(&db.read_tag_backward("t", 3, 0).unwrap()),
+        [3, 2, 0],
+        "0 is everything"
+    );
 }
 
 #[test]

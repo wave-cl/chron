@@ -221,9 +221,13 @@ async fn tail(
             let e = c.epoch;
             blocking(move || db.set_epoch(e)).await?;
         }
-        let (from, to) = (c.from, c.to);
-        let frames = c.frames;
-        let new_head = blocking(move || db.apply_chunk(from, to, &frames)).await?;
+        let to = c.to;
+        let chunk = chron::Chunk {
+            from: c.from,
+            to,
+            frames: c.frames,
+        };
+        let new_head = blocking(move || db.apply_chunk(&chunk)).await?;
         if new_head != to {
             return Err(format!(
                 "applied a chunk to {to} but the head is {new_head}"

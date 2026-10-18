@@ -1,4 +1,4 @@
-use chron::{Db, Error, Expected, Retained};
+use chron::{Db, Error, Expected};
 
 use crate::common::*;
 
@@ -55,13 +55,10 @@ fn retain_rounds_down_and_positions_are_stable() {
         (head, expected_floor, before - r.segments_removed)
     );
     // Again at the same floor: a no-op.
+    let again = db.retain_from(x).unwrap();
     assert_eq!(
-        db.retain_from(x).unwrap(),
-        Retained {
-            floor: expected_floor,
-            segments_removed: 0,
-            bytes_freed: 0
-        }
+        (again.floor, again.segments_removed, again.bytes_freed),
+        (expected_floor, 0, 0)
     );
 }
 

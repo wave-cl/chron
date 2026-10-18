@@ -55,11 +55,10 @@ pub(crate) fn chunk(inner: &Inner, from: u64, max_events: usize) -> Result<Optio
                 return Err(Error::corrupt(path, offset, "record too short for a body"));
             };
             if position == from && flags & FLAG_FIRST_IN_TXN == 0 {
-                return Err(Error::corrupt(
-                    inner.layout.index_file(),
-                    from,
-                    format!("position {from} is not the start of a transaction"),
-                ));
+                return Err(Error::Inconsistent {
+                    position: from,
+                    reason: "not the start of a transaction".into(),
+                });
             }
             position += 1;
             if flags & FLAG_LAST_IN_TXN != 0 {
@@ -77,11 +76,10 @@ pub(crate) fn chunk(inner: &Inner, from: u64, max_events: usize) -> Result<Optio
         to = next;
     }
     let Some((bytes, to)) = cut else {
-        return Err(Error::corrupt(
-            inner.layout.index_file(),
-            from,
-            "no transaction ends before the head",
-        ));
+        return Err(Error::Inconsistent {
+            position: from,
+            reason: "no transaction ends before the head".into(),
+        });
     };
     frames.truncate(bytes);
     Ok(Some(Chunk { from, to, frames }))

@@ -26,8 +26,11 @@ enum Filter {
 ///
 /// A subscription holds the database open: `Inner` lives (and its `LOCK`
 /// stays held) until every `Db` and every `Subscription` is dropped. The
-/// [`Iterator`] never ends; use [`next_timeout`](Subscription::next_timeout)
-/// from a thread that must also watch a stop flag.
+/// [`Iterator`] ends only when retention dropped the positions it would
+/// deliver next (see [`Iterator::next`] below); use
+/// [`next_timeout`](Subscription::next_timeout) from a thread that must
+/// also watch a stop flag. A tag subscription from below the floor starts
+/// at the floor, as [`Db::read_tag`] does.
 pub struct Subscription {
     db: Db,
     filter: Filter,
@@ -35,6 +38,9 @@ pub struct Subscription {
     cursor: u64,
     buffer: VecDeque<Event>,
     batch: usize,
+    /// Set once a position below the floor was asked for: nothing more can
+    /// be delivered in order.
+    ended: bool,
     #[cfg(feature = "tokio")]
     head_rx: tokio::sync::watch::Receiver<u64>,
 }
@@ -57,6 +63,7 @@ impl Subscription {
             cursor: from,
             buffer: VecDeque::new(),
             batch: DEFAULT_BATCH,
+            ended: false,
             #[cfg(feature = "tokio")]
             head_rx,
         }
@@ -111,10 +118,17 @@ impl Subscription {
         // more to deliver below `head`.
         let floor = self.db.floor();
         if self.cursor < floor {
-            return Err(crate::Error::BelowFloor {
-                position: self.cursor,
-                floor,
-            });
+            match self.filter {
+                // Like `read_tag`: what survives, from the floor on.
+                Filter::Tag(_) => self.cursor = floor,
+                Filter::All => {
+                    self.ended = true;
+                    return Err(crate::Error::BelowFloor {
+                        position: self.cursor,
+                        floor,
+                    });
+                }
+            }
         }
         let head = self.db.head();
         if self.cursor >= head {
@@ -161,9 +175,15 @@ impl Subscription {
 impl Iterator for Subscription {
     type Item = Result<Event>;
 
-    /// Blocks until an event is committed. Never returns `None`; an error
-    /// is yielded and the subscription stays usable.
+    /// Blocks until an event is committed. Ends only after yielding
+    /// [`Error::BelowFloor`](crate::Error::BelowFloor): the positions it
+    /// would deliver next were dropped by retention, so in-order delivery
+    /// is impossible. Any other error is yielded and the subscription
+    /// stays usable.
     fn next(&mut self) -> Option<Self::Item> {
+        if self.ended {
+            return None;
+        }
         loop {
             match self.next_until(None) {
                 Ok(Some(ev)) => return Some(Ok(ev)),
@@ -171,6 +191,22 @@ impl Iterator for Subscription {
                 Err(e) => return Some(Err(e)),
             }
         }
+    }
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscription")
+            .field("position", &self.position())
+            .field("buffered", &self.buffer.len())
+            .field(
+                "tag",
+                &match &self.filter {
+                    Filter::All => None,
+                    Filter::Tag(t) => Some(t),
+                },
+            )
+            .finish()
     }
 }
 

@@ -126,7 +126,7 @@ impl Store for Embedded {
     }
 
     async fn subscribe_tag(&self, tag: &str, from: u64) -> Result<EventStream, StoreError> {
-        let sub = self.0.subscribe_tag(tag.to_string(), from);
+        let sub = self.0.subscribe_tag(tag, from);
         Ok(Box::pin(futures::stream::unfold(
             sub,
             |mut sub| async move {

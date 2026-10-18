@@ -18,6 +18,7 @@ use crate::segment;
 
 /// What [`Db::rebuild_index`](crate::Db::rebuild_index) found.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Rebuilt {
     /// The new head: one past the last event of the last complete
     /// transaction.

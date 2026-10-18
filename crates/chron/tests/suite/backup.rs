@@ -200,7 +200,17 @@ fn apply_refuses_a_damaged_archive_and_the_wrong_kind() {
     chron::restore_backup(&full, &dst, &opts()).unwrap();
     let r = open(&dst);
     let before = snapshot(&r);
-    assert!(matches!(r.apply_backup(&full), Err(Error::Corrupt { .. })));
+    let e = r.apply_backup(&full).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::WrongBackupKind {
+                kind: BackupKind::Full,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
     let damaged = d.path().join("damaged.chronbak");
     fs::copy(&inc, &damaged).unwrap();
     flip(&damaged, file_len(&damaged) - 40);
@@ -241,7 +251,10 @@ fn restore_refuses_an_existing_dir_and_a_damaged_archive_leaves_no_dir() {
     ));
     assert!(matches!(
         chron::restore_backup(&inc, d.path().join("dst"), &opts()),
-        Err(Error::Corrupt { .. })
+        Err(Error::WrongBackupKind {
+            kind: BackupKind::Incremental,
+            ..
+        })
     ));
     let damaged = d.path().join("damaged.chronbak");
     fs::copy(&full, &damaged).unwrap();

@@ -32,7 +32,8 @@ mod subscribe;
 mod txn;
 
 pub use backup::{BackupKind, BackupMeta, inspect_backup, restore_backup};
-pub use db::{Db, Info};
+pub use bytes::Bytes;
+pub use db::{Db, EventIter, Info};
 pub use error::{Error, Result};
 pub use event::{
     Event, FLAG_FIRST_IN_TXN, FLAG_FREE, FLAG_LAST_IN_TXN, MAX_TAG_BYTES, MAX_TAGS_PER_EVENT,

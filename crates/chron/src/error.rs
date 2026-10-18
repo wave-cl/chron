@@ -100,6 +100,19 @@ pub enum Error {
         ours: Uuid,
     },
 
+    /// `restore_backup` given an incremental archive, or `apply_backup`
+    /// given a full one.
+    #[error("{archive} is a {kind:?} backup; a {} one was needed", match kind { crate::BackupKind::Full => "incremental", crate::BackupKind::Incremental => "full" })]
+    WrongBackupKind {
+        archive: PathBuf,
+        kind: crate::BackupKind,
+    },
+
+    /// The index and the data disagree about a position: the index lists
+    /// it but the record at the place it names says otherwise.
+    #[error("position {position}: {reason}")]
+    Inconsistent { position: u64, reason: String },
+
     /// `set_epoch` below the current epoch.
     #[error("epoch {epoch} is below the current epoch {current}")]
     EpochNotNewer { epoch: u64, current: u64 },

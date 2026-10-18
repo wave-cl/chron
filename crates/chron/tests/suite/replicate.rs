@@ -67,7 +67,7 @@ fn chunks_end_on_transaction_boundaries_and_chain_to_an_identical_snapshot() {
             events.last().unwrap().is_last_in_txn(),
             "chunk {chunks} ends one"
         );
-        assert_eq!(dst.apply_chunk(c.from, c.to, &c.frames).unwrap(), c.to);
+        assert_eq!(dst.apply_chunk(&c).unwrap(), c.to);
         from = c.to;
         chunks += 1;
     }
@@ -102,10 +102,8 @@ fn a_long_transaction_is_sent_whole() {
     assert_eq!((second.from, second.to), (2000, 2001));
     assert!(src.replication_chunk(2001, 100).unwrap().is_none());
     let dst = open(d.path().join("dst"));
-    dst.apply_chunk(first.from, first.to, &first.frames)
-        .unwrap();
-    dst.apply_chunk(second.from, second.to, &second.frames)
-        .unwrap();
+    dst.apply_chunk(&first).unwrap();
+    dst.apply_chunk(&second).unwrap();
     assert_eq!(
         dst.read_all(0, 10_000).unwrap(),
         src.read_all(0, 10_000).unwrap()
@@ -138,22 +136,29 @@ fn apply_chunk_refuses_a_gap_and_a_torn_chunk() {
     write_some(&src, 0, 6);
     let c = src.replication_chunk(4, 100).unwrap().unwrap();
     assert!(
-        matches!(src.replication_chunk(2, 100), Err(Error::Corrupt { .. })),
+        matches!(
+            src.replication_chunk(2, 100),
+            Err(Error::Inconsistent { position: 2, .. })
+        ),
         "position 2 is inside the first transaction"
     );
     let dst = open(d.path().join("dst"));
     assert!(matches!(
-        dst.apply_chunk(c.from, c.to, &c.frames),
+        dst.apply_chunk(&c),
         Err(Error::ReplicationGap { from: 4, head: 0 })
     ));
     let whole = src.replication_chunk(0, 100).unwrap().unwrap();
     let torn = &whole.frames[..whole.frames.len() - 10];
     assert!(matches!(
-        dst.apply_chunk(0, whole.to, torn),
+        dst.apply_chunk(&chron::Chunk {
+            from: 0,
+            to: whole.to,
+            frames: torn.to_vec()
+        }),
         Err(Error::Corrupt { .. })
     ));
     assert_eq!(dst.head(), 0, "nothing written");
-    dst.apply_chunk(0, whole.to, &whole.frames).unwrap();
+    dst.apply_chunk(&whole).unwrap();
     assert_eq!(dst.head(), src.head());
 }
 

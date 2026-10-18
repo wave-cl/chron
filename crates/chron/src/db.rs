@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
+use bytes::Bytes;
+
 use crate::backup::{self, BackupMeta};
 use crate::error::{Error, Result};
 use crate::event::{self, Event};
@@ -261,8 +263,8 @@ impl Db {
     /// Appends a chunk taken from another copy of this database. `from`
     /// must be the head ([`Error::ReplicationGap`] otherwise); returns the
     /// new head, which is `to`.
-    pub fn apply_chunk(&self, from: u64, to: u64, frames: &[u8]) -> Result<u64> {
-        replicate::apply(&self.inner, from, to, frames)
+    pub fn apply_chunk(&self, chunk: &Chunk) -> Result<u64> {
+        replicate::apply(&self.inner, chunk.from, chunk.to, &chunk.frames)
     }
 
     /// Removes the identity: the state of a database written before
@@ -289,6 +291,7 @@ impl Db {
             bytes,
             db_id: self.id(),
             epoch: self.epoch(),
+            fsync: self.inner.opts.fsync,
         })
     }
 
@@ -338,9 +341,7 @@ impl Db {
     /// order. Empty for an unknown aggregate or a `from_index` at or past
     /// its length.
     pub fn read_aggregate(&self, id: Uuid, from_index: u64, limit: usize) -> Result<Vec<Event>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+        let limit = all_if_zero(limit);
         let txn = self.inner.index.begin_read()?;
         let found = self
             .inner
@@ -358,9 +359,7 @@ impl Db {
         from_index: u64,
         limit: usize,
     ) -> Result<Vec<Event>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+        let limit = all_if_zero(limit);
         let txn = self.inner.index.begin_read()?;
         let found = self
             .inner
@@ -429,10 +428,13 @@ impl Db {
                 floor,
             });
         }
-        if limit == 0 || from == head {
+        if from == head {
             return Ok(Vec::new());
         }
-        let found = self.inner.index.positions_from(&txn, from, limit)?;
+        let found = self
+            .inner
+            .index
+            .positions_from(&txn, from, all_if_zero(limit))?;
         self.read_runs(&found)
     }
 
@@ -440,9 +442,7 @@ impl Db {
     /// is clamped to the newest event, so `u64::MAX` means "from the end";
     /// empty when there are no events.
     pub fn read_all_backward(&self, from: u64, limit: usize) -> Result<Vec<Event>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+        let limit = all_if_zero(limit);
         let txn = self.inner.index.begin_read()?;
         let floor = Index::floor_in(&txn)?;
         let mut found = self.inner.index.positions_to(&txn, floor, from, limit)?;
@@ -456,9 +456,7 @@ impl Db {
     /// `limit`, in global order.
     pub fn read_tag(&self, tag: impl AsRef<[u8]>, from: u64, limit: usize) -> Result<Vec<Event>> {
         let tag = tag.as_ref();
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+        let limit = all_if_zero(limit);
         let txn = self.inner.index.begin_read()?;
         let positions = self.inner.index.tag_positions(&txn, tag, from, limit)?;
         self.assemble_tag(&txn, tag, positions)
@@ -473,9 +471,7 @@ impl Db {
         limit: usize,
     ) -> Result<Vec<Event>> {
         let tag = tag.as_ref();
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+        let limit = all_if_zero(limit);
         let txn = self.inner.index.begin_read()?;
         let positions = self.inner.index.tag_positions_rev(&txn, tag, from, limit)?;
         self.assemble_tag(&txn, tag, positions)
@@ -511,8 +507,30 @@ impl Db {
 
     /// The events carrying `tag`, in global order from `from`, then new
     /// ones as they are committed.
-    pub fn subscribe_tag(&self, tag: impl Into<bytes::Bytes>, from: u64) -> Subscription {
-        Subscription::tag(self.clone(), tag.into(), from)
+    pub fn subscribe_tag(&self, tag: impl AsRef<[u8]>, from: u64) -> Subscription {
+        Subscription::tag(self.clone(), Bytes::copy_from_slice(tag.as_ref()), from)
+    }
+
+    /// Every event from global position `from` to the head, a page at a
+    /// time. Ends at the head; a position past it is
+    /// [`Error::PositionOutOfRange`] on the first item and below the floor
+    /// [`Error::BelowFloor`].
+    pub fn iter_all(&self, from: u64) -> EventIter {
+        EventIter::new(self.clone(), Paged::All, from)
+    }
+
+    /// The aggregate's events from `from_index` to its end, a page at a time.
+    pub fn iter_aggregate(&self, id: Uuid, from_index: u64) -> EventIter {
+        EventIter::new(self.clone(), Paged::Aggregate(id), from_index)
+    }
+
+    /// The events carrying `tag` from `from` to the head, a page at a time.
+    pub fn iter_tag(&self, tag: impl AsRef<[u8]>, from: u64) -> EventIter {
+        EventIter::new(
+            self.clone(),
+            Paged::Tag(Bytes::copy_from_slice(tag.as_ref())),
+            from,
+        )
     }
 
     /// Starts a transaction. Nothing happens until `commit`.
@@ -615,11 +633,10 @@ impl Db {
     }
 
     fn mismatch(&self, position: u64, reason: impl Into<String>) -> Error {
-        Error::corrupt(
-            self.inner.layout.index_file(),
+        Error::Inconsistent {
             position,
-            format!("position {position}: {}", reason.into()),
-        )
+            reason: reason.into(),
+        }
     }
 
     /// Reads ascending, index-ordered records, one positional read per run
@@ -681,15 +698,106 @@ impl Db {
 
 /// What [`Db::info`] reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Info {
+    /// The next global position.
     pub head: u64,
+    /// The retention floor: positions below it were dropped.
     pub floor: u64,
     /// Segment files present.
     pub segments: usize,
     /// Bytes those files take.
     pub bytes: u64,
+    /// The database's identity.
     pub db_id: Uuid,
+    /// The fencing epoch.
     pub epoch: u64,
+    /// Whether commits sync to disk.
+    pub fsync: Fsync,
+}
+
+/// A read, usize::MAX when the caller asked for everything with 0.
+fn all_if_zero(limit: usize) -> usize {
+    if limit == 0 { usize::MAX } else { limit }
+}
+
+enum Paged {
+    All,
+    Aggregate(Uuid),
+    Tag(Bytes),
+}
+
+/// A finite, paged walk over committed events; created by
+/// [`Db::iter_all`], [`Db::iter_aggregate`] and [`Db::iter_tag`]. Reads
+/// 256 events at a time and ends at the head (or the aggregate's end).
+pub struct EventIter {
+    db: Db,
+    what: Paged,
+    cursor: u64,
+    buffer: std::collections::VecDeque<Event>,
+    done: bool,
+}
+
+const PAGE: usize = 256;
+
+impl EventIter {
+    fn new(db: Db, what: Paged, from: u64) -> Self {
+        EventIter {
+            db,
+            what,
+            cursor: from,
+            buffer: std::collections::VecDeque::new(),
+            done: false,
+        }
+    }
+
+    fn fill(&mut self) -> Result<()> {
+        let page = match &self.what {
+            Paged::All => self.db.read_all(self.cursor, PAGE)?,
+            Paged::Aggregate(id) => self.db.read_aggregate(*id, self.cursor, PAGE)?,
+            Paged::Tag(tag) => self.db.read_tag(tag, self.cursor, PAGE)?,
+        };
+        if page.len() < PAGE {
+            self.done = true;
+        }
+        if let Some(last) = page.last() {
+            self.cursor = match &self.what {
+                Paged::Aggregate(_) => last.index + 1,
+                _ => last.position + 1,
+            };
+        }
+        self.buffer.extend(page);
+        Ok(())
+    }
+}
+
+impl Iterator for EventIter {
+    type Item = Result<Event>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(ev) = self.buffer.pop_front() {
+                return Some(Ok(ev));
+            }
+            if self.done {
+                return None;
+            }
+            if let Err(e) = self.fill() {
+                self.done = true;
+                return Some(Err(e));
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Db {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Db")
+            .field("path", &self.inner.layout.root())
+            .field("head", &self.head())
+            .field("floor", &self.floor())
+            .finish()
+    }
 }
 
 impl Inner {

@@ -1,5 +1,6 @@
 /// When segment writes and index commits reach the disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Fsync {
     /// Every commit fdatasyncs the segment and commits the index durably
     /// before returning. A committed transaction survives power loss.
@@ -13,6 +14,7 @@ pub enum Fsync {
 
 /// How a [`crate::Db`] is opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Options {
     /// A new segment file starts after the commit that makes the current
     /// one reach this size. A transaction is never split across segments, so
