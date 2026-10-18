@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::db::{Layout, Lock};
 use crate::error::{Error, Result};
-use crate::index::{AGG_INDEX, AGG_LEN, HEAD_KEY, Index, META, POS, TAG};
+use crate::index::{AGG_INDEX, AGG_LEN, FLOOR_KEY, HEAD_KEY, Index, META, POS, TAG};
 use crate::options::{Fsync, Options};
 use crate::recover::{Item, Records};
 use crate::segment;
@@ -20,6 +20,8 @@ pub struct Rebuilt {
     /// The new head: one past the last event of the last complete
     /// transaction.
     pub head: u64,
+    /// Base of the first segment: the retention floor the data carries.
+    pub floor: u64,
     /// Segment files read.
     pub segments: usize,
     /// Decodable events of an incomplete trailing transaction, left out of
@@ -111,8 +113,9 @@ pub(crate) fn rebuild(path: &Path, opts: &Options) -> Result<Rebuilt> {
     let mut batch: Vec<Entry> = Vec::new();
     let mut open_txn: Vec<Entry> = Vec::new();
     let mut pending: HashMap<Uuid, u64> = HashMap::new();
-    let mut next_base = 0u64;
-    let mut head = 0u64;
+    let floor = segments.first().map_or(0, |(b, _)| *b);
+    let mut next_base = floor;
+    let mut head = floor;
     let mut decoded = 0u64;
     let last = segments.len().saturating_sub(1);
 
@@ -139,11 +142,13 @@ pub(crate) fn rebuild(path: &Path, opts: &Options) -> Result<Rebuilt> {
                         return Err(Error::corrupt(seg_path, r.offset, what));
                     }
                     let agg_index = if let Some(id) = ev.aggregate {
+                        // An aggregate first seen above a floor may start at
+                        // any index: its earlier events were dropped.
                         let cur = pending
                             .get(&id)
                             .copied()
                             .or_else(|| lens.get(&id).copied())
-                            .unwrap_or(0);
+                            .unwrap_or(if floor > 0 { ev.index } else { 0 });
                         if ev.index != cur {
                             return Err(Error::corrupt(
                                 seg_path,
@@ -204,13 +209,17 @@ pub(crate) fn rebuild(path: &Path, opts: &Options) -> Result<Rebuilt> {
             }
         }
     }
-    let dropped = decoded - head;
+    let dropped = decoded - (head - floor);
     drop(open_txn);
     drop(pending);
 
     flush(&index, &mut batch, &lens, &mut touched)?;
     let txn = index.begin_write_durable()?;
-    txn.open_table(META)?.insert(HEAD_KEY, head)?;
+    {
+        let mut meta = txn.open_table(META)?;
+        meta.insert(HEAD_KEY, head)?;
+        meta.insert(FLOOR_KEY, floor)?;
+    }
     txn.commit()?;
     drop(index);
 
@@ -219,6 +228,7 @@ pub(crate) fn rebuild(path: &Path, opts: &Options) -> Result<Rebuilt> {
     segment::sync_dir(layout.root())?;
     Ok(Rebuilt {
         head,
+        floor,
         segments: segments.len(),
         dropped,
     })
@@ -289,6 +299,7 @@ mod tests {
             r,
             Rebuilt {
                 head: 4,
+                floor: 0,
                 segments: 2,
                 dropped: 0
             }
@@ -332,6 +343,26 @@ mod tests {
             rebuild(d.path(), &Options::new()),
             Err(Error::Corrupt { offset: 0, .. })
         ));
+    }
+
+    #[test]
+    fn a_first_segment_above_zero_is_a_floor() {
+        let (d, dir) = setup();
+        let a = Some(Uuid::from_u128(1));
+        write_segment(&dir, 7, &[(7, a, 5, BOTH), (8, a, 6, BOTH)]);
+        let r = rebuild(d.path(), &Options::new()).unwrap();
+        assert_eq!(
+            r,
+            Rebuilt {
+                head: 9,
+                floor: 7,
+                segments: 1,
+                dropped: 0
+            }
+        );
+        let index = Index::open(&d.path().join("index.redb"), Fsync::Never).unwrap();
+        assert_eq!(index.floor().unwrap(), 7);
+        assert_eq!(index.aggregate_len(&Uuid::from_u128(1)).unwrap(), 7);
     }
 
     #[test]

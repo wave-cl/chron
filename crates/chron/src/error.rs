@@ -65,6 +65,24 @@ pub enum Error {
     #[error("position {position} is past the head {head}")]
     PositionOutOfRange { position: u64, head: u64 },
 
+    /// A read, backup or subscription from a position below the retention
+    /// floor: its segment was dropped.
+    #[error("position {position} is below the floor {floor}")]
+    BelowFloor { position: u64, floor: u64 },
+
+    /// `restore_backup` was given a directory that already exists.
+    #[error("{path} already exists")]
+    AlreadyExists { path: PathBuf },
+
+    /// An incremental backup applies onto `base_head`, but the database is
+    /// at `head`.
+    #[error("{archive} applies onto head {base_head} but the database is at head {head}")]
+    WrongBaseHead {
+        archive: PathBuf,
+        base_head: u64,
+        head: u64,
+    },
+
     /// The redb index failed.
     #[error("index: {0}")]
     Index(#[from] redb::Error),

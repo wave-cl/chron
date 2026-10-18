@@ -24,11 +24,12 @@ mod index;
 mod options;
 mod rebuild;
 mod recover;
+mod retain;
 mod segment;
 mod subscribe;
 mod txn;
 
-pub use db::Db;
+pub use db::{Db, Info};
 pub use error::{Error, Result};
 pub use event::{
     Event, FLAG_FIRST_IN_TXN, FLAG_FREE, FLAG_LAST_IN_TXN, MAX_TAG_BYTES, MAX_TAGS_PER_EVENT,
@@ -36,6 +37,7 @@ pub use event::{
 };
 pub use options::{Fsync, Options};
 pub use rebuild::Rebuilt;
+pub use retain::Retained;
 pub use subscribe::Subscription;
 pub use txn::{AppendResult, Committed, Expected, Transaction};
 pub use uuid::Uuid;

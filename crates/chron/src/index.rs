@@ -24,6 +24,8 @@ pub(crate) const POS: TableDefinition<u64, (u64, u64, u32)> = TableDefinition::n
 pub(crate) const TAG: TableDefinition<(&[u8], u64), ()> = TableDefinition::new("tag");
 
 pub(crate) const HEAD_KEY: &str = "head";
+/// `"floor"` → base of the first kept segment; absent means 0.
+pub(crate) const FLOOR_KEY: &str = "floor";
 
 /// Where a record's frame starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +141,14 @@ impl Index {
             .map_or(0, |v| v.value()))
     }
 
+    pub(crate) fn floor(&self) -> Result<u64> {
+        let txn = self.begin_read()?;
+        Ok(txn
+            .open_table(META)?
+            .get(FLOOR_KEY)?
+            .map_or(0, |v| v.value()))
+    }
+
     pub(crate) fn aggregate_len(&self, id: &Uuid) -> Result<u64> {
         let txn = self.begin_read()?;
         Ok(txn
@@ -209,17 +219,18 @@ impl Index {
         Ok(out)
     }
 
-    /// `(position, location)` of the events at positions `<= from`, newest
-    /// first, at most `limit`.
+    /// `(position, location)` of the events at positions in `floor..=from`,
+    /// newest first, at most `limit`.
     pub(crate) fn positions_to(
         &self,
         txn: &ReadTransaction,
+        floor: u64,
         from: u64,
         limit: usize,
     ) -> Result<Vec<(u64, Location)>> {
         let table = txn.open_table(POS)?;
         let mut out = Vec::new();
-        for item in table.range(..=from)?.rev().take(limit) {
+        for item in table.range(floor..=from)?.rev().take(limit) {
             let (k, v) = item?;
             out.push((k.value(), v.value().into()));
         }
@@ -449,7 +460,7 @@ mod tests {
         );
         assert!(i.positions_from(&txn, u64::MAX, 5).unwrap().is_empty());
         let back = |from, limit| -> Vec<u64> {
-            i.positions_to(&txn, from, limit)
+            i.positions_to(&txn, 0, from, limit)
                 .unwrap()
                 .iter()
                 .map(|(p, _)| *p)
@@ -458,6 +469,13 @@ mod tests {
         assert_eq!(back(u64::MAX, 2), vec![5, 4]);
         assert_eq!(back(3, 10), vec![3, 2, 1, 0]);
         assert_eq!(back(0, 1), vec![0]);
+        let floored: Vec<u64> = i
+            .positions_to(&txn, 3, u64::MAX, 10)
+            .unwrap()
+            .iter()
+            .map(|(p, _)| *p)
+            .collect();
+        assert_eq!(floored, vec![5, 4, 3]);
         assert_eq!(
             i.locate(5).unwrap(),
             Some(Location {

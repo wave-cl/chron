@@ -15,6 +15,7 @@ use crate::index::{self, Index, Location};
 use crate::options::{Fsync, Options};
 use crate::rebuild::Rebuilt;
 use crate::recover;
+use crate::retain::{self, Retained};
 use crate::segment::{self, SegmentWriter};
 use crate::subscribe::Subscription;
 use crate::txn::{self, Committed, Mode, Transaction};
@@ -86,6 +87,11 @@ pub(crate) struct Inner {
     pub(crate) index: Index,
     pub(crate) writer: Mutex<SegmentWriter>,
     pub(crate) head: AtomicU64,
+    /// Base of the first kept segment; positions below it were dropped.
+    pub(crate) floor: AtomicU64,
+    /// Serialises backup and retention against each other. Writers never
+    /// take it.
+    pub(crate) maintenance: Mutex<()>,
     head_watch: (Mutex<u64>, Condvar),
     #[cfg(feature = "tokio")]
     pub(crate) head_tx: tokio::sync::watch::Sender<u64>,
@@ -112,10 +118,10 @@ impl Db {
         let sync = opts.fsync == Fsync::Always;
 
         let index_file = layout.index_file();
-        let (index, head, writer) = if index_file.exists() {
+        let (index, head, floor, writer) = if index_file.exists() {
             let r = recover::recover(&layout, &opts)?;
             let writer = SegmentWriter::open(&r.tail_path, r.tail_base, r.tail_len)?;
-            (r.index, r.head, writer)
+            (r.index, r.head, r.floor, writer)
         } else {
             if let Some((_, stray)) = segment::list(&segments_dir)?.first() {
                 return Err(Error::corrupt(
@@ -129,7 +135,7 @@ impl Db {
             if sync {
                 segment::sync_dir(layout.root())?;
             }
-            (index, 0, writer)
+            (index, 0, 0, writer)
         };
 
         Ok(Db {
@@ -139,6 +145,8 @@ impl Db {
                 index,
                 writer: Mutex::new(writer),
                 head: AtomicU64::new(head),
+                floor: AtomicU64::new(floor),
+                maintenance: Mutex::new(()),
                 head_watch: (Mutex::new(head), Condvar::new()),
                 #[cfg(feature = "tokio")]
                 head_tx: tokio::sync::watch::channel(head).0,
@@ -155,6 +163,42 @@ impl Db {
     /// The next global position: one past the last committed event.
     pub fn head(&self) -> u64 {
         self.inner.head.load(Ordering::Acquire)
+    }
+
+    /// Base of the first kept segment: positions below it were dropped by
+    /// [`retain_from`](Db::retain_from). 0 until then.
+    pub fn floor(&self) -> u64 {
+        self.inner.floor.load(Ordering::Acquire)
+    }
+
+    /// Head, floor, and what the segment directory holds.
+    pub fn info(&self) -> Result<Info> {
+        let dir = self.inner.layout.segments_dir();
+        let listed = segment::list(&dir)?;
+        let mut bytes = 0;
+        for (_, path) in &listed {
+            bytes += fs::metadata(path)
+                .map_err(|e| Error::io(path, "metadata", e))?
+                .len();
+        }
+        Ok(Info {
+            head: self.head(),
+            floor: self.floor(),
+            segments: listed.len(),
+            bytes,
+        })
+    }
+
+    /// Drops every segment that lies wholly below `floor`, freeing its
+    /// space. The floor in force becomes the base of the first kept
+    /// segment (so it is at most `floor`); positions never renumber.
+    /// Reads below the floor fail with [`Error::BelowFloor`]; aggregate
+    /// and tag reads return what survives; aggregate lengths are unchanged,
+    /// so [`Expected::Exact`](crate::Expected::Exact) keeps working.
+    /// `floor` past the head is [`Error::PositionOutOfRange`]; a floor at
+    /// or below the current one is a no-op.
+    pub fn retain_from(&self, floor: u64) -> Result<Retained> {
+        retain::retain(&self.inner, floor, true)
     }
 
     /// How many events the aggregate has; 0 for one never written.
@@ -225,6 +269,13 @@ impl Db {
     /// Every event from global position `from`, at most `limit`. Empty at
     /// the head; [`Error::PositionOutOfRange`] past it.
     pub fn read_all(&self, from: u64, limit: usize) -> Result<Vec<Event>> {
+        let floor = self.floor();
+        if from < floor {
+            return Err(Error::BelowFloor {
+                position: from,
+                floor,
+            });
+        }
         let head = self.head();
         if from > head {
             return Err(Error::PositionOutOfRange {
@@ -248,7 +299,10 @@ impl Db {
             return Ok(Vec::new());
         }
         let txn = self.inner.index.begin_read()?;
-        let mut found = self.inner.index.positions_to(&txn, from, limit)?;
+        let mut found = self
+            .inner
+            .index
+            .positions_to(&txn, self.floor(), from, limit)?;
         found.reverse();
         let mut out = self.read_runs(&found)?;
         out.reverse();
@@ -389,6 +443,14 @@ impl Db {
         crate::rebuild::rebuild(path.as_ref(), opts)
     }
 
+    /// Retention's index update without the file removal: the state a crash
+    /// between the two leaves. For tests of recovery only; the `Db` must be
+    /// dropped afterwards.
+    #[doc(hidden)]
+    pub fn debug_retain_index_only(&self, floor: u64) -> Result<Retained> {
+        retain::retain(&self.inner, floor, false)
+    }
+
     /// Where the index places `position`: `(segment base, offset, frame
     /// length)`. For tests of segment rotation.
     #[doc(hidden)]
@@ -465,10 +527,21 @@ impl Db {
     }
 }
 
+/// What [`Db::info`] reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Info {
+    pub head: u64,
+    pub floor: u64,
+    /// Segment files present.
+    pub segments: usize,
+    /// Bytes those files take.
+    pub bytes: u64,
+}
+
 impl Inner {
     /// A shared read handle on a segment. Never seek on it: readers use
     /// positional reads only.
-    fn file(&self, base: u64) -> Result<Arc<File>> {
+    pub(crate) fn file(&self, base: u64) -> Result<Arc<File>> {
         let mut files = self.files.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(f) = files.get(&base) {
             return Ok(f.clone());
@@ -477,6 +550,14 @@ impl Inner {
         let f = Arc::new(File::open(&path).map_err(|e| Error::io(&path, "open", e))?);
         files.insert(base, f.clone());
         Ok(f)
+    }
+
+    /// Drops cached handles on segments about to be removed.
+    pub(crate) fn forget_files(&self, bases: &[u64]) {
+        let mut files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+        for b in bases {
+            files.remove(b);
+        }
     }
 
     pub(crate) fn publish_head(&self, head: u64) {

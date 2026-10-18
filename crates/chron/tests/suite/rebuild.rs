@@ -95,6 +95,7 @@ fn rebuild_drops_a_torn_trailing_transaction() {
         r,
         Rebuilt {
             head: 3,
+            floor: 0,
             segments: 1,
             dropped: 2
         }
@@ -129,6 +130,7 @@ fn rebuild_keeps_a_complete_unacknowledged_transaction() {
         r,
         Rebuilt {
             head: 6,
+            floor: 0,
             segments: 1,
             dropped: 0
         }
@@ -190,6 +192,7 @@ fn rebuild_refuses_while_open_and_is_idempotent() {
         r,
         Rebuilt {
             head: 2,
+            floor: 0,
             segments: 1,
             dropped: 0
         }
@@ -205,6 +208,7 @@ fn rebuild_of_an_empty_directory_gives_head_zero() {
         r,
         Rebuilt {
             head: 0,
+            floor: 0,
             segments: 0,
             dropped: 0
         }

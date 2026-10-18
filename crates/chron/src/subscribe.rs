@@ -109,6 +109,13 @@ impl Subscription {
         // The head is read before the index: the read snapshot then holds
         // every position below it, so a short batch proves there is nothing
         // more to deliver below `head`.
+        let floor = self.db.floor();
+        if self.cursor < floor {
+            return Err(crate::Error::BelowFloor {
+                position: self.cursor,
+                floor,
+            });
+        }
         let head = self.db.head();
         if self.cursor >= head {
             return Ok(());

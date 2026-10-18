@@ -15,6 +15,7 @@ use crate::segment::{self, HEADER_LEN, ScanItem, Scanner, SegmentWriter};
 pub(crate) struct Recovered {
     pub index: Index,
     pub head: u64,
+    pub floor: u64,
     pub tail_base: u64,
     pub tail_path: PathBuf,
     /// Byte length of the tail after truncation; the writer continues here.
@@ -141,7 +142,20 @@ fn remove(path: &Path, dir: &Path) -> Result<()> {
 
 pub(crate) fn recover(layout: &Layout, opts: &Options) -> Result<Recovered> {
     let dir = layout.segments_dir();
-    let listed = segment::list(&dir)?;
+    let index = Index::open(&layout.index_file(), opts.fsync)?;
+    let head = index.head()?;
+    let floor = index.floor()?;
+
+    // Segments a retention dropped from the index before a crash stopped
+    // it removing the files.
+    let mut listed = Vec::new();
+    for (base, path) in segment::list(&dir)? {
+        if base < floor {
+            remove(&path, &dir)?;
+        } else {
+            listed.push((base, path));
+        }
+    }
     let n = listed.len();
     let mut segments = Vec::with_capacity(n);
     for (k, (base, path)) in listed.into_iter().enumerate() {
@@ -163,29 +177,27 @@ pub(crate) fn recover(layout: &Layout, opts: &Options) -> Result<Recovered> {
         }
     }
 
-    let index = Index::open(&layout.index_file(), opts.fsync)?;
-    let head = index.head()?;
-
     // Segments nothing was ever committed into.
     while segments.last().is_some_and(|(base, _)| *base > head) {
         let (_, path) = segments.pop().unwrap();
         remove(&path, &dir)?;
     }
     let Some((tail_base, tail_path)) = segments.last().cloned() else {
-        if head != 0 {
+        if head != floor {
             return Err(Error::corrupt(
                 layout.index_file(),
                 0,
                 format!("head is {head} but no segment starts at or before it"),
             ));
         }
-        let w = SegmentWriter::create(&dir, 0, true)?;
+        let w = SegmentWriter::create(&dir, floor, true)?;
         drop(w);
         return Ok(Recovered {
             index,
-            head: 0,
-            tail_base: 0,
-            tail_path: layout.segment(0),
+            head,
+            floor,
+            tail_base: floor,
+            tail_path: layout.segment(floor),
             tail_len: HEADER_LEN,
         });
     };
@@ -243,6 +255,7 @@ pub(crate) fn recover(layout: &Layout, opts: &Options) -> Result<Recovered> {
     Ok(Recovered {
         index,
         head,
+        floor,
         tail_base,
         tail_path,
         tail_len: truncate_to,
