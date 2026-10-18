@@ -168,8 +168,10 @@ pub(crate) fn recover(layout: &Layout, opts: &Options) -> Result<Recovered> {
                     format!("header says base {} but the file name says {base}", h.base),
                 ));
             }
-            // A roll that crashed before its header was complete.
+            // A roll that crashed before its header was complete, or
+            // whose header never reached the disk whole.
             Ok(None) if k + 1 == n => remove(&path, &dir)?,
+            Err(_) if k + 1 == n && base >= head => remove(&path, &dir)?,
             Ok(None) => {
                 return Err(Error::corrupt(&path, 0, "segment shorter than a header"));
             }
@@ -277,6 +279,11 @@ fn verify_all(
         let end = segments.get(k + 1).map_or(head, |(next, _)| *next);
         let mut records = Records::open(path, *base, max_record)?;
         loop {
+            if records.reached() == end && *base < end {
+                // Everything the index knows is checked; bytes after the
+                // last committed record are a failed commit's leftovers.
+                break;
+            }
             match records.next()? {
                 Item::Record(r) => {
                     if r.position >= end {

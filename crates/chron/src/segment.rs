@@ -344,11 +344,21 @@ impl SegmentWriter {
             .create_new(true)
             .open(&path)
             .map_err(|e| Error::io(&path, "create", e))?;
-        file.write_all(&SegmentHeader { base }.encode())
-            .map_err(|e| Error::io(&path, "write", e))?;
-        if sync {
-            file.sync_all().map_err(|e| Error::io(&path, "fsync", e))?;
-            sync_dir(segments_dir)?;
+        let written = (|| -> Result<()> {
+            file.write_all(&SegmentHeader { base }.encode())
+                .map_err(|e| Error::io(&path, "write", e))?;
+            if sync {
+                file.sync_all().map_err(|e| Error::io(&path, "fsync", e))?;
+                sync_dir(segments_dir)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = written {
+            // A file without a valid header would be taken for a segment.
+            drop(file);
+            let _ = fs::remove_file(&path);
+            let _ = sync_dir(segments_dir);
+            return Err(e);
         }
         Ok(SegmentWriter {
             file,
@@ -356,6 +366,14 @@ impl SegmentWriter {
             base,
             len: HEADER_LEN,
         })
+    }
+
+    /// Cuts the file back to the logical end, dropping leftovers of a
+    /// failed commit.
+    pub(crate) fn truncate_to_len(&self) -> Result<()> {
+        self.file
+            .set_len(self.len)
+            .map_err(|e| Error::io(&self.path, "truncate", e))
     }
 
     /// Opens an existing, already recovered segment for appending at `len`.

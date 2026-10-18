@@ -100,6 +100,10 @@ pub enum Error {
         ours: Uuid,
     },
 
+    /// `set_epoch` below the current epoch.
+    #[error("epoch {epoch} is below the current epoch {current}")]
+    EpochNotNewer { epoch: u64, current: u64 },
+
     /// The redb index failed.
     #[error("index: {0}")]
     Index(#[from] redb::Error),

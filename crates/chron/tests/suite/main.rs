@@ -12,6 +12,7 @@ mod recovery;
 mod reopen;
 mod replicate;
 mod retention;
+mod review;
 mod rotation;
 mod subscribe;
 mod transactions;

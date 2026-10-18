@@ -222,8 +222,36 @@ fn land(
     // Bytes first, synced before the index commit vouches for them.
     let base = w.base();
     let at = w.write_at_end(buf)?;
+    let landed = land_index(inner, w, wtxn, base, at, buf, entries, lens, new_head);
+    if landed.is_err() {
+        // Leftover bytes past the logical end would survive a later,
+        // shorter commit and a roll; cut them now.
+        let _ = w.truncate_to_len();
+    }
+    landed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn land_index(
+    inner: &Inner,
+    w: &mut MutexGuard<'_, SegmentWriter>,
+    wtxn: redb::WriteTransaction,
+    base: u64,
+    at: u64,
+    buf: &[u8],
+    entries: &[Entry],
+    lens: &HashMap<Uuid, u64>,
+    new_head: u64,
+) -> Result<()> {
     if inner.opts.fsync == Fsync::Always {
         w.sync_data()?;
+    }
+    if inner.fail_next_commit.swap(false, Ordering::AcqRel) {
+        return Err(Error::io(
+            inner.layout.index_file(),
+            "commit",
+            std::io::Error::other("injected failure before the index commit"),
+        ));
     }
     {
         let mut pos = wtxn.open_table(POS)?;

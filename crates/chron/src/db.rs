@@ -98,6 +98,7 @@ pub(crate) struct Inner {
     /// Serialises backup and retention against each other. Writers never
     /// take it.
     pub(crate) maintenance: Mutex<()>,
+    pub(crate) fail_next_commit: std::sync::atomic::AtomicBool,
     head_watch: (Mutex<u64>, Condvar),
     #[cfg(feature = "tokio")]
     pub(crate) head_tx: tokio::sync::watch::Sender<u64>,
@@ -143,7 +144,12 @@ impl Db {
             }
             (index, 0, 0, writer)
         };
-        // Databases written before identities existed get one here.
+        // Databases written before identities existed get one here; the
+        // durable commit that stores it also persists every earlier index
+        // commit, so the segment bytes are synced first.
+        if index.db_id()?.is_none() {
+            writer.sync_data()?;
+        }
         let db_id = index.ensure_db_id()?;
         let epoch = index.epoch()?;
 
@@ -158,6 +164,7 @@ impl Db {
                 db_id: Mutex::new(db_id),
                 epoch: AtomicU64::new(epoch),
                 maintenance: Mutex::new(()),
+                fail_next_commit: std::sync::atomic::AtomicBool::new(false),
                 head_watch: (Mutex::new(head), Condvar::new()),
                 #[cfg(feature = "tokio")]
                 head_tx: tokio::sync::watch::channel(head).0,
@@ -199,9 +206,18 @@ impl Db {
         self.inner.epoch.load(Ordering::Acquire)
     }
 
-    /// Durably sets the epoch.
+    /// Durably sets the epoch. An epoch below the current one is
+    /// [`Error::EpochNotNewer`]; the current one is a no-op.
     pub fn set_epoch(&self, epoch: u64) -> Result<()> {
-        self.inner.index.set_epoch(epoch)?;
+        self.inner.durable_index(|inner, txn| {
+            let current = inner.epoch.load(Ordering::Acquire);
+            if epoch < current {
+                return Err(Error::EpochNotNewer { epoch, current });
+            }
+            txn.open_table(crate::index::META)?
+                .insert(crate::index::EPOCH_KEY, epoch)?;
+            Ok(())
+        })?;
         self.inner.epoch.store(epoch, Ordering::Release);
         Ok(())
     }
@@ -209,12 +225,15 @@ impl Db {
     /// Makes an empty database take on another's identity, so it can
     /// replicate from it. [`Error::NotEmpty`] once anything was written.
     pub fn adopt_id(&self, id: Uuid) -> Result<()> {
-        let _w = self.inner.writer.lock().unwrap_or_else(|p| p.into_inner());
-        let head = self.head();
-        if head != 0 || self.floor() != 0 {
-            return Err(Error::NotEmpty { head });
-        }
-        self.inner.index.set_db_id(id)?;
+        self.inner.durable_index(|inner, txn| {
+            let head = inner.head.load(Ordering::Acquire);
+            if head != 0 || inner.floor.load(Ordering::Acquire) != 0 {
+                return Err(Error::NotEmpty { head });
+            }
+            txn.open_table(crate::index::META_BYTES)?
+                .insert(crate::index::DB_ID_KEY, id.as_bytes().as_slice())?;
+            Ok(())
+        })?;
         *self.inner.db_id.lock().unwrap_or_else(|p| p.into_inner()) = id;
         Ok(())
     }
@@ -378,13 +397,19 @@ impl Db {
     /// Every event from global position `from`, at most `limit`. Empty at
     /// the head; [`Error::PositionOutOfRange`] past it.
     pub fn read_all(&self, from: u64, limit: usize) -> Result<Vec<Event>> {
-        let floor = self.floor();
-        if from < floor {
-            return Err(Error::BelowFloor {
-                position: from,
-                floor,
-            });
-        }
+        self.read_all_with(from, limit, || {})
+    }
+
+    /// `read_all` with a hook run between the head check and the read
+    /// snapshot; the floor is read inside that snapshot, so a retention
+    /// landing in the hook is seen. For tests of that ordering.
+    #[doc(hidden)]
+    pub fn read_all_with(
+        &self,
+        from: u64,
+        limit: usize,
+        between: impl FnOnce(),
+    ) -> Result<Vec<Event>> {
         let head = self.head();
         if from > head {
             return Err(Error::PositionOutOfRange {
@@ -392,10 +417,21 @@ impl Db {
                 head,
             });
         }
+        between();
+        let txn = self.inner.index.begin_read()?;
+        // The floor the snapshot holds, not the atomic: a retention that
+        // committed after the atomic was read would otherwise hide the
+        // positions it dropped as if they had been read.
+        let floor = Index::floor_in(&txn)?;
+        if from < floor {
+            return Err(Error::BelowFloor {
+                position: from,
+                floor,
+            });
+        }
         if limit == 0 || from == head {
             return Ok(Vec::new());
         }
-        let txn = self.inner.index.begin_read()?;
         let found = self.inner.index.positions_from(&txn, from, limit)?;
         self.read_runs(&found)
     }
@@ -408,10 +444,8 @@ impl Db {
             return Ok(Vec::new());
         }
         let txn = self.inner.index.begin_read()?;
-        let mut found = self
-            .inner
-            .index
-            .positions_to(&txn, self.floor(), from, limit)?;
+        let floor = Index::floor_in(&txn)?;
+        let mut found = self.inner.index.positions_to(&txn, floor, from, limit)?;
         found.reverse();
         let mut out = self.read_runs(&found)?;
         out.reverse();
@@ -489,26 +523,28 @@ impl Db {
     /// Forces everything committed so far to disk. Only matters under
     /// [`Fsync::Never`]; also run when the last handle is dropped.
     pub fn flush(&self) -> Result<()> {
-        let w = self.inner.writer.lock().unwrap_or_else(|p| p.into_inner());
-        w.sync_data()?;
-        self.inner.index.begin_write_durable()?.commit()?;
-        drop(w);
-        Ok(())
+        self.inner.durable_index(|_, _| Ok(()))
     }
 
     /// Blocks until the head is at least `min_head` or `timeout` passes.
     /// Returns the head seen last.
     pub fn wait_for(&self, min_head: u64, timeout: Duration) -> u64 {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout);
         let (lock, cv) = &self.inner.head_watch;
         let mut head = lock.lock().unwrap_or_else(|p| p.into_inner());
         while *head < min_head {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
+            let wait = match deadline {
+                Some(d) => {
+                    let now = Instant::now();
+                    if now >= d {
+                        break;
+                    }
+                    d - now
+                }
+                None => Duration::from_secs(60),
+            };
             head = cv
-                .wait_timeout(head, deadline - now)
+                .wait_timeout(head, wait)
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
         }
@@ -558,6 +594,13 @@ impl Db {
     #[doc(hidden)]
     pub fn debug_retain_index_only(&self, floor: u64) -> Result<Retained> {
         retain::retain(&self.inner, floor, false)
+    }
+
+    /// The next commit fails after writing its bytes and before its index
+    /// commit. For tests of the cleanup that follows.
+    #[doc(hidden)]
+    pub fn debug_fail_next_commit(&self) {
+        self.inner.debug_fail_next_commit();
     }
 
     /// Where the index places `position`: `(segment base, offset, frame
@@ -658,9 +701,45 @@ impl Inner {
             return Ok(f.clone());
         }
         let path = self.layout.segment(base);
-        let f = Arc::new(File::open(&path).map_err(|e| Error::io(&path, "open", e))?);
+        let f = match File::open(&path) {
+            Ok(f) => Arc::new(f),
+            // A segment that retention removed under an older snapshot.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && base < self.floor.load(Ordering::Acquire) =>
+            {
+                return Err(Error::BelowFloor {
+                    position: base,
+                    floor: self.floor.load(Ordering::Acquire),
+                });
+            }
+            Err(e) => return Err(Error::io(&path, "open", e)),
+        };
         files.insert(base, f.clone());
         Ok(f)
+    }
+
+    /// A durable index write with the segment bytes synced first, so the
+    /// index never vouches for data that is not on disk. Takes the writer
+    /// lock; `f` gets the transaction and this `Inner`.
+    pub(crate) fn durable_index<T>(
+        &self,
+        f: impl FnOnce(&Inner, &redb::WriteTransaction) -> Result<T>,
+    ) -> Result<T> {
+        let w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        w.sync_data()?;
+        let txn = self.index.begin_write_durable()?;
+        let out = f(self, &txn)?;
+        txn.commit()?;
+        drop(w);
+        Ok(out)
+    }
+
+    /// Marks the next commit to fail after its bytes are written but
+    /// before its index commit. For tests of the cleanup that follows.
+    #[doc(hidden)]
+    pub fn debug_fail_next_commit(&self) {
+        self.fail_next_commit.store(true, Ordering::Release);
     }
 
     /// Drops cached handles on segments about to be removed.
@@ -683,8 +762,14 @@ impl Inner {
     /// Starts a new segment at `base`. The commit that filled the old one
     /// already succeeded, so a failure here just keeps writing to it.
     pub(crate) fn roll(&self, w: &mut MutexGuard<'_, SegmentWriter>, base: u64) {
-        let sync = self.opts.fsync == Fsync::Always;
-        if let Ok(next) = SegmentWriter::create(&self.layout.segments_dir(), base, sync) {
+        // The old segment is closed for good: cut any leftovers of a
+        // failed commit and make it durable, whatever the fsync policy,
+        // since nothing will sync it later. A new segment's header and
+        // directory entry are synced for the same reason.
+        if w.truncate_to_len().is_err() || w.sync_data().is_err() {
+            return;
+        }
+        if let Ok(next) = SegmentWriter::create(&self.layout.segments_dir(), base, true) {
             **w = next;
         }
     }
@@ -693,8 +778,9 @@ impl Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         if self.opts.fsync == Fsync::Never {
-            if let Ok(w) = self.writer.get_mut() {
-                let _ = w.sync_data();
+            let w = self.writer.get_mut().unwrap_or_else(|p| p.into_inner());
+            if w.sync_data().is_err() {
+                return;
             }
             if let Ok(txn) = self.index.begin_write_durable() {
                 let _ = txn.commit();

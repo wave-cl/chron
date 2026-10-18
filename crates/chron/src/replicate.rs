@@ -51,7 +51,9 @@ pub(crate) fn chunk(inner: &Inner, from: u64, max_events: usize) -> Result<Optio
     loop {
         let mut walker = Frames::new(&frames[scanned..]);
         while let Some((offset, frame)) = walker.next(path, max_record)? {
-            let flags = frame[FRAME_LEN + 1];
+            let Some(&flags) = frame.get(FRAME_LEN + 1) else {
+                return Err(Error::corrupt(path, offset, "record too short for a body"));
+            };
             if position == from && flags & FLAG_FIRST_IN_TXN == 0 {
                 return Err(Error::corrupt(
                     inner.layout.index_file(),

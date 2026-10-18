@@ -1,6 +1,6 @@
 use std::fs;
 
-use chron::{Db, Error, Expected, Fsync, Options, Rebuilt};
+use chron::{Db, Error, Expected, Fsync, Options};
 
 use crate::common::*;
 
@@ -91,15 +91,7 @@ fn rebuild_drops_a_torn_trailing_transaction() {
     fs::remove_file(d.path().join("index.redb")).unwrap();
 
     let r = Db::rebuild_index(d.path(), &durable()).unwrap();
-    assert_eq!(
-        r,
-        Rebuilt {
-            head: 3,
-            floor: 0,
-            segments: 1,
-            dropped: 2
-        }
-    );
+    assert_eq!((r.head, r.floor, r.segments, r.dropped), (3, 0, 1, 2));
     let db = open_with(d.path(), durable());
     assert_eq!(db.head(), 3);
     assert_eq!(
@@ -126,15 +118,7 @@ fn rebuild_keeps_a_complete_unacknowledged_transaction() {
     drop(db);
     fs::remove_file(d.path().join("index.redb")).unwrap();
     let r = Db::rebuild_index(d.path(), &durable()).unwrap();
-    assert_eq!(
-        r,
-        Rebuilt {
-            head: 6,
-            floor: 0,
-            segments: 1,
-            dropped: 0
-        }
-    );
+    assert_eq!((r.head, r.floor, r.segments, r.dropped), (6, 0, 1, 0));
     let db = open_with(d.path(), durable().verify_all_segments(true));
     assert_eq!(payloads(&db.read_all(3, 10).unwrap()), ["g0", "g1", "g2"]);
     assert_eq!(payloads(&db.read_tag("t", 0, 10).unwrap()), ["g0"]);
@@ -188,15 +172,7 @@ fn rebuild_refuses_while_open_and_is_idempotent() {
     let before = snapshot(&db);
     drop(db);
     let r = Db::rebuild_index(d.path(), &opts()).unwrap();
-    assert_eq!(
-        r,
-        Rebuilt {
-            head: 2,
-            floor: 0,
-            segments: 1,
-            dropped: 0
-        }
-    );
+    assert_eq!((r.head, r.floor, r.segments, r.dropped), (2, 0, 1, 0));
     assert_eq!(snapshot(&open(d.path())), before);
 }
 
@@ -204,15 +180,7 @@ fn rebuild_refuses_while_open_and_is_idempotent() {
 fn rebuild_of_an_empty_directory_gives_head_zero() {
     let d = tmp();
     let r = Db::rebuild_index(d.path().join("fresh"), &opts()).unwrap();
-    assert_eq!(
-        r,
-        Rebuilt {
-            head: 0,
-            floor: 0,
-            segments: 0,
-            dropped: 0
-        }
-    );
+    assert_eq!((r.head, r.floor, r.segments, r.dropped), (0, 0, 0, 0));
     let db = open(d.path().join("fresh"));
     assert_eq!(db.head(), 0);
     fill(&db, agg(1), 1);

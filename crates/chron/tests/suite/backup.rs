@@ -64,7 +64,10 @@ fn a_full_backup_restores_an_identical_snapshot() {
         (meta.kind, meta.head, meta.floor, meta.base_head),
         (BackupKind::Full, before.0, 0, None)
     );
-    assert_eq!(meta.files as usize, segments(&d.path().join("src")).len());
+    assert_eq!(
+        meta.files as usize,
+        segments(&d.path().join("src")).len() + 1
+    );
     assert!(meta.bytes > 0);
     let inspected = chron::inspect_backup(&archive).unwrap();
     assert_eq!(inspected, meta);
@@ -312,7 +315,11 @@ fn restore_of_a_retained_db_keeps_the_floor_and_an_empty_db_round_trips() {
     let empty = open(d.path().join("empty"));
     let archive = d.path().join("empty.chronbak");
     let meta = empty.backup(&archive).unwrap();
-    assert_eq!((meta.head, meta.files), (0, 1));
+    assert_eq!(
+        (meta.head, meta.files),
+        (0, 2),
+        "one segment entry and the lengths entry"
+    );
     chron::restore_backup(&archive, d.path().join("empty2"), &opts()).unwrap();
     let r = open(d.path().join("empty2"));
     assert_eq!(r.head(), 0);

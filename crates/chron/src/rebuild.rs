@@ -29,6 +29,15 @@ pub struct Rebuilt {
     /// Decodable events of an incomplete trailing transaction, left out of
     /// the index. The next open truncates their bytes.
     pub dropped: u64,
+    /// Bytes after the last complete transaction in the last segment,
+    /// which the next open truncates.
+    pub tail_bytes_dropped: u64,
+    /// Why the last segment's scan stopped before its end, if it did.
+    pub tail_reason: Option<String>,
+    /// Whether the identity came from the existing index or the backup
+    /// (`false`: the next open mints a fresh one, and replicas of the old
+    /// identity will refuse it).
+    pub identity_kept: bool,
 }
 
 /// Records committed under the current flush, bound for the index.
@@ -105,18 +114,61 @@ enum IdSource {
     Given(Option<Uuid>),
 }
 
-/// Rebuilds, keeping the identity the existing index holds (if any).
+/// Rebuilds, keeping the identity and the aggregate lengths the existing
+/// index holds (if any): lengths of aggregates whose events all lie
+/// below the floor exist nowhere else.
 pub(crate) fn rebuild(path: &Path, opts: &Options) -> Result<Rebuilt> {
-    rebuild_from(path, opts, IdSource::Existing)
+    rebuild_from(path, opts, IdSource::Existing, Vec::new())
 }
 
-/// Rebuilds, writing `id` as the identity when given; without one the
-/// next open mints a fresh identity.
-pub(crate) fn rebuild_with_id(path: &Path, opts: &Options, id: Option<Uuid>) -> Result<Rebuilt> {
-    rebuild_from(path, opts, IdSource::Given(id))
+/// Rebuilds from a backup: `id` and `lens` come from the archive; without
+/// an id the next open mints a fresh identity.
+pub(crate) fn rebuild_seeded(
+    path: &Path,
+    opts: &Options,
+    id: Option<Uuid>,
+    lens: Vec<(Uuid, u64)>,
+) -> Result<Rebuilt> {
+    rebuild_from(path, opts, IdSource::Given(id), lens)
 }
 
-fn rebuild_from(path: &Path, opts: &Options, id: IdSource) -> Result<Rebuilt> {
+/// Whether a crc-valid record carrying a position at or past `after`
+/// exists anywhere in the file from `offset` on: damage inside committed
+/// data rather than a torn tail.
+fn later_record_exists(path: &Path, offset: u64, after: u64) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).map_err(|e| Error::io(path, "open", e))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| Error::io(path, "seek", e))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|e| Error::io(path, "read", e))?;
+    let frame = segment::FRAME_LEN;
+    for i in 0..buf.len().saturating_sub(frame) {
+        let body_len = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap()) as usize;
+        if body_len == 0 || i + frame + body_len > buf.len() {
+            continue;
+        }
+        let crc = u32::from_be_bytes(buf[i + 4..i + 8].try_into().unwrap());
+        let body = &buf[i + frame..i + frame + body_len];
+        if crc32fast::hash(body) != crc {
+            continue;
+        }
+        if let Ok(ev) = crate::event::decode_body(body)
+            && ev.position >= after
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn rebuild_from(
+    path: &Path,
+    _opts: &Options,
+    id: IdSource,
+    seed: Vec<(Uuid, u64)>,
+) -> Result<Rebuilt> {
     let layout = Layout::new(path);
     let dir = layout.segments_dir();
     fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, "mkdir", e))?;
@@ -129,19 +181,25 @@ fn rebuild_from(path: &Path, opts: &Options, id: IdSource) -> Result<Rebuilt> {
     let segments = validated_segments(&dir)?;
     // Only after the segments passed: opening the old index may rewrite
     // its file, and a refused rebuild must leave it untouched.
-    let id = match id {
-        IdSource::Given(id) => id,
+    let (id, seed) = match id {
+        IdSource::Given(id) => (id, seed),
         IdSource::Existing => {
             let index_file = layout.index_file();
-            if index_file.exists() {
-                Index::open(&index_file, Fsync::Never)
-                    .and_then(|i| i.db_id())
-                    .unwrap_or(None)
+            let old = if index_file.exists() {
+                Index::open(&index_file, Fsync::Never).ok()
             } else {
                 None
+            };
+            match old {
+                Some(old) => (
+                    old.db_id().unwrap_or(None),
+                    old.aggregate_lens().unwrap_or_default(),
+                ),
+                None => (None, Vec::new()),
             }
         }
     };
+    let identity_kept = id.is_some();
 
     let index = Index::create(&tmp, Fsync::Never)?;
     let mut lens: HashMap<Uuid, u64> = HashMap::new();
@@ -153,6 +211,8 @@ fn rebuild_from(path: &Path, opts: &Options, id: IdSource) -> Result<Rebuilt> {
     let mut next_base = floor;
     let mut head = floor;
     let mut decoded = 0u64;
+    let mut tail_bytes_dropped = 0u64;
+    let mut tail_reason = None;
     let last = segments.len().saturating_sub(1);
 
     for (k, (base, seg_path)) in segments.iter().enumerate() {
@@ -163,7 +223,10 @@ fn rebuild_from(path: &Path, opts: &Options, id: IdSource) -> Result<Rebuilt> {
                 format!("segment starts at position {base}, {next_base} expected"),
             ));
         }
-        let mut records = Records::open(seg_path, *base, opts.max_record_bytes)?;
+        // The fixed frame bound, not the configured record limit: a limit
+        // lowered since the data was written must not read as damage.
+        let mut records = Records::open(seg_path, *base, u32::MAX as usize)?;
+        let mut last_complete_end = segment::HEADER_LEN;
         loop {
             match records.next()? {
                 Item::Record(r) => {
@@ -212,6 +275,7 @@ fn rebuild_from(path: &Path, opts: &Options, id: IdSource) -> Result<Rebuilt> {
                     });
                     if last_in_txn {
                         head = r.position + 1;
+                        last_complete_end = r.offset + u64::from(r.frame_len);
                         batch.append(&mut open_txn);
                         for (id, len) in pending.drain() {
                             lens.insert(id, len);
@@ -238,6 +302,25 @@ fn rebuild_from(path: &Path, opts: &Options, id: IdSource) -> Result<Rebuilt> {
                                 "transaction still open at the end of a segment that is not the last",
                             ));
                         }
+                    } else if !clean || !open_txn.is_empty() {
+                        // A torn tail is cut; damage with committed records
+                        // after it is not.
+                        if later_record_exists(seg_path, offset, records.reached())? {
+                            return Err(Error::corrupt(
+                                seg_path,
+                                offset,
+                                format!("{reason}; committed records follow the damage"),
+                            ));
+                        }
+                        let file_len = fs::metadata(seg_path)
+                            .map_err(|e| Error::io(seg_path, "metadata", e))?
+                            .len();
+                        tail_bytes_dropped = file_len.saturating_sub(last_complete_end);
+                        tail_reason = Some(if clean {
+                            "transaction open at the end of the file".to_string()
+                        } else {
+                            reason
+                        });
                     }
                     next_base = records.reached();
                     break;
@@ -249,6 +332,16 @@ fn rebuild_from(path: &Path, opts: &Options, id: IdSource) -> Result<Rebuilt> {
     drop(open_txn);
     drop(pending);
 
+    // Seeded lengths stand for events below the floor. An aggregate with
+    // survivors counted its true length (indices are absolute); one whose
+    // events were all dropped has only the seed.
+    for (id, len) in seed {
+        let entry = lens.entry(id).or_insert(0);
+        if len > *entry {
+            *entry = len;
+        }
+    }
+    touched.extend(lens.keys().copied());
     flush(&index, &mut batch, &lens, &mut touched)?;
     let txn = index.begin_write_durable()?;
     {
@@ -276,6 +369,9 @@ fn rebuild_from(path: &Path, opts: &Options, id: IdSource) -> Result<Rebuilt> {
         floor,
         segments: segments.len(),
         dropped,
+        tail_bytes_dropped,
+        tail_reason,
+        identity_kept,
     })
 }
 
@@ -340,15 +436,7 @@ mod tests {
         );
         write_segment(&dir, 3, &[(3, a, 2, BOTH)]);
         let r = rebuild(d.path(), &Options::new()).unwrap();
-        assert_eq!(
-            r,
-            Rebuilt {
-                head: 4,
-                floor: 0,
-                segments: 2,
-                dropped: 0
-            }
-        );
+        assert_eq!((r.head, r.floor, r.segments, r.dropped), (4, 0, 2, 0));
         let index = Index::open(&d.path().join("index.redb"), Fsync::Never).unwrap();
         assert_eq!(index.head().unwrap(), 4);
         assert_eq!(index.aggregate_len(&Uuid::from_u128(1)).unwrap(), 3);
@@ -396,15 +484,7 @@ mod tests {
         let a = Some(Uuid::from_u128(1));
         write_segment(&dir, 7, &[(7, a, 5, BOTH), (8, a, 6, BOTH)]);
         let r = rebuild(d.path(), &Options::new()).unwrap();
-        assert_eq!(
-            r,
-            Rebuilt {
-                head: 9,
-                floor: 7,
-                segments: 1,
-                dropped: 0
-            }
-        );
+        assert_eq!((r.head, r.floor, r.segments, r.dropped), (9, 7, 1, 0));
         let index = Index::open(&d.path().join("index.redb"), Fsync::Never).unwrap();
         assert_eq!(index.floor().unwrap(), 7);
         assert_eq!(index.aggregate_len(&Uuid::from_u128(1)).unwrap(), 7);

@@ -7,7 +7,8 @@
 //! entries: u8 kind | u16 name_len | name | u64 len | bytes
 //!   kind 1  a segment file, "segments/<base:020>.seg"   (full backups)
 //!   kind 2  "records": frames of positions [base_head, head)   (incremental)
-//! u8 0xFF | u32 crc32 over everything after the header
+//!   kind 3  "agg_len": (uuid, u64 length) pairs                  (full backups)
+//! u8 0xFF | u32 crc32 over everything before it
 //! ```
 
 use std::fs::{self, File, OpenOptions};
@@ -30,6 +31,9 @@ const MAGIC: &[u8; 8] = b"CHRONBAK";
 const FORMAT: u32 = 1;
 const KIND_SEGMENT: u8 = 1;
 const KIND_RECORDS: u8 = 2;
+/// Every aggregate's length, (16-byte uuid, u64) pairs: lengths of
+/// aggregates whose events all lie below the floor exist nowhere else.
+const KIND_AGG_LEN: u8 = 3;
 const KIND_END: u8 = 0xFF;
 const MAX_HEADER: u32 = 16 * 1024 * 1024;
 const COPY_CHUNK: usize = 1 << 20;
@@ -98,50 +102,63 @@ impl<W: Write> Write for Crc<W> {
 struct Writer {
     path: PathBuf,
     tmp: PathBuf,
-    out: Crc<BufWriter<File>>,
+    /// `None` once finished; a dropped unfinished writer removes its file.
+    out: Option<Crc<BufWriter<File>>>,
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        if self.out.take().is_some() {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
 }
 
 impl Writer {
     fn create(archive: &Path, meta: &BackupMeta) -> Result<Self> {
-        let tmp = archive.with_extension("chronbak.tmp");
+        let tmp = PathBuf::from(format!(
+            "{}.{}.{}.tmp",
+            archive.display(),
+            std::process::id(),
+            now_nanos()
+        ));
         let file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&tmp)
             .map_err(|e| Error::io(&tmp, "create", e))?;
-        let mut out = BufWriter::new(file);
         let header = serde_json::to_vec(meta)
             .map_err(|e| Error::corrupt(archive, 0, format!("cannot encode the header: {e}")))?;
-        out.write_all(MAGIC)
-            .and_then(|()| out.write_all(&(header.len() as u32).to_be_bytes()))
-            .and_then(|()| out.write_all(&header))
-            .map_err(|e| Error::io(&tmp, "write", e))?;
-        Ok(Writer {
+        let mut w = Writer {
             path: archive.to_path_buf(),
             tmp,
-            out: Crc {
-                inner: out,
+            out: Some(Crc {
+                inner: BufWriter::new(file),
                 hasher: crc32fast::Hasher::new(),
-            },
-        })
+            }),
+        };
+        w.bytes(MAGIC)?;
+        w.bytes(&(header.len() as u32).to_be_bytes())?;
+        w.bytes(&header)?;
+        Ok(w)
     }
 
-    fn io(&self, op: &'static str, e: std::io::Error) -> Error {
-        Error::io(&self.tmp, op, e)
+    fn out(&mut self) -> &mut Crc<BufWriter<File>> {
+        self.out.as_mut().expect("writer not finished")
     }
 
     fn entry_header(&mut self, kind: u8, name: &str, len: u64) -> Result<()> {
-        self.out
-            .write_all(&[kind])
-            .and_then(|()| self.out.write_all(&(name.len() as u16).to_be_bytes()))
-            .and_then(|()| self.out.write_all(name.as_bytes()))
-            .and_then(|()| self.out.write_all(&len.to_be_bytes()))
-            .map_err(|e| self.io("write", e))
+        self.bytes(&[kind])?;
+        self.bytes(&(name.len() as u16).to_be_bytes())?;
+        self.bytes(name.as_bytes())?;
+        self.bytes(&len.to_be_bytes())
     }
 
     fn bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        self.out.write_all(bytes).map_err(|e| self.io("write", e))
+        let tmp = self.tmp.clone();
+        self.out()
+            .write_all(bytes)
+            .map_err(|e| Error::io(&tmp, "write", e))
     }
 
     /// Copies exactly `len` bytes of `file` from offset 0, by positional
@@ -166,11 +183,10 @@ impl Writer {
     }
 
     fn finish(mut self, mut meta: BackupMeta) -> Result<BackupMeta> {
-        self.out
-            .write_all(&[KIND_END])
-            .map_err(|e| self.io("write", e))?;
-        let crc = self.out.hasher.clone().finalize();
-        let mut file = self.out.inner;
+        self.bytes(&[KIND_END])?;
+        let out = self.out.take().expect("writer not finished");
+        let crc = out.hasher.clone().finalize();
+        let mut file = out.inner;
         file.write_all(&crc.to_be_bytes())
             .and_then(|()| file.flush())
             .map_err(|e| Error::io(&self.tmp, "write", e))?;
@@ -259,11 +275,12 @@ pub(crate) fn write_full(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
         head: plan.head,
         floor: plan.floor,
         created_at_unix_nanos: now_nanos(),
-        files: plan.segments.len() as u64,
+        files: plan.segments.len() as u64 + 1,
         bytes: 0,
         db_id: Some(*inner.db_id.lock().unwrap_or_else(|p| p.into_inner())),
     };
     let mut w = Writer::create(archive, &meta)?;
+    let lens = inner.index.aggregate_lens()?;
     for (base, path, len) in &plan.segments {
         let name = format!("segments/{}", segment::file_name(*base));
         w.entry_header(KIND_SEGMENT, &name, *len)?;
@@ -277,7 +294,34 @@ pub(crate) fn write_full(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
         let file = inner.file(*base)?;
         w.copy_file(&file, path, *len)?;
     }
+    w.entry_header(KIND_AGG_LEN, "agg_len", lens.len() as u64 * 24)?;
+    for (id, len) in &lens {
+        w.bytes(id.as_bytes())?;
+        w.bytes(&len.to_be_bytes())?;
+    }
     w.finish(meta)
+}
+
+/// Decodes an `agg_len` entry.
+fn parse_lens(bytes: &[u8], path: &Path, at: u64) -> Result<Vec<(Uuid, u64)>> {
+    if !bytes.len().is_multiple_of(24) {
+        return Err(Error::corrupt(
+            path,
+            at,
+            "agg_len entry is not a whole number of pairs",
+        ));
+    }
+    Ok(bytes
+        .as_chunks::<24>()
+        .0
+        .iter()
+        .map(|c| {
+            (
+                Uuid::from_bytes(c[..16].try_into().unwrap()),
+                u64::from_be_bytes(c[16..].try_into().unwrap()),
+            )
+        })
+        .collect())
 }
 
 /// The frames of positions `from..to`, back to back.
@@ -320,8 +364,15 @@ pub(crate) fn frames_between(inner: &Inner, from: u64, to: u64) -> Result<Vec<u8
         let start = first.offset;
         let end = last.offset + u64::from(last.frame_len);
         let file = inner.file(*base)?;
+        let span = end.checked_sub(start).ok_or_else(|| {
+            Error::corrupt(
+                inner.layout.index_file(),
+                lo,
+                format!("positions {lo}..{hi} are placed out of order in segment {base}"),
+            )
+        })?;
         let at = out.len();
-        out.resize(at + (end - start) as usize, 0);
+        out.resize(at + span as usize, 0);
         file.read_exact_at(&mut out[at..], start)
             .map_err(|e| Error::io(path, "read", e))?;
     }
@@ -368,26 +419,32 @@ struct Reader {
     file: BufReader<File>,
     hasher: crc32fast::Hasher,
     at: u64,
+    len: u64,
 }
 
 impl Reader {
     fn open(archive: &Path) -> Result<(Self, BackupMeta)> {
         let file = File::open(archive).map_err(|e| Error::io(archive, "open", e))?;
+        let len = file
+            .metadata()
+            .map_err(|e| Error::io(archive, "metadata", e))?
+            .len();
         let mut r = Reader {
             path: archive.to_path_buf(),
             file: BufReader::new(file),
             hasher: crc32fast::Hasher::new(),
             at: 0,
+            len,
         };
         let mut magic = [0u8; 8];
-        r.read_raw(&mut magic)?;
+        r.read_hashed(&mut magic)?;
         if &magic != MAGIC {
             return Err(Error::corrupt(archive, 0, "not a chron backup"));
         }
         let mut len = [0u8; 4];
-        r.read_raw(&mut len)?;
+        r.read_hashed(&mut len)?;
         let len = u32::from_be_bytes(len);
-        if len == 0 || len > MAX_HEADER {
+        if len == 0 || len > MAX_HEADER || u64::from(len) > r.len.saturating_sub(12) {
             return Err(Error::corrupt(
                 archive,
                 8,
@@ -395,7 +452,7 @@ impl Reader {
             ));
         }
         let mut header = vec![0u8; len as usize];
-        r.read_raw(&mut header)?;
+        r.read_hashed(&mut header)?;
         let meta: BackupMeta = serde_json::from_slice(&header)
             .map_err(|e| Error::corrupt(archive, 12, format!("bad header: {e}")))?;
         if meta.format != FORMAT {
@@ -459,6 +516,13 @@ impl Reader {
     }
 
     fn read_entry(&mut self, len: u64) -> Result<Vec<u8>> {
+        if len > self.len.saturating_sub(self.at) {
+            return Err(Error::corrupt(
+                &self.path,
+                self.at,
+                format!("entry of {len} bytes exceeds the archive"),
+            ));
+        }
         let mut out = vec![0u8; len as usize];
         self.read_hashed(&mut out)?;
         Ok(out)
@@ -550,7 +614,14 @@ fn restore_into(
     let layout = Layout::new(staging);
     let segments_dir = layout.segments_dir();
     fs::create_dir_all(&segments_dir).map_err(|e| Error::io(&segments_dir, "mkdir", e))?;
+    let mut lens: Vec<(Uuid, u64)> = Vec::new();
     while let Some((kind, name, len)) = reader.next_entry()? {
+        if kind == KIND_AGG_LEN {
+            let at = reader.at;
+            let bytes = reader.read_entry(len)?;
+            lens = parse_lens(&bytes, &reader.path, at)?;
+            continue;
+        }
         if kind != KIND_SEGMENT {
             return Err(Error::corrupt(
                 &reader.path,
@@ -575,7 +646,7 @@ fn restore_into(
     }
     reader.finish()?;
     // The index last: a damaged archive never leaves a half-built database.
-    let rebuilt = rebuild::rebuild_with_id(staging, opts, meta.db_id)?;
+    let rebuilt = rebuild::rebuild_seeded(staging, opts, meta.db_id, lens)?;
     if rebuilt.head != meta.head || rebuilt.floor != meta.floor || rebuilt.dropped != 0 {
         return Err(Error::corrupt(
             staging,

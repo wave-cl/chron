@@ -4,7 +4,8 @@
 use std::path::Path;
 
 use redb::{
-    Database, Durability, ReadTransaction, ReadableDatabase, TableDefinition, WriteTransaction,
+    Database, Durability, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
+    WriteTransaction,
 };
 use uuid::Uuid;
 
@@ -96,8 +97,21 @@ impl Index {
         }
     }
 
-    /// Creates the index with every table and `head = 0`.
+    /// Creates the index with every table and `head = 0`, under a
+    /// temporary name renamed into place once complete: a crash while
+    /// creating leaves no table-less index behind.
     pub(crate) fn create(path: &Path, fsync: Fsync) -> Result<Self> {
+        let tmp = path.with_extension("redb.new");
+        let _ = std::fs::remove_file(&tmp);
+        Self::create_at(&tmp, fsync)?;
+        std::fs::rename(&tmp, path).map_err(|e| crate::error::Error::io(&tmp, "rename", e))?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            crate::segment::sync_dir(parent)?;
+        }
+        Self::open(path, fsync)
+    }
+
+    fn create_at(path: &Path, fsync: Fsync) -> Result<()> {
         let index = Index {
             db: Database::create(path)?,
             durability: Self::durability_for(fsync),
@@ -117,7 +131,7 @@ impl Index {
             txn.open_table(TAG)?;
         }
         txn.commit()?;
-        Ok(index)
+        Ok(())
     }
 
     pub(crate) fn open(path: &Path, fsync: Fsync) -> Result<Self> {
@@ -203,6 +217,9 @@ impl Index {
             .map_or(0, |v| v.value()))
     }
 
+    /// Sets the epoch without syncing any segment: for the unit tests
+    /// below; the library goes through `Inner::durable_index`.
+    #[cfg(test)]
     pub(crate) fn set_epoch(&self, epoch: u64) -> Result<()> {
         let txn = self.begin_write_durable()?;
         txn.open_table(META)?.insert(EPOCH_KEY, epoch)?;
@@ -212,10 +229,28 @@ impl Index {
 
     pub(crate) fn floor(&self) -> Result<u64> {
         let txn = self.begin_read()?;
+        Self::floor_in(&txn)
+    }
+
+    /// The floor as the snapshot `txn` holds it: what a read in that
+    /// snapshot must compare its positions against.
+    pub(crate) fn floor_in(txn: &ReadTransaction) -> Result<u64> {
         Ok(txn
             .open_table(META)?
             .get(FLOOR_KEY)?
             .map_or(0, |v| v.value()))
+    }
+
+    /// Every aggregate's length.
+    pub(crate) fn aggregate_lens(&self) -> Result<Vec<(Uuid, u64)>> {
+        let txn = self.begin_read()?;
+        let table = txn.open_table(AGG_LEN)?;
+        let mut out = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            out.push((Uuid::from_bytes(*k.value()), v.value()));
+        }
+        Ok(out)
     }
 
     pub(crate) fn aggregate_len(&self, id: &Uuid) -> Result<u64> {
