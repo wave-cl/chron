@@ -208,9 +208,57 @@ impl Scanner {
     }
 }
 
+/// Reads `len` bytes at `offset` in one positional read. A short file is
+/// `Corrupt`: the caller only asks for bytes the index vouches for.
+pub(crate) fn read_bytes_at(file: &File, path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    file.read_exact_at(&mut buf, offset).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            Error::corrupt(path, offset, "record past end of file")
+        } else {
+            Error::io(path, "read", e)
+        }
+    })?;
+    Ok(buf)
+}
+
+/// Checks one framed record (`len, crc, body`) the index placed at `offset`
+/// and returns its body. Everything wrong is `Corrupt`.
+pub(crate) fn check_frame<'a>(
+    path: &Path,
+    offset: u64,
+    frame: &'a [u8],
+    max_record: usize,
+) -> Result<&'a [u8]> {
+    let frame_len = frame.len();
+    if frame_len <= FRAME_LEN || frame_len > max_record {
+        return Err(Error::corrupt(
+            path,
+            offset,
+            format!("index claims an implausible frame length {frame_len}"),
+        ));
+    }
+    let body_len = u32::from_be_bytes(frame[0..4].try_into().unwrap()) as usize;
+    let crc = u32::from_be_bytes(frame[4..8].try_into().unwrap());
+    if body_len + FRAME_LEN != frame_len {
+        return Err(Error::corrupt(
+            path,
+            offset,
+            format!(
+                "frame says body {body_len}, index says {}",
+                frame_len - FRAME_LEN
+            ),
+        ));
+    }
+    let body = &frame[FRAME_LEN..];
+    if crc32fast::hash(body) != crc {
+        return Err(Error::corrupt(path, offset, "crc mismatch"));
+    }
+    Ok(body)
+}
+
 /// Reads the record the index placed at `offset` with a frame of `frame_len`
-/// bytes, in one positional read. Everything wrong is `Corrupt`: the caller
-/// only asks for records the index vouches for.
+/// bytes, in one positional read, and checks it.
 pub(crate) fn read_record_at(
     file: &File,
     path: &Path,
@@ -226,31 +274,8 @@ pub(crate) fn read_record_at(
             format!("index claims an implausible frame length {frame_len}"),
         ));
     }
-    let mut buf = vec![0u8; frame_len];
-    file.read_exact_at(&mut buf, offset).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            Error::corrupt(path, offset, "record past end of file")
-        } else {
-            Error::io(path, "read", e)
-        }
-    })?;
-    let body_len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
-    let crc = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-    if body_len + FRAME_LEN != frame_len {
-        return Err(Error::corrupt(
-            path,
-            offset,
-            format!(
-                "frame says body {body_len}, index says {}",
-                frame_len - FRAME_LEN
-            ),
-        ));
-    }
-    buf.drain(..FRAME_LEN);
-    if crc32fast::hash(&buf) != crc {
-        return Err(Error::corrupt(path, offset, "crc mismatch"));
-    }
-    Ok(buf)
+    let frame = read_bytes_at(file, path, offset, frame_len)?;
+    Ok(check_frame(path, offset, &frame, max_record)?.to_vec())
 }
 
 /// The writer's handle on the current segment.

@@ -43,6 +43,38 @@ impl From<(u64, u64, u32)> for Location {
     }
 }
 
+/// Groups ascending `(position, location)` entries into runs of records
+/// that sit back to back in one segment, each run at most `max_bytes`
+/// long (a single record larger than that is a run of its own). Each
+/// range indexes into `found`.
+pub(crate) fn coalesce(found: &[(u64, Location)], max_bytes: u64) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0u64;
+    for i in 0..found.len() {
+        let loc = &found[i].1;
+        let extends = i > start && {
+            let prev = &found[i - 1].1;
+            prev.base == loc.base
+                && prev.offset + u64::from(prev.frame_len) == loc.offset
+                && bytes + u64::from(loc.frame_len) <= max_bytes
+        };
+        if extends {
+            bytes += u64::from(loc.frame_len);
+        } else {
+            if i > start {
+                runs.push(start..i);
+            }
+            start = i;
+            bytes = u64::from(loc.frame_len);
+        }
+    }
+    if start < found.len() {
+        runs.push(start..found.len());
+    }
+    runs
+}
+
 pub(crate) struct Index {
     db: Database,
     durability: Durability,
@@ -355,6 +387,39 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn loc(base: u64, offset: u64, frame_len: u32) -> (u64, Location) {
+        (
+            offset,
+            Location {
+                base,
+                offset,
+                frame_len,
+            },
+        )
+    }
+
+    #[test]
+    fn coalesce_runs() {
+        assert!(coalesce(&[], 100).is_empty());
+        let contiguous = [loc(0, 64, 10), loc(0, 74, 10), loc(0, 84, 10)];
+        assert_eq!(coalesce(&contiguous, 100), vec![0..3]);
+        let gap = [loc(0, 64, 10), loc(0, 80, 10), loc(0, 90, 10)];
+        assert_eq!(coalesce(&gap, 100), vec![0..1, 1..3]);
+        let base_change = [loc(0, 64, 10), loc(7, 74, 10)];
+        assert_eq!(coalesce(&base_change, 100), vec![0..1, 1..2]);
+        let capped = [
+            loc(0, 64, 10),
+            loc(0, 74, 10),
+            loc(0, 84, 10),
+            loc(0, 94, 10),
+        ];
+        assert_eq!(coalesce(&capped, 25), vec![0..2, 2..4]);
+        let huge = [loc(0, 64, 10), loc(0, 74, 500), loc(0, 574, 10)];
+        assert_eq!(coalesce(&huge, 100), vec![0..1, 1..2, 2..3]);
+        let one = [loc(0, 64, 500)];
+        assert_eq!(coalesce(&one, 100), vec![0..1]);
     }
 
     #[test]

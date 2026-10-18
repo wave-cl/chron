@@ -30,6 +30,29 @@ fn payload_at_the_limit_round_trips_and_one_more_is_refused() {
 }
 
 #[test]
+fn records_over_the_coalesce_cap_read_alone() {
+    let d = tmp();
+    let db = open_with(d.path(), opts().max_record_bytes(4 * 1024 * 1024));
+    let payloads: Vec<Vec<u8>> = (0..6u8).map(|i| vec![i; 1536 * 1024]).collect();
+    for p in &payloads {
+        let mut t = db.transaction();
+        t.append_one(agg(1), Expected::Any, NewEvent::new(p.clone()));
+        t.commit().unwrap();
+    }
+    let got = db.read_all(0, 10).unwrap();
+    assert_eq!(got.len(), 6);
+    for (ev, p) in got.iter().zip(&payloads) {
+        assert_eq!(ev.payload.as_ref(), p.as_slice());
+    }
+    assert_eq!(
+        db.read_all_backward(u64::MAX, 2).unwrap()[0]
+            .payload
+            .as_ref(),
+        payloads[5].as_slice()
+    );
+}
+
+#[test]
 fn tag_limits() {
     let d = tmp();
     let db = open(d.path());

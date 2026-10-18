@@ -137,6 +137,12 @@ fn a_flipped_byte_in_an_earlier_segment_fails_the_read() {
     flip(&segments(d.path())[0], offset + 20);
     let db = open_with(d.path(), o);
     assert!(matches!(db.read_all(0, 1), Err(Error::Corrupt { .. })));
+    match db.read_all(0, 100) {
+        Err(Error::Corrupt { offset: at, .. }) => {
+            assert_eq!(at, offset, "the flipped record is blamed")
+        }
+        other => panic!("unexpected {other:?}"),
+    }
     assert!(matches!(
         db.read_aggregate(agg(1), 0, 1),
         Err(Error::Corrupt { .. })

@@ -47,6 +47,12 @@ fn segments_rotate_and_reads_cross_them() {
     assert!(segments(d.path()).len() >= n);
     assert_eq!(db.read_all(0, 1000).unwrap().len(), 341);
 
+    let singles: Vec<_> = (0..341).flat_map(|p| db.read_all(p, 1).unwrap()).collect();
+    assert_eq!(db.read_all(0, 1000).unwrap(), singles);
+    assert_eq!(db.read_all(0, 7).unwrap(), singles[..7]);
+    assert_eq!(db.read_all(5, 100).unwrap(), singles[5..105]);
+    assert_eq!(db.read_all(300, 100).unwrap(), singles[300..]);
+
     let mut forward = db.read_all(0, 1000).unwrap();
     forward.reverse();
     assert_eq!(db.read_all_backward(u64::MAX, 1000).unwrap(), forward);

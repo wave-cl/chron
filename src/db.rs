@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::event::{self, Event};
-use crate::index::{Index, Location};
+use crate::index::{self, Index, Location};
 use crate::options::{Fsync, Options};
 use crate::recover;
 use crate::segment::{self, SegmentWriter};
@@ -48,6 +48,10 @@ impl Layout {
         self.segments_dir().join(segment::file_name(base))
     }
 }
+
+/// Longest single positional read `read_all` makes when records sit back
+/// to back.
+const COALESCE_MAX_BYTES: u64 = 1 << 20;
 
 /// Exclusive hold on the directory for as long as the `Db` lives.
 struct Lock {
@@ -226,10 +230,7 @@ impl Db {
         }
         let txn = self.inner.index.begin_read()?;
         let found = self.inner.index.positions_from(&txn, from, limit)?;
-        found
-            .into_iter()
-            .map(|(position, loc)| self.read_located(position, Some(loc)))
-            .collect()
+        self.read_runs(&found)
     }
 
     /// Events at positions `<= from`, newest first, at most `limit`. `from`
@@ -240,11 +241,11 @@ impl Db {
             return Ok(Vec::new());
         }
         let txn = self.inner.index.begin_read()?;
-        let found = self.inner.index.positions_to(&txn, from, limit)?;
-        found
-            .into_iter()
-            .map(|(position, loc)| self.read_located(position, Some(loc)))
-            .collect()
+        let mut found = self.inner.index.positions_to(&txn, from, limit)?;
+        found.reverse();
+        let mut out = self.read_runs(&found)?;
+        out.reverse();
+        Ok(out)
     }
 
     /// Every event carrying `tag` from global position `from`, at most
@@ -360,6 +361,47 @@ impl Db {
         )
     }
 
+    /// Reads ascending, index-ordered records, one positional read per run
+    /// of back-to-back records. Every record is still checked on its own.
+    fn read_runs(&self, found: &[(u64, Location)]) -> Result<Vec<Event>> {
+        let max_record = self.inner.opts.max_record_bytes;
+        let mut out = Vec::with_capacity(found.len());
+        for run in index::coalesce(found, COALESCE_MAX_BYTES) {
+            let first = &found[run.start].1;
+            let path = self.inner.layout.segment(first.base);
+            let file = self.inner.file(first.base)?;
+            let len: u64 = found[run.clone()]
+                .iter()
+                .map(|(_, l)| u64::from(l.frame_len))
+                .sum();
+            let bytes = segment::read_bytes_at(&file, &path, first.offset, len as usize)?;
+            let mut at = 0usize;
+            for (position, loc) in &found[run] {
+                let frame = &bytes[at..at + loc.frame_len as usize];
+                let body = segment::check_frame(&path, loc.offset, frame, max_record)?;
+                out.push(self.decoded(&path, loc.offset, *position, body)?);
+                at += loc.frame_len as usize;
+            }
+        }
+        Ok(out)
+    }
+
+    fn decoded(&self, path: &Path, offset: u64, position: u64, body: &[u8]) -> Result<Event> {
+        let ev =
+            event::decode_body(body).map_err(|e| Error::corrupt(path, offset, e.to_string()))?;
+        if ev.position != position {
+            return Err(Error::corrupt(
+                path,
+                offset,
+                format!(
+                    "index points position {position} at a record carrying {}",
+                    ev.position
+                ),
+            ));
+        }
+        Ok(ev)
+    }
+
     fn read_located(&self, position: u64, loc: Option<Location>) -> Result<Event> {
         let loc = loc
             .ok_or_else(|| self.mismatch(position, "listed but missing from the position table"))?;
@@ -372,19 +414,7 @@ impl Db {
             loc.frame_len,
             self.inner.opts.max_record_bytes,
         )?;
-        let ev = event::decode_body(&body)
-            .map_err(|e| Error::corrupt(&path, loc.offset, e.to_string()))?;
-        if ev.position != position {
-            return Err(Error::corrupt(
-                &path,
-                loc.offset,
-                format!(
-                    "index points position {position} at a record carrying {}",
-                    ev.position
-                ),
-            ));
-        }
-        Ok(ev)
+        self.decoded(&path, loc.offset, position, &body)
     }
 }
 
