@@ -29,6 +29,24 @@ impl Server {
         }
     }
 
+    /// Starts on a fresh directory without connecting a client (TLS or
+    /// token setups connect their own).
+    pub async fn start_with_no_client(f: impl FnOnce(&mut chrond::Options)) -> Server {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts =
+            chrond::Options::new(dir.path().join("data"), "127.0.0.1:0".parse().unwrap());
+        opts.fsync = false;
+        f(&mut opts);
+        let running = chrond::start(opts).await.expect("the daemon starts");
+        // A lazy channel: never used by these tests.
+        let client = ChronClient::new(Channel::from_static("http://127.0.0.1:1").connect_lazy());
+        Server {
+            dir,
+            running: Some(running),
+            client,
+        }
+    }
+
     /// Starts on a fresh directory with `f` adjusting the options.
     pub async fn start_with(f: impl FnOnce(&mut chrond::Options)) -> Server {
         let dir = tempfile::tempdir().unwrap();
@@ -141,6 +159,35 @@ pub async fn read_all_payloads(client: &mut ChronClient<Channel>) -> Vec<String>
     .await
     .unwrap();
     payloads(&events)
+}
+
+/// Adds `authorization: Bearer <token>` to every call.
+#[derive(Clone)]
+pub struct TokenInterceptor(pub tonic::metadata::MetadataValue<tonic::metadata::Ascii>);
+
+impl tonic::service::Interceptor for TokenInterceptor {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        req.metadata_mut().insert("authorization", self.0.clone());
+        Ok(req)
+    }
+}
+
+pub async fn plain_channel(addr: std::net::SocketAddr) -> Channel {
+    Channel::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap()
+}
+
+pub fn with_token(
+    channel: Channel,
+    token: &str,
+) -> ChronClient<tonic::service::interceptor::InterceptedService<Channel, TokenInterceptor>> {
+    ChronClient::with_interceptor(
+        channel,
+        TokenInterceptor(format!("Bearer {token}").parse().unwrap()),
+    )
 }
 
 pub fn agg(n: u128) -> Uuid {
