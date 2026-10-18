@@ -182,7 +182,7 @@ async fn health_is_serving_then_not_serving_on_shutdown() {
             })
             .await
         {
-            Ok(r) if r.into_inner().status() == ServingStatus::NotServing => break,
+            Ok(r) if r.get_ref().status() == ServingStatus::NotServing => break,
             Ok(_) => {}
             Err(_) => break, // the connection ended with the server
         }
