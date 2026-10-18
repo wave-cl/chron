@@ -4,6 +4,7 @@ mod concurrency;
 mod free;
 mod limits;
 mod reads;
+mod rebuild;
 mod recovery;
 mod reopen;
 mod rotation;

@@ -22,6 +22,7 @@ mod error;
 mod event;
 mod index;
 mod options;
+mod rebuild;
 mod recover;
 mod segment;
 mod subscribe;
@@ -34,6 +35,7 @@ pub use event::{
     NewEvent,
 };
 pub use options::{Fsync, Options};
+pub use rebuild::Rebuilt;
 pub use subscribe::Subscription;
 pub use txn::{AppendResult, Committed, Expected, Transaction};
 pub use uuid::Uuid;

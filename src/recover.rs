@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::db::Layout;
 use crate::error::{Error, Result};
-use crate::event;
+use crate::event::{self, Event};
 use crate::index::{Index, POS};
 use crate::options::Options;
 use crate::segment::{self, HEADER_LEN, ScanItem, Scanner, SegmentWriter};
@@ -26,6 +26,7 @@ pub(crate) struct Record {
     pub position: u64,
     pub offset: u64,
     pub frame_len: u32,
+    pub event: Event,
 }
 
 pub(crate) enum Item {
@@ -53,6 +54,11 @@ impl Records {
             scanner: Scanner::open(path, HEADER_LEN, max_record)?,
             expected: base,
         })
+    }
+
+    /// The position after the last good record so far.
+    pub(crate) fn reached(&self) -> u64 {
+        self.expected
     }
 
     pub(crate) fn next(&mut self) -> Result<Item> {
@@ -84,6 +90,7 @@ impl Records {
                     position: event.position,
                     offset,
                     frame_len,
+                    event,
                 }))
             }
             ScanItem::Tail { offset, reason } => Ok(Item::Tail {
@@ -290,7 +297,7 @@ fn verify_all(
                     if !clean {
                         return Err(Error::corrupt(path, offset, reason));
                     }
-                    let reached = records.expected;
+                    let reached = records.reached();
                     if reached != end {
                         return Err(Error::corrupt(
                             path,

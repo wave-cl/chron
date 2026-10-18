@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::event::{self, Event};
 use crate::index::{self, Index, Location};
 use crate::options::{Fsync, Options};
+use crate::rebuild::Rebuilt;
 use crate::recover;
 use crate::segment::{self, SegmentWriter};
 use crate::subscribe::Subscription;
@@ -54,13 +55,14 @@ impl Layout {
 /// to back.
 const COALESCE_MAX_BYTES: u64 = 1 << 20;
 
-/// Exclusive hold on the directory for as long as the `Db` lives.
-struct Lock {
+/// Exclusive hold on the directory for as long as the `Db` (or a rebuild)
+/// lives.
+pub(crate) struct Lock {
     _file: File,
 }
 
 impl Lock {
-    fn acquire(path: &Path) -> Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -117,7 +119,7 @@ impl Db {
                 return Err(Error::corrupt(
                     stray,
                     0,
-                    "segment files without an index; rebuilding the index is not supported",
+                    "segment files without an index; run Db::rebuild_index first",
                 ));
             }
             let index = Index::create(&index_file, opts.fsync)?;
@@ -354,6 +356,21 @@ impl Db {
     pub fn debug_write_without_commit(&self, txn: Transaction) -> Result<Committed> {
         let (_db, appends) = txn.into_parts();
         txn::commit(&self.inner, appends, Mode::WriteWithoutCommit)
+    }
+
+    /// Rebuilds `index.redb` from the segment files alone, for a database
+    /// whose index is missing or damaged. Takes `LOCK`, so no `Db` may be
+    /// open on `path`. The new index is written beside the old one and
+    /// renamed into place only when complete, so a crash mid-rebuild leaves
+    /// the old index (if any) untouched. Segment files are never modified:
+    /// the next [`Db::open`] truncates whatever the new head excludes.
+    ///
+    /// Every complete transaction in the segments is indexed, including a
+    /// trailing one whose commit was never acknowledged; an incomplete
+    /// trailing transaction is dropped (see [`Rebuilt::dropped`]). Damage
+    /// anywhere but the trailing transaction is [`Error::Corrupt`].
+    pub fn rebuild_index(path: impl AsRef<Path>, opts: &Options) -> Result<Rebuilt> {
+        crate::rebuild::rebuild(path.as_ref(), opts)
     }
 
     /// Where the index places `position`: `(segment base, offset, frame
