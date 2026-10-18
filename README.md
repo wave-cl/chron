@@ -1,15 +1,18 @@
 # chron
 
-An event-sourcing database: a Rust library, a gRPC daemon and a CLI.
+An event-sourcing database: a Rust library, a gRPC daemon, a typed client
+and a CLI.
 
 | Crate | What |
 |---|---|
-| `chron` | the embeddable library (this README's first half) |
+| `chron` | the embeddable library |
 | `chron-proto` | the `chron.v1` gRPC contract and generated code |
 | `chrond` | the daemon: one database behind that service, as a leader or a replica |
-| `chron-cli` | the `chron` binary: client and offline maintenance |
 | `chron-client` | a typed async client in the library's vocabulary |
+| `chron-cli` | the `chron` binary: client and offline maintenance |
 | `examples/bank` | accounts as aggregates, embedded or through a daemon |
+
+## The library
 
 Events live in append-only logs called **aggregates**, each keyed by a
 binary UUID. A **transaction** appends to any number of aggregates at once
@@ -26,7 +29,7 @@ tags and commits with the rest of its transaction.
 use chron::{Db, Expected, NewEvent, Options, Uuid};
 
 let db = Db::open("./orders.chron", Options::new())?;
-let order = Uuid::new_v4();     // `uuid` with the `v4` feature; any Uuid works
+let order = Uuid::new_v4();     // needs `uuid` with its `v4` feature; chron takes any Uuid
 let customer = Uuid::new_v4();
 
 let mut txn = db.transaction();
@@ -35,20 +38,27 @@ txn.append_one(customer, Expected::Exact(3), NewEvent::new(r#"{"ordered":1}"#).t
 txn.append_free(vec![NewEvent::new("audit: order placed").tag("audit")]);
 let committed = txn.commit()?;          // Err(Error::ExpectedLength{..}) if `customer` is not at 3
 
-let events = db.read_aggregate(order, 0, 100)?;     // from index 0
-let everything = db.read_all(committed.first, 100)?; // from a global position
+let events = db.read_aggregate(order, 0, 100)?;      // from index 0, at most 100
+let everything = db.read_all(committed.first, 0)?;   // from a global position; 0 = all
 let audit = db.read_tag("audit", 0, 100)?;            // the tagged subset, in global order
 let newest = db.read_all_backward(u64::MAX, 10)?;     // the last ten, newest first
 
-for event in db.subscribe_tag("orders", 0) {          // every order event so far, then live
+for event in db.iter_tag("orders", 0) {               // a page at a time, to the head
+    let event = event?;
+    println!("{} {:?}", event.position, event.payload);
+}
+for event in db.subscribe_tag("orders", 0) {          // the same, then live, never ends
     let event = event?;
     println!("{} {:?}", event.position, event.payload);
 }
 ```
 
-Every read has a backward twin (`read_all_backward`,
-`read_aggregate_backward`, `read_tag_backward`) that takes an inclusive
-upper bound and returns newest first; `u64::MAX` means "from the end".
+Every read takes `(from, limit)` with `limit` 0 meaning everything, and
+has a backward twin (`read_all_backward`, `read_aggregate_backward`,
+`read_tag_backward`) that takes an inclusive upper bound and returns
+newest first; `u64::MAX` means "from the end". `iter_all`,
+`iter_aggregate` and `iter_tag` page to the head without holding it all.
+Tags are stored sorted and deduplicated.
 
 ## Guarantees
 
@@ -62,12 +72,14 @@ upper bound and returns newest first; `u64::MAX` means "from the end".
   transaction and the second expectation is checked after the first append.
 - **Durability.** Under `Fsync::Always` (the default) a committed
   transaction survives power loss. Under `Fsync::Never` it survives a
-  process crash; `flush()` (also run on drop) makes it durable.
+  process crash; `flush()` (also run on drop) makes it durable, and every
+  maintenance write (retention, epoch, identity) syncs what it depends on.
 - **Recovery.** Event bytes go to append-only segment files and the indexes
   to one redb file; the redb commit is the commit point. On open, anything
   in the segments past the committed head was never acknowledged and is
-  truncated. Damage inside committed data is reported as `Error::Corrupt`,
-  never repaired silently.
+  truncated; a failed commit truncates its own bytes at once. Damage inside
+  committed data is `Error::Corrupt`; index and data disagreeing is
+  `Error::Inconsistent`; neither is repaired silently.
 - **One writer, many readers.** `Db` is cheap to clone and shared between
   threads; commits serialise on one lock, reads never take it. A `LOCK`
   file refuses a second process.
@@ -75,24 +87,39 @@ upper bound and returns newest first; `u64::MAX` means "from the end".
   return a `Subscription`: an iterator that catches up through the index
   and then blocks for new commits. `next_timeout` serves threads that also
   watch a stop flag; `position()` is the checkpoint to resume from. A
-  subscription keeps the database open.
+  subscription keeps the database open. Starting below the retention
+  floor, `subscribe` yields one `Error::BelowFloor` and ends;
+  `subscribe_tag` starts at the floor.
+
+## Limits
+
+Tags are at most 255 bytes and 255 per event. One event's record is at most
+`Options::max_record_bytes` (16 MiB by default). Segments roll at
+`Options::segment_max_bytes` (256 MiB by default); a transaction is never
+split across segments.
 
 ## Layout on disk
 
 ```
 <path>/
   LOCK                      held while a Db is open
-  index.redb                head, aggregate lengths, (aggregate, index) → position,
+  index.redb                head, floor, identity, epoch, aggregate lengths,
+                            (aggregate, index) → position,
                             position → (segment, offset, length), (tag, position)
   segments/<base>.seg       64-byte header, then framed records (length, crc32, body)
 ```
 
-## Backups
+Every database has an **identity** (a UUID, `db.id()`), kept by backups,
+restores and index rebuilds, and an **epoch** (`db.epoch()`) that
+replication raises on every promotion. `db.info()` reports head, floor,
+segment count and bytes, identity, epoch and the fsync mode.
+
+## Backups, retention, checking
 
 - `db.backup(archive)` writes a **full** backup while the database stays in
   use: each segment is copied up to where the index places its last
-  committed record, so the archive holds exactly the events below the head
-  at that moment.
+  committed record, plus every aggregate's length (so lengths of aggregates
+  wholly below the floor survive a restore).
 - `db.backup_since(archive, since)` writes an **incremental** backup: the
   frames of positions `since..head`, to be applied onto a database whose
   head is `since`.
@@ -102,13 +129,13 @@ upper bound and returns newest first; `u64::MAX` means "from the end".
   segments, and only then is the staging directory renamed into place.
 - `db.apply_backup(archive)` appends an incremental backup's events after
   checking every frame; the head must equal the archive's base head
-  (`Error::WrongBaseHead`), and a damaged archive changes nothing.
+  (`Error::WrongBaseHead`), and a damaged archive changes nothing. Giving
+  either call the other kind is `Error::WrongBackupKind`.
 - `chron::inspect_backup(archive)` reads the header only.
 
 The archive is one file: a magic, a JSON header (`BackupMeta`: kind,
-base head, head, floor, time, counts), the entries, and a CRC32 trailer.
-
-## Retention
+base head, head, floor, identity, time, counts), the entries, and a CRC32
+trailer over everything before it.
 
 `db.retain_from(floor)` drops every segment that lies wholly below
 `floor`. The floor in force rounds **down** to a segment boundary (the
@@ -116,122 +143,35 @@ base of the first kept segment), positions never renumber, and the tail
 segment is never dropped. Reads below the floor fail with
 `Error::BelowFloor`; backward reads stop at it; aggregate and tag reads
 return what survives; aggregate lengths are unchanged, so
-`Expected::Exact` keeps working. The index is updated first, so a crash
-before the files are removed is repaired on the next open. `db.info()`
-reports head, floor and the segment directory.
-
-## Checking and repairing
+`Expected::Exact` keeps working. Readers and subscriptions take the floor
+inside their own index snapshot, so a retention racing them is either
+wholly before or wholly after each read.
 
 - `Options::verify_all_segments(true)` reads every segment on open, checking
   each record's CRC, that positions run consecutively, and that the index
   places every record where it is. Off by default, when only the tail is
-  checked.
+  checked (recovery may truncate unacknowledged bytes there).
 - `Db::rebuild_index(path, &opts)` rebuilds `index.redb` from the segment
   files alone, for a missing or damaged index. It takes `LOCK` (no `Db`
   may be open), writes the new index beside the old one and renames it
   into place only when complete. Every complete transaction in the
   segments is indexed, including a trailing one whose commit was never
-  acknowledged; a torn trailing transaction is dropped and the next open
-  truncates its bytes. Damage anywhere else is reported, never repaired.
-  A first segment above zero is read as a retention floor.
+  acknowledged; a torn trailing transaction is dropped and reported
+  (`Rebuilt::tail_bytes_dropped`, `tail_reason`). Damage anywhere else,
+  including inside the last segment when committed records follow it, is
+  reported, never repaired. A first segment above zero is read as a
+  retention floor; the old index's identity and aggregate lengths are
+  kept when it can still be read.
 
 ## Async
 
 With the `tokio` feature, head changes are also published on a tokio
-watch channel: `Db::wait_for_async(min_head)` and
-`Subscription::next_async()`, which is cancel-safe at its one await, so
-`tokio::time::timeout(d, sub.next_async())` is the timeout idiom. The
-daemon uses it; the sync API is unchanged and the feature is off by
-default.
-
-## The daemon
-
-```
-cargo run -p chrond -- --data-dir ./orders.chron            # 127.0.0.1:4242
-chrond --data-dir DIR --listen 0.0.0.0:4242 [--no-fsync] [--verify-all-segments]
-       [--tls-cert server.pem --tls-key server.key [--tls-client-ca ca.pem]]
-       [--token SECRET | --token-file FILE]
-       [--max-message-bytes N] [--request-timeout SECS] [--concurrency-per-connection N]
-       [--replicate-from http://leader:4242 [--replicate-token SECRET]]
-```
-
-Flags fall back to `CHRON_DATA_DIR`, `CHRON_LISTEN`, `CHROND_TLS_*`,
-`CHRON_TOKEN`, `CHRON_TOKEN_FILE`, `CHRON_REPLICATE_FROM`; logging follows
-`CHROND_LOG` (an `EnvFilter`, default `info`) on stderr, one line per call
-with its method, gRPC status and duration. Ctrl-C or SIGTERM stops it:
-every stream ends, the server drains, the database is flushed.
-
-The service is `chron.v1.Chron` in
-`crates/chron-proto/proto/chron/v1/chron.proto`: commit, the six reads
-(server-streamed, `limit` 0 for everything), subscribe (never ends), head,
-aggregate length, info, flush, backup, apply, retain, replicate, promote
-and fence. A failed expectation is `FAILED_PRECONDITION` with the metadata
-`chron-actual-length` and `chron-aggregate`; a write refused by the node's
-role or epoch is `FAILED_PRECONDITION` with `chron-epoch`; bad requests are
-`INVALID_ARGUMENT`; positions past the head or below the floor are
-`OUT_OF_RANGE`.
-
-Plaintext and open by default; off a loopback address, enable TLS and a
-token. With `--tls-client-ca` only clients presenting a certificate from
-that CA are accepted. With a token, every `chron.v1.Chron` call must
-carry `authorization: Bearer <token>` (compared in constant time);
-`grpc.health.v1.Health` stays open and reports SERVING for `""` and
-`chron.v1.Chron` until shutdown, so `grpc_health_probe -addr host:4242`
-works as is. Messages above `--max-message-bytes` (64 MiB) are refused;
-the limit must cover the database's `max_record_bytes`. HTTP/2 keepalives
-run every 30 s.
-
-## Replication
-
-A daemon started with `--replicate-from` is a **replica**: it checks that
-it is a copy of the leader (same identity, a head no further than the
-leader's, the same record before its head; an empty database adopts the
-leader's identity), then pulls whole transactions and applies them
-through the normal commit path, reconnecting with backoff when the
-leader goes away. A replica serves reads, subscriptions, backups and
-retention; it refuses writes with "read-only replica". `chron info` on
-either side shows the role, the epoch, the identity, and on a replica
-whether it is connected, the leader's head and the last error.
-
-Promotion is manual: `chron --addr <replica> promote` stops the pull,
-raises the **epoch** by one, records a `promoted` marker in the data
-directory and asks the old leader to fence itself. A fenced leader
-refuses writes ("a newer leader exists") and keeps a `fenced` marker
-across restarts. Writers that want the guarantee send the epoch they
-last saw: `chron append --epoch N` (or `Client::commit_with_epoch`); a
-stale epoch is refused, and an epoch newer than the daemon's fences it
-on the spot. To bring the old leader back, restart it with
-`--replicate-from` the new leader: if its history still matches it
-becomes a replica and the marker goes; if it took writes of its own it
-is refused as diverged and must be restored from a backup of the
-leader. A promoted directory refuses to become a replica until its
-`promoted` marker is removed.
-
-## The CLI
-
-```
-chron append <AGGREGATE|free> [--expect any|new|N] [--tag T]... [--meta M] (-d PAYLOAD | --stdin)
-chron commit (-f FILE | --stdin)         # {"appends":[{"aggregate":"<uuid>"|null,"expect":"new","events":[{"payload":"…","tags":["…"]}]}]}
-chron read <AGGREGATE> | all | tag <TAG>   [--from N] [--limit N] [--backward]
-chron tail [--from N | --from-head] [--tag T]
-chron len <AGGREGATE> | head | info | flush
-chron backup <ARCHIVE> [--since N] | apply <ARCHIVE> | retain <FLOOR>     # paths on the daemon's filesystem
-chron rebuild-index <DIR> | verify <DIR> | restore <ARCHIVE> <DIR> | inspect <ARCHIVE>   # offline, no daemon
-```
-
-```
-chron health [--service NAME]            # exit 0 when SERVING, 1 otherwise
-chron promote | fence <EPOCH>             # replication
-chron append --epoch N … | commit --epoch N …
-```
-
-`--addr` (or `CHRON_ADDR`, default `http://127.0.0.1:4242`) names the
-daemon; `https://` enables TLS with `--tls-ca`, `--tls-cert`/`--tls-key`
-and `--tls-domain` (`CHRON_TLS_*`); `--token` (`CHRON_TOKEN`) sends the
-bearer token. `--json` prints one JSON object per line, with `payload`
-and `metadata` as strings when they are UTF-8 and as `payload_base64` /
-`metadata_base64` otherwise. Exit codes: 0 ok, 1 the daemon refused or
-an offline command failed, 2 usage or an unreachable daemon.
+watch channel: `Db::wait_for_async(min_head)`, `Subscription::next_async()`
+(cancel-safe at its one await, so `tokio::time::timeout(d,
+sub.next_async())` is the timeout idiom) and `Subscription::wait_async()`
+with `catch_up()` / `pop()` for tasks that want the reads off their own
+thread. The daemon uses it; the sync API is unchanged and the feature is
+off by default.
 
 ## The client crate
 
@@ -242,27 +182,169 @@ let client = Client::connect("http://127.0.0.1:4242", ClientConfig::default()).a
 let order = Uuid::new_v4();
 let mut txn = Transaction::new();
 txn.append_one(order, Expected::New, NewEvent::new("placed").tag("orders"));
-let committed = client.commit(txn).await?;            // Err(ClientError::Conflict { actual, .. }) on a failed expectation
-let events = client.read_aggregate(order, 0, 0, false).await?;
-let mut live = client.subscribe(committed.next, Some("orders".into())).await?;
+let committed = client.commit(txn).await?;        // Err(ClientError::Conflict { actual, expected, .. })
+let events = client.read_aggregate(order, 0, 0).await?;
+let mut page = client.read_all_stream(0, 0).await?;  // an EventStream, for reads too large to hold
+let mut live = client.subscribe_tag("orders", committed.next).await?;
 ```
 
-`chron-client` speaks the library's types, so code written against an
-embedded `chron::Db` moves to a daemon by swapping the handle;
-`examples/bank` does exactly that behind a small `Store` trait
-(`cargo run -p bank -- open alice`, `deposit <id> 50`, `withdraw`,
-`balances [--follow]`, `history <id>`; `--addr` switches to a daemon).
+`chron-client` speaks the library's types and shapes: the same six reads
+with `limit` 0 for everything, each with a `_stream` variant,
+`subscribe` / `subscribe_tag`, `info`, `flush`, and the admin calls
+(`backup`, `apply_backup`, `retain`, `promote`, `fence`, `replicate`).
+Errors are typed: `Conflict`, `Fenced { epoch }`, `PositionOutOfRange
+{ position, head }`, `BelowFloor { position, floor }`, `Unauthenticated`,
+`PermissionDenied`, `ResourceExhausted`, `Unavailable`. `ClientConfig`
+takes the TLS settings (`ca_pem`, an `Identity`, `domain`; only for
+`https://`), `token`, `admin_token`, `connect_timeout`, `request_timeout`
+and `max_message_bytes`. Code written against an embedded `chron::Db`
+moves to a daemon by swapping the handle; `examples/bank` does exactly
+that behind a small `Store` trait.
 
-## Limits
+## The daemon
 
-Tags are at most 255 bytes and 255 per event. One event's record is at most
-`Options::max_record_bytes` (16 MiB by default). Segments roll at
-`Options::segment_max_bytes` (256 MiB by default); a transaction is never
-split across segments.
+```
+cargo run -p chrond -- --data-dir ./orders.chron            # 127.0.0.1:4242
+chrond --data-dir DIR --listen 0.0.0.0:4242 [--no-fsync] [--verify-all-segments]
+       [--tls-cert server.pem --tls-key server.key [--tls-client-ca ca.pem]]
+       [--token SECRET | --token-file FILE] [--admin-token SECRET | --admin-token-file FILE]
+       [--backup-dir DIR]
+       [--max-message-bytes N] [--request-timeout SECS] [--concurrency-per-connection N]
+       [--keepalive-interval SECS] [--keepalive-timeout SECS]
+       [--replicate-from http://leader:4242 [--replicate-token SECRET | --replicate-token-file FILE]
+        [--replicate-ca ca.pem] [--replicate-cert c.pem --replicate-key c.key] [--replicate-domain NAME]]
+       [--promote]
+```
 
-## Not in this version
+Flags fall back to environment variables: `CHRON_DATA_DIR`,
+`CHRON_LISTEN`, `CHROND_TLS_CERT` / `_KEY` / `_CLIENT_CA`, `CHRON_TOKEN`,
+`CHRON_TOKEN_FILE`, `CHROND_ADMIN_TOKEN`, `CHROND_ADMIN_TOKEN_FILE`,
+`CHROND_BACKUP_DIR`, `CHROND_MAX_MESSAGE_BYTES`, `CHROND_REQUEST_TIMEOUT`,
+`CHROND_KEEPALIVE_INTERVAL`, `CHROND_KEEPALIVE_TIMEOUT`,
+`CHRON_REPLICATE_FROM`, `CHRON_REPLICATE_TOKEN`, `CHRON_REPLICATE_TOKEN_FILE`,
+`CHROND_REPLICATE_CA` / `_CERT` / `_KEY` / `_DOMAIN`. Logging follows
+`CHROND_LOG` (an `EnvFilter`, default `info`) on stderr, one line per call
+with its method, peer, gRPC status and duration. Ctrl-C or SIGTERM stops
+it: every stream ends with `UNAVAILABLE`, the server drains, the database
+is flushed.
 
-A crates.io release, automatic failover, more than one leader.
+The service is `chron.v1.Chron` in
+`crates/chron-proto/proto/chron/v1/chron.proto`: commit, the six reads
+(server-streamed, `limit` 0 for everything), subscribe, head, aggregate
+length, info, flush, backup, apply, retain, replicate, promote and fence.
+A failed expectation is `FAILED_PRECONDITION` with the metadata
+`chron-actual-length` and `chron-aggregate`; a write refused by the node's
+role or epoch is `FAILED_PRECONDITION` with `chron-epoch`; bad requests
+are `INVALID_ARGUMENT`; positions past the head or below the floor are
+`OUT_OF_RANGE` with `chron-position` and `chron-head` or `chron-floor`;
+a missing token is `UNAUTHENTICATED`, a missing admin token
+`PERMISSION_DENIED`, a transaction above the message limit
+`RESOURCE_EXHAUSTED`.
+
+Plaintext and open by default; off a loopback address without a token or
+TLS the daemon logs a warning. With `--tls-client-ca` only clients
+presenting a certificate from that CA are accepted. With `--token`, every
+`chron.v1.Chron` call must carry `authorization: Bearer <token>`
+(compared in constant time, scheme case-insensitive). With
+`--admin-token` as well, promote, fence, retain, backup, apply and
+replicate need that token instead (it opens every other call too).
+Backups over the daemon are taken and applied by bare file name under
+`--backup-dir`; without one those calls are refused. `grpc.health.v1.Health`
+stays open: `""` and `chron.v1.Chron` report SERVING until shutdown, and
+`chron.v1.Chron.leader` only while the node leads, so
+`grpc_health_probe -addr host:4242 -service chron.v1.Chron.leader` finds
+the writable node. Messages above `--max-message-bytes` (64 MiB) are
+refused; the limit must cover the database's `max_record_bytes`. HTTP/2
+keepalives run every 30 s; `--request-timeout` bounds a call's response
+head (streams keep running) and is off by default. Finite reads are paged
+off the blocking pool and streamed under back-pressure, so stalled
+clients hold no thread.
+
+## The CLI
+
+```
+chron append <AGGREGATE|free> [--expect any|new|N] [--tag T]... [--metadata M] (-d PAYLOAD | --stdin)
+chron commit (-f FILE | --stdin)   # {"appends":[{"aggregate":"<uuid>"|null,"expect":"new","events":[{"payload":"…","tags":["…"]}]}]}
+chron read <AGGREGATE> [--from N] [--limit N] [--backward]
+chron all [--from N] [--limit N] [--backward]
+chron tag <TAG> [--from N] [--limit N] [--backward]
+chron tail [--from N | --from-head] [--tag T]        # from the floor by default
+chron len <AGGREGATE> | head | info | flush
+chron backup <NAME> [--since N] | apply <NAME>       # names under the daemon's --backup-dir
+chron retain <FLOOR>
+chron health [--service NAME]                        # exit 0 SERVING, 1 NOT_SERVING, 2 unreachable
+chron promote | fence <EPOCH>                        # replication
+chron append --epoch N … | commit --epoch N …        # fencing token
+chron rebuild-index <DIR> | verify <DIR> | restore <ARCHIVE> <DIR> | inspect <ARCHIVE>   # offline, no daemon
+```
+
+`--addr` (or `CHRON_ADDR`, default `http://127.0.0.1:4242`) names the
+daemon; `https://` enables TLS with `--tls-ca`, `--tls-cert`/`--tls-key`
+and `--tls-domain` (`CHRON_TLS_*`); `--token` (`CHRON_TOKEN`) and
+`--admin-token` (`CHRON_ADMIN_TOKEN`) send the bearer tokens;
+`--max-message-bytes` (`CHRON_MAX_MESSAGE_BYTES`) matches the daemon's
+limit. The offline commands take `--max-record-bytes` when the database
+was written with a non-default limit, and refuse a directory that holds
+no database. `--json` prints one JSON object per line, with `payload`,
+`metadata` and `tags` as strings when they are UTF-8 and as
+`payload_base64` / `metadata_base64` / `tags_base64` otherwise (the same
+keys are accepted by `commit`); an empty payload or metadata is `null`;
+an error is `{"error","code"}` on stderr. Exit codes: 0 ok, 1 the daemon
+refused or an offline command failed, 2 usage (including unreadable
+files and bad base64) or an unreachable daemon.
+
+## Replication
+
+A daemon started with `--replicate-from` is a **replica**: it checks that
+it is a copy of the leader (same identity, a head no further than the
+leader's, the same record before its head; an empty database adopts the
+leader's identity), then pulls whole transactions and applies them
+through the normal commit path, reconnecting with backoff when the
+leader goes away. A leader that is merely unreachable lets the replica
+start disconnected; a leader that *refuses* it (another database, a
+diverged history) fails the start. A replica serves reads,
+subscriptions, backups and retention; it refuses writes with "read-only
+replica". It keeps a `replica` marker in its data directory, and refuses
+to start as a leader until promoted. `chron info` on either side shows
+the role, the epoch, the identity, and on a replica whether it is
+connected, the leader's head and the last error. Chunks are capped at
+half the message limit; a single transaction above the limit is reported
+(`RESOURCE_EXHAUSTED`, "raise --max-message-bytes") rather than retried
+silently. Towards an `https://` leader the replica uses
+`--replicate-ca`, `--replicate-cert` / `--replicate-key` and
+`--replicate-domain`; the replication token must be the leader's admin
+token when it has one.
+
+Promotion is manual: `chron --addr <replica> promote` stops the pull,
+raises the **epoch** by one, records a `promoted` marker in the data
+directory and asks the old leader to fence itself; `chrond --promote` on
+a stopped replica's directory does the same without a leader to tell. A
+fenced leader refuses writes ("a newer leader exists"), ends its
+subscriptions and replication streams with `UNAVAILABLE`, and keeps a
+`fenced` marker across restarts. Writers that want the guarantee send
+the epoch they last saw: `chron append --epoch N` (or
+`Client::commit_with_epoch`); a stale epoch is refused, an epoch exactly
+one above the daemon's fences it on the spot, and a larger jump is
+refused without effect. To bring the old leader back, restart it with
+`--replicate-from` the new leader: if its history still matches it
+becomes a replica and the marker goes; if it took writes of its own it
+is refused as diverged and must be restored from a backup of the
+leader. A promoted directory refuses to become a replica until its
+`promoted` marker is removed. A replica restored from a backup of a
+leader retained up to its head starts at the leader's floor, where the
+record before it is gone; the leader accepts it without that check.
+
+## Known limitations
+
+- A stream's buffered memory is bounded by records (256 events per page
+  and per channel), not bytes: a page of 16 MiB records is large.
+- An incremental apply or replication chunk interrupted mid-way (a crash
+  between the segment write and the index commit) is rolled back on the
+  next open; the caller retries from the head the error reports.
+- The library's cache of open segment handles grows with the segments
+  read and shrinks only through retention.
+- A crates.io release, automatic failover and more than one leader are
+  not in this version.
 
 ## Development
 
@@ -274,10 +356,13 @@ cargo fmt --all --check
 cargo clippy -p chron --all-targets -- -D warnings                    # the library without features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace --all-features --no-fail-fast
+cargo doc --workspace --no-deps                                       # warning-free; the library denies missing docs
 cargo bench -p chron   # criterion: append in both fsync modes, the three reads
+cargo run -p bank -- open alice   # the example: deposit <id> 50, withdraw, balances [--follow], history <id>; --addr for a daemon
 ```
 
 CI runs the first four on every push and pull request. The suite
 includes property tests against a model of the semantics, a crash test
-that kills a child process mid-commit and reopens, TLS and token tests
-against generated certificates, and replication tests with two daemons.
+that kills a child process mid-commit and reopens, injected-failure
+tests for a commit that fails after writing, TLS and token tests against
+generated certificates, and replication tests with two daemons.
