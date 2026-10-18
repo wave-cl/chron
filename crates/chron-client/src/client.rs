@@ -36,6 +36,10 @@ pub struct ClientConfig {
     pub tls: Option<TlsConfig>,
     /// Sent as `authorization: Bearer <token>` on every call.
     pub token: Option<String>,
+    /// Sent instead of `token` on the admin calls (promote, fence, retain,
+    /// backup, apply, replicate) when the daemon requires a separate admin
+    /// token; `None` sends `token` there too.
+    pub admin_token: Option<String>,
     pub connect_timeout: Duration,
     /// Largest message accepted from the daemon; default 64 MiB.
     pub max_message_bytes: usize,
@@ -46,6 +50,7 @@ impl Default for ClientConfig {
         ClientConfig {
             tls: None,
             token: None,
+            admin_token: None,
             connect_timeout: Duration::from_secs(3),
             max_message_bytes: 64 * 1024 * 1024,
         }
@@ -81,6 +86,8 @@ pub struct Info {
     pub segments: u64,
     pub bytes: u64,
     pub options: chron::Options,
+    /// Whether the daemon's commits are synced to disk.
+    pub fsync: bool,
     pub db_id: Option<Uuid>,
     pub epoch: u64,
     pub role: Role,
@@ -108,11 +115,38 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + S
 
 type Inner = ChronClient<InterceptedService<Channel, Auth>>;
 
+/// One replication chunk as the leader sent it.
+#[derive(Debug, Clone)]
+pub struct ReplicationChunk {
+    /// The leader's database identity.
+    pub db_id: Option<Uuid>,
+    /// The records, ready for [`chron::Db::apply_chunk`].
+    pub chunk: chron::Chunk,
+    /// The leader's head when the chunk was cut.
+    pub head: u64,
+    /// The leader's epoch when the chunk was cut.
+    pub epoch: u64,
+}
+
+/// A stream of replication chunks.
+pub type ChunkStream =
+    Pin<Box<dyn Stream<Item = Result<ReplicationChunk, ClientError>> + Send + 'static>>;
+
 /// A connection to one daemon. Cheap to clone; every method takes `&self`.
 #[derive(Clone)]
 pub struct Client {
     inner: Inner,
+    admin: Inner,
     health: HealthClient<Channel>,
+}
+
+fn auth(token: Option<&str>) -> Result<Auth, ClientError> {
+    Ok(Auth(match token {
+        Some(t) => Some(format!("Bearer {t}").parse().map_err(|_| {
+            ClientError::InvalidArgument("the token is not valid header text".into())
+        })?),
+        None => None,
+    }))
 }
 
 impl Client {
@@ -123,7 +157,16 @@ impl Client {
         let addr = addr.into();
         let mut endpoint = Endpoint::from_shared(addr.clone())
             .map_err(|e| ClientError::InvalidArgument(format!("{addr}: {e}")))?
-            .connect_timeout(config.connect_timeout);
+            .connect_timeout(config.connect_timeout)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .tcp_keepalive(Some(Duration::from_secs(30)));
+        if config.tls.is_some() && !addr.starts_with("https://") {
+            return Err(ClientError::InvalidArgument(format!(
+                "{addr} is not an https:// address, but TLS was configured"
+            )));
+        }
         if addr.starts_with("https://") {
             let tls = config.tls.clone().unwrap_or_default();
             let mut cfg = ClientTlsConfig::new();
@@ -140,23 +183,29 @@ impl Client {
             endpoint = endpoint.tls_config(cfg)?;
         }
         let channel = endpoint.connect().await?;
-        let auth = Auth(match &config.token {
-            Some(t) => Some(format!("Bearer {t}").parse().map_err(|_| {
-                ClientError::InvalidArgument("the token is not valid header text".into())
-            })?),
-            None => None,
-        });
-        let inner = ChronClient::with_interceptor(channel.clone(), auth)
-            .max_decoding_message_size(config.max_message_bytes)
-            .max_encoding_message_size(config.max_message_bytes);
+        let n = config.max_message_bytes;
+        let inner = ChronClient::with_interceptor(channel.clone(), auth(config.token.as_deref())?)
+            .max_decoding_message_size(n)
+            .max_encoding_message_size(n);
+        let admin = ChronClient::with_interceptor(
+            channel.clone(),
+            auth(config.admin_token.as_deref().or(config.token.as_deref()))?,
+        )
+        .max_decoding_message_size(n)
+        .max_encoding_message_size(n);
         Ok(Client {
             inner,
+            admin,
             health: HealthClient::new(channel),
         })
     }
 
     fn rpc(&self) -> Inner {
         self.inner.clone()
+    }
+
+    fn admin(&self) -> Inner {
+        self.admin.clone()
     }
 
     async fn events(stream: tonic::Streaming<pb::Event>) -> Result<Vec<Event>, ClientError> {
@@ -331,6 +380,7 @@ impl Client {
             segments: i.segments,
             bytes: i.bytes,
             options: convert::options_from_wire(i.options.unwrap_or_default()),
+            fsync: i.fsync,
             db_id: convert::aggregate(&i.db_id).ok(),
             epoch: i.epoch,
             role,
@@ -350,7 +400,7 @@ impl Client {
         since: Option<u64>,
     ) -> Result<BackupMeta, ClientError> {
         let m = self
-            .rpc()
+            .admin()
             .backup(pb::BackupRequest {
                 archive: archive.to_string(),
                 since,
@@ -362,7 +412,7 @@ impl Client {
 
     pub async fn apply_backup(&self, archive: &str) -> Result<BackupMeta, ClientError> {
         let m = self
-            .rpc()
+            .admin()
             .apply_backup(pb::ApplyBackupRequest {
                 archive: archive.to_string(),
             })
@@ -373,7 +423,7 @@ impl Client {
 
     pub async fn retain(&self, floor: u64) -> Result<Retained, ClientError> {
         let r = self
-            .rpc()
+            .admin()
             .retain(pb::RetainRequest { floor })
             .await?
             .into_inner();
@@ -383,7 +433,7 @@ impl Client {
     /// Makes a replica the leader; returns its new epoch and head.
     pub async fn promote(&self) -> Result<(u64, u64), ClientError> {
         let r = self
-            .rpc()
+            .admin()
             .promote(pb::PromoteRequest {})
             .await?
             .into_inner();
@@ -393,11 +443,43 @@ impl Client {
     /// Tells a leader that `epoch` exists; returns the daemon's own epoch.
     pub async fn fence(&self, epoch: u64) -> Result<u64, ClientError> {
         Ok(self
-            .rpc()
+            .admin()
             .fence(pb::FenceRequest { epoch })
             .await?
             .into_inner()
             .epoch)
+    }
+
+    /// Whole transactions from `from` on, then live ones: what a replica
+    /// pulls. `last_fingerprint` is the crc32 of the record before `from`
+    /// as the caller holds it, so the daemon can refuse a diverged
+    /// history. An admin call.
+    pub async fn replicate(
+        &self,
+        from: u64,
+        last_fingerprint: Option<u32>,
+    ) -> Result<ChunkStream, ClientError> {
+        let stream = self
+            .admin()
+            .replicate(pb::ReplicateRequest {
+                from_position: from,
+                last_fingerprint,
+            })
+            .await?
+            .into_inner();
+        Ok(Box::pin(stream.map(|item| {
+            let c = item?;
+            Ok(ReplicationChunk {
+                db_id: Uuid::from_slice(&c.db_id).ok(),
+                chunk: chron::Chunk {
+                    from: c.from,
+                    to: c.to,
+                    frames: c.frames,
+                },
+                head: c.head,
+                epoch: c.epoch,
+            })
+        })))
     }
 
     /// Whether `service` (`""` for the daemon as a whole, or

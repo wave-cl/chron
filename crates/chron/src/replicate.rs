@@ -21,7 +21,12 @@ pub struct Chunk {
     pub frames: Vec<u8>,
 }
 
-pub(crate) fn chunk(inner: &Inner, from: u64, max_events: usize) -> Result<Option<Chunk>> {
+pub(crate) fn chunk(
+    inner: &Inner,
+    from: u64,
+    max_events: usize,
+    max_bytes: usize,
+) -> Result<Option<Chunk>> {
     use std::sync::atomic::Ordering;
     let _m = inner.maintenance.lock().unwrap_or_else(|p| p.into_inner());
     let head = inner.head.load(Ordering::Acquire);
@@ -65,7 +70,12 @@ pub(crate) fn chunk(inner: &Inner, from: u64, max_events: usize) -> Result<Optio
             }
             position += 1;
             if flags & FLAG_LAST_IN_TXN != 0 {
-                cut = Some((scanned + offset as usize + frame.len(), position));
+                let end = scanned + offset as usize + frame.len();
+                // The first transaction is always taken whole; later ones
+                // only while they fit under `max_bytes`.
+                if cut.is_none() || end <= max_bytes {
+                    cut = Some((end, position));
+                }
             }
         }
         scanned = frames.len();

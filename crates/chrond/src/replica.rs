@@ -4,58 +4,64 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chron::Uuid;
-use chron_proto::v1 as pb;
-use chron_proto::v1::chron_client::ChronClient;
+use chron_client::{ChunkStream, Client, ClientConfig, ClientError, Role as WireRole};
 use tokio::task::JoinHandle;
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tonic::metadata::{Ascii, MetadataValue};
-use tonic::service::Interceptor;
-use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, Endpoint};
-use tonic::{Request, Status, Streaming};
 
-use crate::node::{Node, Role};
+use crate::node::{Node, Role, Upstream};
 
 const BACKOFF_MIN: Duration = Duration::from_millis(200);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// A bound on the leader's answer to `Info`, so a hung leader cannot hang
+/// the puller or a start.
+const INFO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Sends `authorization: Bearer …` when a token is configured.
-#[derive(Clone)]
-pub struct Token(Option<MetadataValue<Ascii>>);
+/// Why a replica could not follow its leader.
+#[derive(Debug)]
+pub enum CheckError {
+    /// The leader did not answer; worth retrying.
+    Unreachable(String),
+    /// The leader answered and the two cannot be paired; retrying will
+    /// not help until something changes.
+    Refused(String),
+}
 
-impl Token {
-    pub fn new(token: Option<&str>) -> Result<Token, String> {
-        match token {
-            None => Ok(Token(None)),
-            Some(t) => format!("Bearer {t}")
-                .parse()
-                .map(|v| Token(Some(v)))
-                .map_err(|_| "the replication token is not valid header text".to_string()),
+impl CheckError {
+    pub fn message(&self) -> &str {
+        match self {
+            CheckError::Unreachable(m) | CheckError::Refused(m) => m,
         }
     }
 }
 
-impl Interceptor for Token {
-    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
-        if let Some(v) = &self.0 {
-            req.metadata_mut().insert("authorization", v.clone());
-        }
-        Ok(req)
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
     }
 }
 
-pub type LeaderClient = ChronClient<InterceptedService<Channel, Token>>;
+fn unreachable(addr: &str, e: ClientError) -> CheckError {
+    match e {
+        ClientError::Transport(_) | ClientError::Unavailable(_) => {
+            CheckError::Unreachable(format!("cannot reach the leader at {addr}: {e}"))
+        }
+        other => CheckError::Refused(format!("{addr}: {other}")),
+    }
+}
 
-pub async fn connect(addr: &str, token: Option<&str>) -> Result<LeaderClient, String> {
-    let endpoint = Endpoint::from_shared(addr.to_string())
-        .map_err(|e| format!("{addr} is not a valid address: {e}"))?
-        .connect_timeout(Duration::from_secs(3));
-    let channel = endpoint
-        .connect()
+/// A client for the leader: the replication token on every call.
+pub async fn connect(up: &Upstream) -> Result<Client, CheckError> {
+    let config = ClientConfig {
+        tls: up.tls.clone(),
+        token: up.token.clone(),
+        admin_token: up.token.clone(),
+        max_message_bytes: up.max_message_bytes,
+        ..ClientConfig::default()
+    };
+    Client::connect(&up.addr, config)
         .await
-        .map_err(|e| format!("cannot reach the leader at {addr}: {e}"))?;
-    Ok(ChronClient::with_interceptor(channel, Token::new(token)?))
+        .map_err(|e| unreachable(&up.addr, e))
 }
 
 async fn blocking<T: Send + 'static>(
@@ -70,66 +76,84 @@ async fn blocking<T: Send + 'static>(
 /// Connects to the leader and checks this database can follow it: same
 /// identity (an empty database adopts the leader's), an epoch no newer
 /// than the leader's, a head no further, and the same record before it.
+/// Nothing is written here until the leader has accepted the stream.
 /// Returns the open chunk stream.
-pub async fn connect_and_check(
-    node: &Arc<Node>,
-) -> Result<Streaming<pb::ReplicationChunk>, String> {
-    let addr = node.replicate_from.clone().ok_or("no leader configured")?;
-    let mut client = connect(&addr, node.replicate_token.as_deref()).await?;
-    let info = client
-        .info(pb::InfoRequest {})
-        .await
-        .map_err(|s| format!("Info on {addr}: {}: {}", s.code(), s.message()))?
-        .into_inner();
-    if info.role() != pb::Role::Leader {
-        return Err(format!("{addr} is not a leader (role {:?})", info.role()));
+pub async fn connect_and_check(node: &Arc<Node>) -> Result<ChunkStream, CheckError> {
+    let up = node
+        .upstream
+        .as_ref()
+        .ok_or_else(|| CheckError::Refused("no leader configured".into()))?;
+    let addr = up.addr.as_str();
+    let client = connect(up).await?;
+    let info = match tokio::time::timeout(INFO_TIMEOUT, client.info()).await {
+        Ok(r) => r.map_err(|e| unreachable(addr, e))?,
+        Err(_) => {
+            return Err(CheckError::Unreachable(format!(
+                "{addr} did not answer Info within {INFO_TIMEOUT:?}"
+            )));
+        }
+    };
+    if info.role != WireRole::Leader {
+        return Err(CheckError::Refused(format!(
+            "{addr} is not a leader (role {:?})",
+            info.role
+        )));
     }
-    let leader_id = Uuid::from_slice(&info.db_id)
-        .map_err(|_| format!("{addr} reports no database identity"))?;
+    let Some(leader_id) = info.db_id else {
+        return Err(CheckError::Refused(format!(
+            "{addr} reports no database identity"
+        )));
+    };
     let db = node.db.clone();
     let (head, floor, id, epoch) = (db.head(), db.floor(), db.id(), db.epoch());
-    if id != leader_id {
-        if head == 0 && floor == 0 {
-            let db = db.clone();
-            blocking(move || db.adopt_id(leader_id)).await?;
-        } else {
-            return Err(format!(
-                "{} is database {id}; {addr} serves database {leader_id}; a replica must be restored from a backup of the leader",
-                node.data_dir.display()
-            ));
-        }
+    let empty = head == 0 && floor == 0;
+    if id != leader_id && !empty {
+        return Err(CheckError::Refused(format!(
+            "{} is database {id}; {addr} serves database {leader_id}; a replica must be restored from a backup of the leader",
+            node.data_dir.display()
+        )));
     }
     if epoch > info.epoch {
-        return Err(format!(
+        return Err(CheckError::Refused(format!(
             "local epoch {epoch} is newer than the leader's {}",
             info.epoch
-        ));
+        )));
+    }
+    if head > info.head {
+        return Err(CheckError::Refused(format!(
+            "diverged: this replica is at head {head}, the leader at {}; reset it from a backup of the leader",
+            info.head
+        )));
+    }
+    // The record before the head is gone when the head sits on the floor
+    // (restored from a backup of a retained leader); the leader skips the
+    // check then too.
+    let last_fingerprint = if head > floor {
+        let db = db.clone();
+        blocking(move || db.fingerprint(head - 1))
+            .await
+            .map_err(CheckError::Refused)?
+    } else {
+        None
+    };
+    let stream = client
+        .replicate(head, last_fingerprint)
+        .await
+        .map_err(|e| unreachable(addr, e))?;
+    if id != leader_id {
+        let db = db.clone();
+        blocking(move || db.adopt_id(leader_id))
+            .await
+            .map_err(CheckError::Refused)?;
     }
     if epoch < info.epoch {
         let db = db.clone();
         let e = info.epoch;
-        blocking(move || db.set_epoch(e)).await?;
+        blocking(move || db.set_epoch(e))
+            .await
+            .map_err(CheckError::Refused)?;
     }
-    if head > info.head {
-        return Err(format!(
-            "diverged: this replica is at head {head}, the leader at {}; reset it from a backup of the leader",
-            info.head
-        ));
-    }
-    let last_fingerprint = if head > 0 {
-        let db = db.clone();
-        blocking(move || db.fingerprint(head - 1)).await?
-    } else {
-        None
-    };
-    client
-        .replicate(pb::ReplicateRequest {
-            from_position: head,
-            last_fingerprint,
-        })
-        .await
-        .map(|r| r.into_inner())
-        .map_err(|s| format!("Replicate on {addr}: {}: {}", s.code(), s.message()))
+    Ok(stream)
 }
 
 /// The pull loop's handle.
@@ -145,44 +169,55 @@ impl Puller {
     }
 }
 
-pub fn spawn(node: Arc<Node>, initial: Streaming<pb::ReplicationChunk>) -> Puller {
+/// Pulls from `initial` (or reconnects first, when it is `None`) until
+/// stopped. On exit the node is recorded as disconnected.
+pub fn spawn(node: Arc<Node>, initial: Option<ChunkStream>) -> Puller {
     let cancel = node.cancel.child_token();
     let task_cancel = cancel.clone();
     let handle = tokio::spawn(async move {
-        let mut stream = Some(initial);
-        let mut backoff = BACKOFF_MIN;
-        loop {
-            let s = match stream.take() {
-                Some(s) => s,
-                None => loop {
-                    tokio::select! {
-                        _ = task_cancel.cancelled() => return,
-                        _ = tokio::time::sleep(backoff) => {}
-                    }
-                    backoff = (backoff * 2).min(BACKOFF_MAX);
-                    match connect_and_check(&node).await {
-                        Ok(s) => {
-                            backoff = BACKOFF_MIN;
-                            break s;
-                        }
-                        Err(e) => record_error(&node, e),
-                    }
-                },
-            };
-            node.record_replica(|r| {
-                r.connected = true;
-                r.last_error = None;
-            });
-            match tail(&node, s, &task_cancel).await {
-                Ok(()) => return,
-                Err(e) => record_error(&node, e),
-            }
-        }
+        pull(&node, initial, &task_cancel).await;
+        node.record_replica(|r| r.connected = false);
     });
     Puller { cancel, handle }
 }
 
-fn record_error(node: &Node, e: String) {
+async fn pull(node: &Arc<Node>, initial: Option<ChunkStream>, cancel: &CancellationToken) {
+    let mut stream = initial;
+    let mut backoff = BACKOFF_MIN;
+    loop {
+        let s = match stream.take() {
+            Some(s) => s,
+            None => loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(BACKOFF_MAX);
+                let checked = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    c = connect_and_check(node) => c,
+                };
+                match checked {
+                    Ok(s) => {
+                        backoff = BACKOFF_MIN;
+                        break s;
+                    }
+                    Err(e) => record_error(node, e.message().to_string()),
+                }
+            },
+        };
+        node.record_replica(|r| {
+            r.connected = true;
+            r.last_error = None;
+        });
+        match tail(node, s, cancel).await {
+            Ok(()) => return,
+            Err(e) => record_error(node, e),
+        }
+    }
+}
+
+pub fn record_error(node: &Node, e: String) {
     tracing::warn!(error = %e, "replication");
     node.record_replica(|r| {
         r.connected = false;
@@ -194,19 +229,19 @@ fn record_error(node: &Node, e: String) {
 /// chunk being applied is never abandoned midway.
 async fn tail(
     node: &Arc<Node>,
-    mut stream: Streaming<pb::ReplicationChunk>,
+    mut stream: ChunkStream,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
     loop {
         let msg = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
-            m = stream.message() => m,
+            m = stream.next() => m,
         };
         let c = msg
-            .map_err(|s| format!("the leader's stream failed: {}: {}", s.code(), s.message()))?
-            .ok_or_else(|| "the leader closed the stream".to_string())?;
+            .ok_or_else(|| "the leader closed the stream".to_string())?
+            .map_err(|e| format!("the leader's stream failed: {e}"))?;
         let db = node.db.clone();
-        if c.db_id != db.id().as_bytes() {
+        if c.db_id != Some(db.id()) {
             return Err("the leader's stream carries another database's identity".into());
         }
         let ours = db.epoch();
@@ -221,12 +256,8 @@ async fn tail(
             let e = c.epoch;
             blocking(move || db.set_epoch(e)).await?;
         }
-        let to = c.to;
-        let chunk = chron::Chunk {
-            from: c.from,
-            to,
-            frames: c.frames,
-        };
+        let to = c.chunk.to;
+        let chunk = c.chunk;
         let new_head = blocking(move || db.apply_chunk(&chunk)).await?;
         if new_head != to {
             return Err(format!(

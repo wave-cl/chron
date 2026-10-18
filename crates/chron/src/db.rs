@@ -255,10 +255,16 @@ impl Db {
     }
 
     /// The next chunk a replica at `from` should apply: whole transactions
-    /// from `from` on, at least one and about `max_events` events (a single
-    /// longer transaction is sent whole). `None` when `from` is the head.
-    pub fn replication_chunk(&self, from: u64, max_events: usize) -> Result<Option<Chunk>> {
-        replicate::chunk(&self.inner, from, max_events)
+    /// from `from` on, at least one, about `max_events` events and at most
+    /// `max_bytes` (a single longer transaction is sent whole, so a chunk
+    /// may exceed `max_bytes` by itself). `None` when `from` is the head.
+    pub fn replication_chunk(
+        &self,
+        from: u64,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Option<Chunk>> {
+        replicate::chunk(&self.inner, from, max_events, max_bytes)
     }
 
     /// Appends a chunk taken from another copy of this database. `from`

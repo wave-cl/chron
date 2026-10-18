@@ -25,6 +25,8 @@ mod txn;
 pub use chron::{
     AppendResult, BackupMeta, Committed, Event, Expected, NewEvent, Options, Retained, Uuid,
 };
-pub use client::{Client, ClientConfig, EventStream, Info, Role, TlsConfig};
+pub use client::{
+    ChunkStream, Client, ClientConfig, EventStream, Info, ReplicationChunk, Role, TlsConfig,
+};
 pub use error::ClientError;
 pub use txn::{Append, Transaction};

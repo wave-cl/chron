@@ -25,8 +25,34 @@ struct Cli {
     #[arg(long, env = "CHRON_REPLICATE_FROM")]
     replicate_from: Option<String>,
     /// Bearer token sent to the leader.
-    #[arg(long, env = "CHRON_REPLICATE_TOKEN", hide_env_values = true)]
+    #[arg(
+        long,
+        env = "CHRON_REPLICATE_TOKEN",
+        hide_env_values = true,
+        conflicts_with = "replicate_token_file"
+    )]
     replicate_token: Option<String>,
+    /// Read the token sent to the leader from this file.
+    #[arg(long, env = "CHRON_REPLICATE_TOKEN_FILE")]
+    replicate_token_file: Option<PathBuf>,
+    /// PEM CA that signed the leader's certificate (an https://
+    /// --replicate-from); without it the system roots are used.
+    #[arg(long, env = "CHROND_REPLICATE_CA")]
+    replicate_ca: Option<PathBuf>,
+    /// PEM client certificate to present to the leader (mTLS).
+    #[arg(long, env = "CHROND_REPLICATE_CERT", requires = "replicate_key")]
+    replicate_cert: Option<PathBuf>,
+    /// PEM private key for --replicate-cert.
+    #[arg(long, env = "CHROND_REPLICATE_KEY", requires = "replicate_cert")]
+    replicate_key: Option<PathBuf>,
+    /// Name to verify the leader's certificate against, when it is not
+    /// the address's host.
+    #[arg(long, env = "CHROND_REPLICATE_DOMAIN")]
+    replicate_domain: Option<String>,
+    /// Make a directory that was a replica the leader: bumps the epoch
+    /// and writes the `promoted` marker. The old leader is not told.
+    #[arg(long, conflicts_with = "replicate_from")]
+    promote: bool,
     /// PEM certificate chain to serve TLS with.
     #[arg(long, env = "CHROND_TLS_CERT", requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -76,7 +102,29 @@ async fn main() -> anyhow::Result<()> {
     opts.fsync = !cli.no_fsync;
     opts.verify_all_segments = cli.verify_all_segments;
     opts.replicate_from = cli.replicate_from;
-    opts.replicate_token = cli.replicate_token;
+    opts.replicate_token = token(
+        cli.replicate_token,
+        cli.replicate_token_file,
+        "replication token file",
+    )?;
+    opts.promote = cli.promote;
+    if cli.replicate_ca.is_some() || cli.replicate_cert.is_some() || cli.replicate_domain.is_some()
+    {
+        opts.replicate_tls = Some(chron_client::TlsConfig {
+            ca_pem: cli
+                .replicate_ca
+                .as_ref()
+                .map(|p| read(p, "leader CA"))
+                .transpose()?,
+            identity_pem: match (&cli.replicate_cert, &cli.replicate_key) {
+                (Some(c), Some(k)) => {
+                    Some((read(c, "client certificate")?, read(k, "client key")?))
+                }
+                _ => None,
+            },
+            domain: cli.replicate_domain,
+        });
+    }
     if let (Some(cert), Some(key)) = (&cli.tls_cert, &cli.tls_key) {
         opts.tls = Some(chrond::Tls {
             cert_pem: read(cert, "TLS certificate")?,
@@ -88,15 +136,7 @@ async fn main() -> anyhow::Result<()> {
                 .transpose()?,
         });
     }
-    opts.token = match (cli.token, cli.token_file) {
-        (Some(t), _) => Some(t),
-        (None, Some(f)) => Some(
-            String::from_utf8(read(&f, "token file")?)?
-                .trim_end()
-                .to_string(),
-        ),
-        (None, None) => None,
-    };
+    opts.token = token(cli.token, cli.token_file, "token file")?;
     opts.max_message_bytes = cli.max_message_bytes;
     opts.request_timeout = cli.request_timeout.map(std::time::Duration::from_secs);
     opts.concurrency_per_connection = cli.concurrency_per_connection;
@@ -104,6 +144,19 @@ async fn main() -> anyhow::Result<()> {
     signal().await;
     tracing::info!("signal received, stopping");
     running.shutdown().await
+}
+
+/// A token given directly, or read from a file (trailing newline dropped).
+fn token(
+    direct: Option<String>,
+    file: Option<PathBuf>,
+    what: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(match (direct, file) {
+        (Some(t), _) => Some(t),
+        (None, Some(f)) => Some(String::from_utf8(read(&f, what)?)?.trim_end().to_string()),
+        (None, None) => None,
+    })
 }
 
 async fn signal() {

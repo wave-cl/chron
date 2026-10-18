@@ -373,6 +373,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "chron",
+ "chron-client",
  "chron-proto",
  "clap",
  "http",

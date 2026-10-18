@@ -1,7 +1,7 @@
 //! Between the wire and the library: the pieces the daemon owns. The pure
 //! type conversions live in `chron_proto::convert`.
 
-use chron::{Error, Expected, NewEvent, Transaction};
+use chron::{Error, Expected, NewEvent, Retained, Transaction};
 use chron_proto::convert;
 use chron_proto::v1 as pb;
 use tonic::Status;
@@ -34,6 +34,14 @@ pub fn apply_append(txn: &mut Transaction, a: pb::Append) -> Result<(), Status> 
         }
     }
     Ok(())
+}
+
+pub fn retained(r: Retained) -> pb::RetainResponse {
+    pb::RetainResponse {
+        floor: r.floor,
+        segments_removed: r.segments_removed as u64,
+        bytes_freed: r.bytes_freed,
+    }
 }
 
 /// The status a library error becomes.

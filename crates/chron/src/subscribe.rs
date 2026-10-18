@@ -83,6 +83,33 @@ impl Subscription {
         self.buffer.front().map_or(self.cursor, |e| e.position)
     }
 
+    /// One catch-up step: reads the next batch into the buffer. Returns
+    /// how many events are buffered afterwards; 0 means the subscription
+    /// is at the head. Blocking (a read); pair it with
+    /// [`pop`](Subscription::pop) and, with the `tokio` feature,
+    /// [`wait_async`](Subscription::wait_async) to drive a subscription
+    /// from an async task without blocking it on reads.
+    pub fn catch_up(&mut self) -> Result<usize> {
+        if self.buffer.is_empty() {
+            self.fill()?;
+        }
+        Ok(self.buffer.len())
+    }
+
+    /// The next buffered event, if any; see
+    /// [`catch_up`](Subscription::catch_up).
+    pub fn pop(&mut self) -> Option<Event> {
+        self.buffer.pop_front()
+    }
+
+    /// Waits until the head moves past this subscription's cursor.
+    /// Cancel-safe.
+    #[cfg(feature = "tokio")]
+    pub async fn wait_async(&mut self) {
+        let min = self.cursor.saturating_add(1);
+        let _ = self.head_rx.wait_for(|h| *h >= min).await;
+    }
+
     /// The next event, or `None` if none is committed before `timeout`
     /// passes.
     pub fn next_timeout(&mut self, timeout: Duration) -> Result<Option<Event>> {

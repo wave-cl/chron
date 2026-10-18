@@ -28,7 +28,11 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 
-use crate::node::{FENCED_MARKER, Node, PROMOTED_MARKER, Role};
+use crate::node::{FENCED_MARKER, Node, PROMOTED_MARKER, REPLICA_MARKER, Role, Upstream};
+
+/// The health service name that is SERVING only while this node is the
+/// leader (`chron.v1.Chron` itself is SERVING in every role).
+pub const LEADER_HEALTH_SERVICE: &str = "chron.v1.Chron.leader";
 
 /// How the daemon opens and serves its database.
 #[derive(Debug, Clone)]
@@ -42,6 +46,12 @@ pub struct Options {
     pub replicate_from: Option<String>,
     /// Bearer token sent to the leader.
     pub replicate_token: Option<String>,
+    /// TLS towards the leader (an `https://` address).
+    pub replicate_tls: Option<chron_client::TlsConfig>,
+    /// A directory that was a replica becomes the leader at start: the
+    /// epoch is bumped and the `promoted` marker written. Refused when the
+    /// directory is not a replica.
+    pub promote: bool,
     /// The database's record limit; `None` for the library's default.
     pub max_record_bytes: Option<usize>,
     /// Serve TLS; `None` is plaintext.
@@ -90,6 +100,8 @@ impl Options {
             verify_all_segments: false,
             replicate_from: None,
             replicate_token: None,
+            replicate_tls: None,
+            promote: false,
             max_record_bytes: None,
             tls: None,
             token: None,
@@ -116,7 +128,8 @@ pub struct Running {
 
 /// Opens (and recovers) the database, settles the node's role, binds
 /// `opts.listen` (port 0 picks a free port) and serves until
-/// [`Running::shutdown`]. A replica must reach its leader to start.
+/// [`Running::shutdown`]. A replica whose leader is unreachable starts
+/// disconnected and keeps trying; one its leader refuses does not start.
 pub async fn start(opts: Options) -> anyhow::Result<Running> {
     let mut db_opts = chron::Options::new()
         .fsync(if opts.fsync {
@@ -145,38 +158,31 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
             db.options().max_record_bytes
         );
     }
+    if opts.replicate_tls.is_some()
+        && !opts
+            .replicate_from
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("https://")
+    {
+        anyhow::bail!("TLS towards the leader needs an https:// --replicate-from address");
+    }
     let cancel = CancellationToken::new();
+    let upstream = opts.replicate_from.clone().map(|addr| Upstream {
+        addr,
+        token: opts.replicate_token.clone(),
+        tls: opts.replicate_tls.clone(),
+        max_message_bytes: opts.max_message_bytes,
+    });
     let node = Arc::new(Node::new(
         db.clone(),
         opts.data_dir.clone(),
-        opts.replicate_from.clone(),
-        opts.replicate_token.clone(),
+        upstream,
+        opts.max_message_bytes,
         cancel.clone(),
     ));
 
-    if opts.replicate_from.is_some() {
-        if node.marker(PROMOTED_MARKER).exists() {
-            anyhow::bail!(
-                "{} was promoted to leader; remove {} to make it a replica again",
-                opts.data_dir.display(),
-                node.marker(PROMOTED_MARKER).display()
-            );
-        }
-        let stream = replica::connect_and_check(&node)
-            .await
-            .map_err(|e| anyhow::anyhow!("cannot replicate: {e}"))?;
-        node.set_role(Role::Replica);
-        node.remove_marker(FENCED_MARKER)
-            .context("remove the fenced marker")?;
-        *node.puller.lock().await = Some(replica::spawn(node.clone(), stream));
-    } else if let Some(by) = node.read_marker(FENCED_MARKER) {
-        node.set_fenced_by(Some(by));
-        node.set_role(Role::Fenced);
-        tracing::warn!(
-            by,
-            "starting fenced: a newer leader exists; writes are refused"
-        );
-    }
+    settle_role(&node, &opts).await?;
 
     let listener = TcpListener::bind(opts.listen)
         .await
@@ -194,6 +200,7 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         .set_serving::<ChronServer<service::ChronService>>()
         .await;
     health.set_service_status("", ServingStatus::Serving).await;
+    spawn_leader_health(health.clone(), node.watch_role(), cancel.clone());
     let mut builder = tonic::transport::Server::builder()
         .tcp_nodelay(true)
         .http2_keepalive_interval(Some(opts.keepalive_interval))
@@ -224,15 +231,129 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
     })
 }
 
+/// Reads the markers and settles the role: a replica (connected or not),
+/// a promoted replica, a fenced leader, or a leader.
+async fn settle_role(node: &Arc<Node>, opts: &Options) -> anyhow::Result<()> {
+    let dir = opts.data_dir.display();
+    if opts.replicate_from.is_some() {
+        if opts.promote {
+            anyhow::bail!("--promote and --replicate-from exclude each other");
+        }
+        if node.marker(PROMOTED_MARKER).exists() {
+            anyhow::bail!(
+                "{dir} was promoted to leader; remove {} to make it a replica again",
+                node.marker(PROMOTED_MARKER).display()
+            );
+        }
+        let stream = match replica::connect_and_check(node).await {
+            Ok(s) => Some(s),
+            Err(replica::CheckError::Unreachable(e)) => {
+                tracing::warn!(error = %e, "starting disconnected; retrying");
+                replica::record_error(node, e);
+                None
+            }
+            Err(replica::CheckError::Refused(e)) => anyhow::bail!("cannot replicate: {e}"),
+        };
+        node.write_marker_text(
+            REPLICA_MARKER,
+            &format!("leader {}\n", node.leader_addr().unwrap_or("?")),
+        )
+        .context("write the replica marker")?;
+        node.set_role(Role::Replica);
+        node.remove_marker(FENCED_MARKER)
+            .context("remove the fenced marker")?;
+        *node.puller.lock().await = Some(replica::spawn(node.clone(), stream));
+        return Ok(());
+    }
+    if let Some(text) = node.marker_text(REPLICA_MARKER) {
+        let leader = text
+            .trim()
+            .strip_prefix("leader ")
+            .unwrap_or("?")
+            .to_string();
+        if !opts.promote {
+            anyhow::bail!(
+                "{dir} is a replica of {leader}; start it with --replicate-from, or promote it with --promote"
+            );
+        }
+        let db = node.db.clone();
+        let epoch = db.epoch() + 1;
+        node.write_marker(PROMOTED_MARKER, epoch)
+            .context("write the promoted marker")?;
+        tokio::task::spawn_blocking(move || db.set_epoch(epoch))
+            .await
+            .context("epoch task")?
+            .context("raise the epoch")?;
+        node.remove_marker(REPLICA_MARKER)
+            .context("remove the replica marker")?;
+        node.remove_marker(FENCED_MARKER)
+            .context("remove the fenced marker")?;
+        tracing::info!(epoch, %leader, "promoted at start; the old leader is not told");
+        return Ok(());
+    }
+    if opts.promote {
+        anyhow::bail!("{dir} is not a replica; nothing to promote");
+    }
+    if let Some(e) = node.read_marker(PROMOTED_MARKER)
+        && e > node.db.epoch()
+    {
+        // A crash between the marker and the epoch.
+        let db = node.db.clone();
+        tokio::task::spawn_blocking(move || db.set_epoch(e))
+            .await
+            .context("epoch task")?
+            .context("raise the epoch to the promoted marker's")?;
+        tracing::warn!(epoch = e, "raised the epoch to the promoted marker's");
+    }
+    if let Some(by) = node.read_marker(FENCED_MARKER) {
+        node.set_fenced_by(Some(by));
+        node.set_role(Role::Fenced);
+        tracing::warn!(
+            by,
+            "starting fenced: a newer leader exists; writes are refused"
+        );
+    }
+    Ok(())
+}
+
+/// Keeps [`LEADER_HEALTH_SERVICE`] SERVING exactly while the role is
+/// Leader.
+fn spawn_leader_health(
+    health: HealthReporter,
+    mut role: tokio::sync::watch::Receiver<Role>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            let status = if *role.borrow_and_update() == Role::Leader {
+                ServingStatus::Serving
+            } else {
+                ServingStatus::NotServing
+            };
+            health
+                .set_service_status(LEADER_HEALTH_SERVICE, status)
+                .await;
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                r = role.changed() => if r.is_err() { return },
+            }
+        }
+    });
+}
+
 impl Running {
     /// Stops pulling, stops accepting, ends every stream, waits for the
-    /// server, then flushes the database.
+    /// server, then flushes the database. The flush runs whatever came
+    /// before; the first failure is returned.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         self.health
             .set_not_serving::<ChronServer<service::ChronService>>()
             .await;
         self.health
             .set_service_status("", ServingStatus::NotServing)
+            .await;
+        self.health
+            .set_service_status(LEADER_HEALTH_SERVICE, ServingStatus::NotServing)
             .await;
         if let Some(p) = self.node.puller.lock().await.take() {
             p.stop().await;
@@ -247,14 +368,17 @@ impl Running {
             f.abort();
         }
         self.cancel.cancel();
-        match tokio::time::timeout(Duration::from_secs(10), self.server).await {
-            Ok(joined) => joined.context("server task")?.context("server")?,
-            Err(_) => anyhow::bail!("the server did not stop within 10 s"),
-        }
+        let stopped = match tokio::time::timeout(Duration::from_secs(10), self.server).await {
+            Ok(joined) => joined
+                .context("server task")
+                .and_then(|r| r.context("server")),
+            Err(_) => Err(anyhow::anyhow!("the server did not stop within 10 s")),
+        };
         let db = self.db;
-        tokio::task::spawn_blocking(move || db.flush())
+        let flushed = tokio::task::spawn_blocking(move || db.flush())
             .await
-            .context("flush task")??;
-        Ok(())
+            .context("flush task")
+            .and_then(|r| r.context("flush"));
+        stopped.and(flushed)
     }
 }

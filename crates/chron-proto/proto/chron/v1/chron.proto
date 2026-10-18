@@ -137,6 +137,8 @@ message InfoResponse {
   optional uint64 leader_head = 12;
   optional string last_replication_error = 13;
   optional uint64 fenced_by = 14;
+  // Whether commits are synced to disk before they are acknowledged.
+  bool fsync = 15;
 }
 
 // A backup written by the daemon to `archive` on its own filesystem: full

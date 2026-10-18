@@ -289,13 +289,24 @@ async fn fencing_token_on_commit() {
         .unwrap_err();
     assert_eq!(not_newer.code(), Code::FailedPrecondition);
 
+    // A jump of more than one is a confused client, not a new leader.
     let err = s.client.commit(req(Some(7))).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(
+        err.message().contains("more than one above"),
+        "{}",
+        err.message()
+    );
+    let info = s.info().await;
+    assert_eq!((info.role(), info.epoch), (pb::Role::Leader, 2));
+    // Exactly one above: a leader promoted from this one exists.
+    let err = s.client.commit(req(Some(3))).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition);
     assert!(err.message().contains("fenced"), "{}", err.message());
     let info = s.info().await;
     assert_eq!(
         (info.role(), info.fenced_by, info.epoch),
-        (pb::Role::Fenced, Some(7), 2)
+        (pb::Role::Fenced, Some(3), 2)
     );
     assert_eq!(
         s.client.commit(req(None)).await.unwrap_err().code(),

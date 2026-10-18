@@ -4,11 +4,12 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
+use std::sync::RwLock;
 
 use chron::{Committed, Db};
 use chron_proto::v1 as pb;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
@@ -16,23 +17,14 @@ use tonic::Status;
 use crate::codec;
 use crate::replica::Puller;
 
-#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    Leader = 0,
-    Replica = 1,
-    Fenced = 2,
+    Leader,
+    Replica,
+    Fenced,
 }
 
 impl Role {
-    fn from_u8(v: u8) -> Role {
-        match v {
-            1 => Role::Replica,
-            2 => Role::Fenced,
-            _ => Role::Leader,
-        }
-    }
-
     pub fn wire(self) -> pb::Role {
         match self {
             Role::Leader => pb::Role::Leader,
@@ -50,17 +42,31 @@ pub struct ReplicaStatus {
     pub last_error: Option<String>,
 }
 
+/// `epoch N`: this directory promoted itself to leader under epoch N.
 pub const PROMOTED_MARKER: &str = "promoted";
+/// `epoch N`: a leader under epoch N exists; writes are refused.
 pub const FENCED_MARKER: &str = "fenced";
+/// `leader ADDR`: this directory follows a leader; it must be started
+/// with `--replicate-from` or promoted.
+pub const REPLICA_MARKER: &str = "replica";
+
+/// How a replica reaches its leader.
+#[derive(Debug, Clone)]
+pub struct Upstream {
+    pub addr: String,
+    pub token: Option<String>,
+    pub tls: Option<chron_client::TlsConfig>,
+    pub max_message_bytes: usize,
+}
 
 pub struct Node {
     pub db: Db,
     pub data_dir: PathBuf,
-    role: AtomicU8,
+    role: watch::Sender<Role>,
     /// Readers check the role and epoch and commit; writers flip the role.
     write_gate: RwLock<()>,
-    pub replicate_from: Option<String>,
-    pub replicate_token: Option<String>,
+    pub upstream: Option<Upstream>,
+    pub max_message_bytes: usize,
     pub replica: Mutex<ReplicaStatus>,
     fenced_by: Mutex<Option<u64>>,
     pub puller: tokio::sync::Mutex<Option<Puller>>,
@@ -72,17 +78,17 @@ impl Node {
     pub fn new(
         db: Db,
         data_dir: PathBuf,
-        replicate_from: Option<String>,
-        replicate_token: Option<String>,
+        upstream: Option<Upstream>,
+        max_message_bytes: usize,
         cancel: CancellationToken,
     ) -> Node {
         Node {
             db,
             data_dir,
-            role: AtomicU8::new(Role::Leader as u8),
+            role: watch::Sender::new(Role::Leader),
             write_gate: RwLock::new(()),
-            replicate_from,
-            replicate_token,
+            upstream,
+            max_message_bytes,
             replica: Mutex::new(ReplicaStatus::default()),
             fenced_by: Mutex::new(None),
             puller: tokio::sync::Mutex::new(None),
@@ -92,11 +98,20 @@ impl Node {
     }
 
     pub fn role(&self) -> Role {
-        Role::from_u8(self.role.load(Ordering::Acquire))
+        *self.role.borrow()
     }
 
     pub fn set_role(&self, role: Role) {
-        self.role.store(role as u8, Ordering::Release);
+        self.role.send_replace(role);
+    }
+
+    /// Changes of role, for streams that must end on one.
+    pub fn watch_role(&self) -> watch::Receiver<Role> {
+        self.role.subscribe()
+    }
+
+    pub fn leader_addr(&self) -> Option<&str> {
+        self.upstream.as_ref().map(|u| u.addr.as_str())
     }
 
     pub fn fenced_by(&self) -> Option<u64> {
@@ -111,14 +126,26 @@ impl Node {
         self.data_dir.join(name)
     }
 
+    /// The marker's text, if present.
+    pub fn marker_text(&self, name: &str) -> Option<String> {
+        fs::read_to_string(self.marker(name)).ok()
+    }
+
     /// Reads `epoch N` from a marker, if present.
     pub fn read_marker(&self, name: &str) -> Option<u64> {
-        let text = fs::read_to_string(self.marker(name)).ok()?;
+        let text = self.marker_text(name)?;
         text.trim().strip_prefix("epoch ")?.parse().ok()
     }
 
     pub fn write_marker(&self, name: &str, epoch: u64) -> std::io::Result<()> {
-        fs::write(self.marker(name), format!("epoch {epoch}\n"))?;
+        self.write_marker_text(name, &format!("epoch {epoch}\n"))
+    }
+
+    pub fn write_marker_text(&self, name: &str, text: &str) -> std::io::Result<()> {
+        let tmp = self.marker(&format!("{name}.tmp"));
+        fs::write(&tmp, text)?;
+        fs::File::open(&tmp)?.sync_all()?;
+        fs::rename(&tmp, self.marker(name))?;
         fs::File::open(&self.data_dir)?.sync_all()
     }
 
@@ -156,7 +183,7 @@ impl Node {
             Role::Leader => None,
             Role::Replica => Some(self.refuse(format!(
                 "read-only replica of {}; send writes to the leader",
-                self.replicate_from.as_deref().unwrap_or("?")
+                self.leader_addr().unwrap_or("?")
             ))),
             Role::Fenced => Some(self.refuse(format!(
                 "fenced: a newer leader (epoch {}) exists; send writes there",
@@ -165,7 +192,20 @@ impl Node {
         }
     }
 
-    /// Checks the role and the writer's epoch, then commits. Blocking.
+    /// Runs `f` while the role is Leader and no role change can land.
+    /// Blocking: `f` is the write itself.
+    pub fn write_guarded<T>(&self, f: impl FnOnce(&Db) -> Result<T, Status>) -> Result<T, Status> {
+        let _gate = self.write_gate.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = self.write_refusal() {
+            return Err(s);
+        }
+        f(&self.db)
+    }
+
+    /// Checks the role and the writer's epoch, then commits. Blocking. An
+    /// epoch exactly one above this leader's fences it; a larger jump is
+    /// refused without taking effect, since no leader can be that far
+    /// ahead of a node it was promoted from.
     pub fn commit_guarded(
         &self,
         appends: Vec<pb::Append>,
@@ -182,11 +222,16 @@ impl Node {
                     "stale epoch {e}; the leader is at epoch {ours}; refresh it from Info"
                 )));
             }
-            if e > ours {
+            if e == ours + 1 {
                 drop(gate);
                 self.fence(e)?;
                 return Err(self.refuse(format!(
                     "fenced: a newer leader (epoch {e}) exists; send writes there"
+                )));
+            }
+            if e > ours {
+                return Err(self.refuse(format!(
+                    "epoch {e} is more than one above this leader's {ours}; refresh it from Info"
                 )));
             }
         }
@@ -206,7 +251,7 @@ impl Node {
             Role::Replica => {
                 return Err(self.refuse(format!(
                     "this node is a replica of {}",
-                    self.replicate_from.as_deref().unwrap_or("?")
+                    self.leader_addr().unwrap_or("?")
                 )));
             }
             Role::Leader if by <= ours => {
@@ -230,16 +275,24 @@ impl Node {
     }
 
     /// The replica becomes the leader under the next epoch. Blocking; the
-    /// caller stopped the puller first.
+    /// caller stopped the puller first. The marker goes first: a crash
+    /// between it and the epoch is repaired on the next start, which
+    /// raises the epoch to the marker's.
     pub fn promote_locked(&self) -> Result<(u64, u64), Status> {
         let _gate = self.write_gate.write().unwrap_or_else(|p| p.into_inner());
         if self.role() != Role::Replica {
             return Err(self.refuse("not a replica"));
         }
         let epoch = self.db.epoch() + 1;
-        self.db.set_epoch(epoch).map_err(codec::status)?;
         self.write_marker(PROMOTED_MARKER, epoch)
             .map_err(|e| Status::internal(format!("cannot write the promoted marker: {e}")))?;
+        if let Err(e) = self.db.set_epoch(epoch) {
+            let _ = self.remove_marker(PROMOTED_MARKER);
+            return Err(codec::status(e));
+        }
+        if let Err(e) = self.remove_marker(REPLICA_MARKER) {
+            tracing::warn!(error = %e, "cannot remove the replica marker");
+        }
         self.set_role(Role::Leader);
         self.record_replica(|r| r.connected = false);
         tracing::info!(epoch, "promoted to leader");

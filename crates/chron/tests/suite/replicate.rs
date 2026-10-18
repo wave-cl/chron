@@ -55,7 +55,7 @@ fn chunks_end_on_transaction_boundaries_and_chain_to_an_identical_snapshot() {
     dst.adopt_id(src.id()).unwrap();
     let mut from = 0;
     let mut chunks = 0;
-    while let Some(c) = src.replication_chunk(from, 7).unwrap() {
+    while let Some(c) = src.replication_chunk(from, 7, usize::MAX).unwrap() {
         assert_eq!(c.from, from);
         assert!(c.to > c.from && c.to <= src.head());
         let events = src.read_all(c.from, (c.to - c.from) as usize).unwrap();
@@ -85,6 +85,30 @@ fn chunks_end_on_transaction_boundaries_and_chain_to_an_identical_snapshot() {
 }
 
 #[test]
+fn chunks_respect_the_byte_cap_but_take_one_transaction_whole() {
+    let d = tmp();
+    let src = open(d.path().join("src"));
+    for i in 0..20 {
+        let mut t = src.transaction();
+        t.append(
+            agg(1),
+            Expected::Any,
+            vec![ev(&"x".repeat(1000)), ev(&format!("e{i}"))],
+        );
+        t.commit().unwrap();
+    }
+    let c = src.replication_chunk(0, 1000, 2500).unwrap().unwrap();
+    assert_eq!(
+        c.to, 4,
+        "two ~1 KiB transactions fit under 2500 bytes, a third does not"
+    );
+    assert!(c.frames.len() <= 2500);
+    let c = src.replication_chunk(0, 1000, 10).unwrap().unwrap();
+    assert_eq!(c.to, 2, "the first transaction is always whole");
+    assert!(c.frames.len() > 10);
+}
+
+#[test]
 fn a_long_transaction_is_sent_whole() {
     let d = tmp();
     let src = open(d.path().join("src"));
@@ -96,11 +120,18 @@ fn a_long_transaction_is_sent_whole() {
     );
     t.commit().unwrap();
     fill(&src, agg(2), 1);
-    let first = src.replication_chunk(0, 100).unwrap().unwrap();
+    let first = src.replication_chunk(0, 100, usize::MAX).unwrap().unwrap();
     assert_eq!((first.from, first.to), (0, 2000));
-    let second = src.replication_chunk(first.to, 100).unwrap().unwrap();
+    let second = src
+        .replication_chunk(first.to, 100, usize::MAX)
+        .unwrap()
+        .unwrap();
     assert_eq!((second.from, second.to), (2000, 2001));
-    assert!(src.replication_chunk(2001, 100).unwrap().is_none());
+    assert!(
+        src.replication_chunk(2001, 100, usize::MAX)
+            .unwrap()
+            .is_none()
+    );
     let dst = open(d.path().join("dst"));
     dst.apply_chunk(&first).unwrap();
     dst.apply_chunk(&second).unwrap();
@@ -115,17 +146,24 @@ fn chunk_positions_past_head_or_below_floor_are_refused() {
     let d = tmp();
     let db = open_with(d.path(), small());
     write_some(&db, 0, 40);
-    assert!(db.replication_chunk(db.head(), 10).unwrap().is_none());
+    assert!(
+        db.replication_chunk(db.head(), 10, usize::MAX)
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
-        db.replication_chunk(db.head() + 1, 10),
+        db.replication_chunk(db.head() + 1, 10, usize::MAX),
         Err(Error::PositionOutOfRange { .. })
     ));
     let floor = db.retain_from(db.head() / 2).unwrap().floor;
     assert!(matches!(
-        db.replication_chunk(floor - 1, 10),
+        db.replication_chunk(floor - 1, 10, usize::MAX),
         Err(Error::BelowFloor { .. })
     ));
-    let c = db.replication_chunk(floor, 10).unwrap().unwrap();
+    let c = db
+        .replication_chunk(floor, 10, usize::MAX)
+        .unwrap()
+        .unwrap();
     assert_eq!(c.from, floor);
 }
 
@@ -134,10 +172,10 @@ fn apply_chunk_refuses_a_gap_and_a_torn_chunk() {
     let d = tmp();
     let src = open(d.path().join("src"));
     write_some(&src, 0, 6);
-    let c = src.replication_chunk(4, 100).unwrap().unwrap();
+    let c = src.replication_chunk(4, 100, usize::MAX).unwrap().unwrap();
     assert!(
         matches!(
-            src.replication_chunk(2, 100),
+            src.replication_chunk(2, 100, usize::MAX),
             Err(Error::Inconsistent { position: 2, .. })
         ),
         "position 2 is inside the first transaction"
@@ -147,7 +185,7 @@ fn apply_chunk_refuses_a_gap_and_a_torn_chunk() {
         dst.apply_chunk(&c),
         Err(Error::ReplicationGap { from: 4, head: 0 })
     ));
-    let whole = src.replication_chunk(0, 100).unwrap().unwrap();
+    let whole = src.replication_chunk(0, 100, usize::MAX).unwrap().unwrap();
     let torn = &whole.frames[..whole.frames.len() - 10];
     assert!(matches!(
         dst.apply_chunk(&chron::Chunk {
