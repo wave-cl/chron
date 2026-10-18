@@ -90,19 +90,22 @@ enum Read {
 }
 
 impl Read {
+    /// Forward pages are bounded in bytes as well as records; backward
+    /// pages, read newest first, keep the record bound only.
     fn page(&self, db: &Db, cursor: u64, n: usize) -> chron::Result<Vec<Event>> {
+        let max_bytes = db.options().page_max_bytes;
         match self {
             Read::Aggregate {
                 id,
                 backward: false,
-            } => db.read_aggregate(*id, cursor, n),
+            } => db.read_aggregate_bounded(*id, cursor, n, max_bytes),
             Read::Aggregate { id, backward: true } => db.read_aggregate_backward(*id, cursor, n),
-            Read::All { backward: false } => db.read_all(cursor, n),
+            Read::All { backward: false } => db.read_all_bounded(cursor, n, max_bytes),
             Read::All { backward: true } => db.read_all_backward(cursor, n),
             Read::Tag {
                 tag,
                 backward: false,
-            } => db.read_tag(tag, cursor, n),
+            } => db.read_tag_bounded(tag, cursor, n, max_bytes),
             Read::Tag {
                 tag,
                 backward: true,

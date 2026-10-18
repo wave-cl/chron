@@ -161,17 +161,18 @@ impl Subscription {
         if self.cursor >= head {
             return Ok(());
         }
-        let got = match &self.filter {
-            Filter::All => self.db.read_all(self.cursor, self.batch)?,
-            Filter::Tag(tag) => self.db.read_tag(tag, self.cursor, self.batch)?,
+        let max_bytes = self.db.inner.opts.page_max_bytes;
+        let page = match &self.filter {
+            Filter::All => self.db.all_page(self.cursor, self.batch, max_bytes)?,
+            Filter::Tag(tag) => self.db.tag_page(tag, self.cursor, self.batch, max_bytes)?,
         };
-        if let Some(last) = got.last() {
+        if let Some(last) = page.events.last() {
             self.cursor = last.position + 1;
         }
-        if got.len() < self.batch {
+        if page.exhausted {
             self.cursor = self.cursor.max(head);
         }
-        self.buffer.extend(got);
+        self.buffer.extend(page.events);
         Ok(())
     }
 

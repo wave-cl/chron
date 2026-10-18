@@ -6,7 +6,20 @@ crates share one version.
 
 ## Unreleased
 
-Nothing yet.
+### chron-db
+
+- Group commit: transactions committed concurrently are landed together
+  (one segment write, one fsync, one index commit for up to
+  `Options::group_commit_max_txns`), each still checked and acknowledged
+  on its own. `Db::stats()` reports batches, transactions, events,
+  fsyncs and fsync time. Eight threads committing under `Fsync::Always`
+  went from about 10 ms to 4 ms per transaction on a laptop.
+- `read_all_bounded`, `read_aggregate_bounded`, `read_tag_bounded`:
+  forward pages bounded in bytes; the iterators, subscriptions and the
+  daemon's forward streams use them with `Options::page_max_bytes`
+  (4 MiB).
+- Open segment files are bounded by `Options::max_open_segments` (64),
+  least recently used closed first.
 
 ## 0.1.0 - 2026-10-18
 

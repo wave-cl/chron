@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "bank"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chron-client",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "chron-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "chron-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "chron-db",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "chron-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "chron-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "chron-db",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "chrond"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",

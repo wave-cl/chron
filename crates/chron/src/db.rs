@@ -108,7 +108,7 @@ pub(crate) struct Inner {
     head_watch: (Mutex<u64>, Condvar),
     #[cfg(feature = "tokio")]
     pub(crate) head_tx: tokio::sync::watch::Sender<u64>,
-    files: Mutex<HashMap<u64, Arc<File>>>,
+    files: Mutex<FileCache>,
     _lock: Lock,
 }
 
@@ -159,6 +159,7 @@ impl Db {
         let db_id = index.ensure_db_id()?;
         let epoch = index.epoch()?;
 
+        let opts_max_open = opts.max_open_segments.max(1);
         Ok(Db {
             inner: Arc::new(Inner {
                 layout,
@@ -176,7 +177,7 @@ impl Db {
                 head_watch: (Mutex::new(head), Condvar::new()),
                 #[cfg(feature = "tokio")]
                 head_tx: tokio::sync::watch::channel(head).0,
-                files: Mutex::new(HashMap::new()),
+                files: Mutex::new(FileCache::new(opts_max_open)),
                 _lock: lock,
             }),
         })
@@ -389,6 +390,15 @@ impl Db {
     ) -> Result<Vec<Event>> {
         let positions: Vec<u64> = found.iter().map(|(_, p)| *p).collect();
         let locations = Index::locate_many(txn, &positions)?;
+        self.assemble_aggregate_located(id, found, locations)
+    }
+
+    fn assemble_aggregate_located(
+        &self,
+        id: Uuid,
+        found: Vec<(u64, u64)>,
+        locations: Vec<Option<Location>>,
+    ) -> Result<Vec<Event>> {
         let mut out = Vec::with_capacity(found.len());
         for ((index, position), loc) in found.into_iter().zip(locations) {
             let ev = self.read_located(position, loc)?;
@@ -410,6 +420,139 @@ impl Db {
     /// the head; [`Error::PositionOutOfRange`] past it.
     pub fn read_all(&self, from: u64, limit: usize) -> Result<Vec<Event>> {
         self.read_all_with(from, limit, || {})
+    }
+
+    /// [`read_all`](Db::read_all) cut at the record that would take the
+    /// page past `max_bytes` (at least one record is returned): a page
+    /// bounded in memory whatever the records' sizes. The next page starts
+    /// after the last event returned.
+    pub fn read_all_bounded(
+        &self,
+        from: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Event>> {
+        Ok(self.all_page(from, limit, max_bytes)?.events)
+    }
+
+    /// [`read_aggregate`](Db::read_aggregate) cut at `max_bytes` like
+    /// [`read_all_bounded`](Db::read_all_bounded).
+    pub fn read_aggregate_bounded(
+        &self,
+        id: Uuid,
+        from_index: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Event>> {
+        Ok(self
+            .aggregate_page(id, from_index, limit, max_bytes)?
+            .events)
+    }
+
+    /// [`read_tag`](Db::read_tag) cut at `max_bytes` like
+    /// [`read_all_bounded`](Db::read_all_bounded).
+    pub fn read_tag_bounded(
+        &self,
+        tag: impl AsRef<[u8]>,
+        from: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Event>> {
+        Ok(self.tag_page(tag.as_ref(), from, limit, max_bytes)?.events)
+    }
+
+    /// A forward page of the global order, bounded by `limit` records and
+    /// `max_bytes`. `exhausted` says the read reached the end of what the
+    /// snapshot held (no cut by either bound).
+    pub(crate) fn all_page(&self, from: u64, limit: usize, max_bytes: usize) -> Result<Page> {
+        let limit = all_if_zero(limit);
+        let head = self.head();
+        if from > head {
+            return Err(Error::PositionOutOfRange {
+                position: from,
+                head,
+            });
+        }
+        let txn = self.inner.index.begin_read()?;
+        let floor = Index::floor_in(&txn)?;
+        if from < floor {
+            return Err(Error::BelowFloor {
+                position: from,
+                floor,
+            });
+        }
+        if from == head {
+            return Ok(Page {
+                events: Vec::new(),
+                exhausted: true,
+            });
+        }
+        let mut found = self.inner.index.positions_from(&txn, from, limit)?;
+        let short = found.len() < limit;
+        let cut = cut_by_bytes(&mut found, |(_, l)| u64::from(l.frame_len), max_bytes);
+        Ok(Page {
+            events: self.read_runs(&found)?,
+            exhausted: short && !cut,
+        })
+    }
+
+    /// A forward page of one aggregate, bounded like [`Db::all_page`].
+    pub(crate) fn aggregate_page(
+        &self,
+        id: Uuid,
+        from_index: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Page> {
+        let limit = all_if_zero(limit);
+        let txn = self.inner.index.begin_read()?;
+        let found = self
+            .inner
+            .index
+            .aggregate_positions(&txn, &id, from_index, limit)?;
+        let short = found.len() < limit;
+        let positions: Vec<u64> = found.iter().map(|(_, p)| *p).collect();
+        let locations = Index::locate_many(&txn, &positions)?;
+        let mut items: Vec<((u64, u64), Option<Location>)> =
+            found.into_iter().zip(locations).collect();
+        let cut = cut_by_bytes(
+            &mut items,
+            |(_, l)| l.as_ref().map_or(0, |l| u64::from(l.frame_len)),
+            max_bytes,
+        );
+        let (found, locations): (Vec<(u64, u64)>, Vec<Option<Location>>) =
+            items.into_iter().unzip();
+        Ok(Page {
+            events: self.assemble_aggregate_located(id, found, locations)?,
+            exhausted: short && !cut,
+        })
+    }
+
+    /// A forward page of one tag, bounded like [`Db::all_page`].
+    pub(crate) fn tag_page(
+        &self,
+        tag: &[u8],
+        from: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Page> {
+        let limit = all_if_zero(limit);
+        let txn = self.inner.index.begin_read()?;
+        let positions = self.inner.index.tag_positions(&txn, tag, from, limit)?;
+        let short = positions.len() < limit;
+        let locations = Index::locate_many(&txn, &positions)?;
+        let mut items: Vec<(u64, Option<Location>)> =
+            positions.into_iter().zip(locations).collect();
+        let cut = cut_by_bytes(
+            &mut items,
+            |(_, l)| l.as_ref().map_or(0, |l| u64::from(l.frame_len)),
+            max_bytes,
+        );
+        let (positions, locations): (Vec<u64>, Vec<Option<Location>>) = items.into_iter().unzip();
+        Ok(Page {
+            events: self.assemble_tag_located(tag, positions, locations)?,
+            exhausted: short && !cut,
+        })
     }
 
     /// `read_all` with a hook run between the head check and the read
@@ -497,6 +640,15 @@ impl Db {
         positions: Vec<u64>,
     ) -> Result<Vec<Event>> {
         let locations = Index::locate_many(txn, &positions)?;
+        self.assemble_tag_located(tag, positions, locations)
+    }
+
+    fn assemble_tag_located(
+        &self,
+        tag: &[u8],
+        positions: Vec<u64>,
+        locations: Vec<Option<Location>>,
+    ) -> Result<Vec<Event>> {
         let mut out = Vec::with_capacity(positions.len());
         for (position, loc) in positions.into_iter().zip(locations) {
             let ev = self.read_located(position, loc)?;
@@ -649,6 +801,12 @@ impl Db {
         WriterHold(self.inner.lock_writer())
     }
 
+    /// How many segment files are open for reading.
+    #[doc(hidden)]
+    pub fn debug_open_segments(&self) -> usize {
+        self.inner.open_segments()
+    }
+
     /// How many transactions are queued for the writer lock's holder.
     #[doc(hidden)]
     pub fn debug_pending_commits(&self) -> usize {
@@ -759,6 +917,36 @@ fn all_if_zero(limit: usize) -> usize {
     if limit == 0 { usize::MAX } else { limit }
 }
 
+/// One page of a bounded read.
+pub(crate) struct Page {
+    pub(crate) events: Vec<Event>,
+    /// Nothing more below the snapshot's end: neither bound cut the page.
+    pub(crate) exhausted: bool,
+}
+
+/// Truncates `items` at the first element that would take the running
+/// total of `len` past `max_bytes`, keeping at least one. Returns whether
+/// anything was cut.
+fn cut_by_bytes<T>(items: &mut Vec<T>, len: impl Fn(&T) -> u64, max_bytes: usize) -> bool {
+    let max = max_bytes as u64;
+    let mut total = 0u64;
+    let mut keep = 0usize;
+    for item in items.iter() {
+        let l = len(item);
+        if keep > 0 && total.saturating_add(l) > max {
+            break;
+        }
+        total = total.saturating_add(l);
+        keep += 1;
+    }
+    if keep < items.len() {
+        items.truncate(keep);
+        true
+    } else {
+        false
+    }
+}
+
 enum Paged {
     All,
     Aggregate(Uuid),
@@ -790,21 +978,22 @@ impl EventIter {
     }
 
     fn fill(&mut self) -> Result<()> {
+        let max_bytes = self.db.inner.opts.page_max_bytes;
         let page = match &self.what {
-            Paged::All => self.db.read_all(self.cursor, PAGE)?,
-            Paged::Aggregate(id) => self.db.read_aggregate(*id, self.cursor, PAGE)?,
-            Paged::Tag(tag) => self.db.read_tag(tag, self.cursor, PAGE)?,
+            Paged::All => self.db.all_page(self.cursor, PAGE, max_bytes)?,
+            Paged::Aggregate(id) => self.db.aggregate_page(*id, self.cursor, PAGE, max_bytes)?,
+            Paged::Tag(tag) => self.db.tag_page(tag, self.cursor, PAGE, max_bytes)?,
         };
-        if page.len() < PAGE {
+        if page.exhausted {
             self.done = true;
         }
-        if let Some(last) = page.last() {
+        if let Some(last) = page.events.last() {
             self.cursor = match &self.what {
                 Paged::Aggregate(_) => last.index + 1,
                 _ => last.position + 1,
             };
         }
-        self.buffer.extend(page);
+        self.buffer.extend(page.events);
         Ok(())
     }
 }
@@ -843,8 +1032,8 @@ impl Inner {
     /// positional reads only.
     pub(crate) fn file(&self, base: u64) -> Result<Arc<File>> {
         let mut files = self.files.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(f) = files.get(&base) {
-            return Ok(f.clone());
+        if let Some(f) = files.get(base) {
+            return Ok(f);
         }
         let path = self.layout.segment(base);
         let f = match File::open(&path) {
@@ -863,6 +1052,11 @@ impl Inner {
         };
         files.insert(base, f.clone());
         Ok(f)
+    }
+
+    /// How many segment files are open for reading right now.
+    pub(crate) fn open_segments(&self) -> usize {
+        self.files.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// The writer lock. Every holder releases it through [`WriterGuard`],
@@ -925,7 +1119,7 @@ impl Inner {
     pub(crate) fn forget_files(&self, bases: &[u64]) {
         let mut files = self.files.lock().unwrap_or_else(|p| p.into_inner());
         for b in bases {
-            files.remove(b);
+            files.remove(*b);
         }
     }
 
@@ -951,6 +1145,57 @@ impl Inner {
         if let Ok(next) = SegmentWriter::create(&self.layout.segments_dir(), base, true) {
             *w = next;
         }
+    }
+}
+
+/// Open segment files for reading, keyed by base, bounded in number: the
+/// least recently used is closed when another is opened. Handles already
+/// handed out stay valid.
+struct FileCache {
+    files: HashMap<u64, (Arc<File>, u64)>,
+    tick: u64,
+    cap: usize,
+}
+
+impl FileCache {
+    fn new(cap: usize) -> Self {
+        FileCache {
+            files: HashMap::new(),
+            tick: 0,
+            cap,
+        }
+    }
+
+    fn get(&mut self, base: u64) -> Option<Arc<File>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let (f, last) = self.files.get_mut(&base)?;
+        *last = tick;
+        Some(f.clone())
+    }
+
+    fn insert(&mut self, base: u64, f: Arc<File>) {
+        while self.files.len() >= self.cap {
+            let Some(oldest) = self
+                .files
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(b, _)| *b)
+            else {
+                break;
+            };
+            self.files.remove(&oldest);
+        }
+        self.tick += 1;
+        self.files.insert(base, (f, self.tick));
+    }
+
+    fn remove(&mut self, base: u64) {
+        self.files.remove(&base);
+    }
+
+    fn len(&self) -> usize {
+        self.files.len()
     }
 }
 

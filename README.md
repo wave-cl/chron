@@ -99,7 +99,11 @@ Tags are stored sorted and deduplicated.
   `Error::Inconsistent`; neither is repaired silently.
 - **One writer, many readers.** `Db` is cheap to clone and shared between
   threads; commits serialise on one lock, reads never take it. A `LOCK`
-  file refuses a second process.
+  file refuses a second process. Transactions committed concurrently are
+  landed together (one segment write, one fsync, one index commit for up
+  to `Options::group_commit_max_txns` of them), each still checked and
+  acknowledged on its own; `Db::stats()` counts batches, transactions,
+  events and fsyncs.
 - **Live subscriptions.** `subscribe(from)` and `subscribe_tag(tag, from)`
   return a `Subscription`: an iterator that catches up through the index
   and then blocks for new commits. `next_timeout` serves threads that also
@@ -113,7 +117,8 @@ Tags are stored sorted and deduplicated.
 Tags are at most 255 bytes and 255 per event. One event's record is at most
 `Options::max_record_bytes` (16 MiB by default). Segments roll at
 `Options::segment_max_bytes` (256 MiB by default); a transaction is never
-split across segments.
+split across segments. At most `Options::max_open_segments` (64) segment
+files stay open for reading; the least recently used is closed first.
 
 ## Layout on disk
 
@@ -353,13 +358,12 @@ record before it is gone; the leader accepts it without that check.
 
 ## Known limitations
 
-- A stream's buffered memory is bounded by records (256 events per page
-  and per channel), not bytes: a page of 16 MiB records is large.
+- Forward pages (iterators, subscriptions, the daemon's streams) are
+  bounded by `Options::page_max_bytes` (4 MiB) as well as by records;
+  backward pages are bounded by records only.
 - An incremental apply or replication chunk interrupted mid-way (a crash
   between the segment write and the index commit) is rolled back on the
   next open; the caller retries from the head the error reports.
-- The library's cache of open segment handles grows with the segments
-  read and shrinks only through retention.
 - A crates.io release, automatic failover and more than one leader are
   not in this version.
 

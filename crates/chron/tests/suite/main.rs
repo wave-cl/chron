@@ -7,6 +7,7 @@ mod free;
 mod group_commit;
 mod limits;
 mod model;
+mod pages;
 mod reads;
 mod rebuild;
 mod recovery;

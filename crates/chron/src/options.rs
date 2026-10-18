@@ -37,6 +37,14 @@ pub struct Options {
     /// A batch stops growing once its frames reach this many bytes; a
     /// single transaction larger than this is a batch of its own.
     pub group_commit_max_bytes: usize,
+    /// A page read by the iterators ([`Db::iter_all`](crate::Db::iter_all)
+    /// and friends), subscriptions and the `*_bounded` reads stops at the
+    /// record that takes it past this many bytes; a page always holds at
+    /// least one record.
+    pub page_max_bytes: usize,
+    /// How many segment files the database keeps open for reading; the
+    /// least recently used is closed when another is needed (at least 1).
+    pub max_open_segments: usize,
 }
 
 impl Default for Options {
@@ -48,6 +56,8 @@ impl Default for Options {
             verify_all_segments: false,
             group_commit_max_txns: 64,
             group_commit_max_bytes: 4 * 1024 * 1024,
+            page_max_bytes: 4 * 1024 * 1024,
+            max_open_segments: 64,
         }
     }
 }
@@ -93,6 +103,18 @@ impl Options {
     /// The byte size at which a batch stops growing.
     pub fn group_commit_max_bytes(mut self, bytes: usize) -> Self {
         self.group_commit_max_bytes = bytes;
+        self
+    }
+
+    /// The byte size at which a page stops growing.
+    pub fn page_max_bytes(mut self, bytes: usize) -> Self {
+        self.page_max_bytes = bytes;
+        self
+    }
+
+    /// How many segment files stay open for reading (at least 1).
+    pub fn max_open_segments(mut self, n: usize) -> Self {
+        self.max_open_segments = n.max(1);
         self
     }
 }
