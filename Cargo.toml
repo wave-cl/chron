@@ -1,0 +1,23 @@
+[package]
+name = "chron"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+description = "Embeddable event-sourcing log: append-only segments + redb indexes, multi-aggregate atomic transactions, tags"
+
+[dependencies]
+redb = "4"
+uuid = "1"
+bytes = "1"
+crc32fast = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+crc32fast = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"
