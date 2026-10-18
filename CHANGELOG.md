@@ -38,6 +38,12 @@ crates share one version.
   `create_database`, `list_databases`, `drop_database`, `DatabaseInfo`,
   `ClientError::{NotFound, AlreadyExists}`. CLI: `--db` (`CHRON_DB`),
   `chron db create|list|drop`.
+- Metrics and operations: `chrond --metrics-listen ADDR` serves
+  Prometheus metrics at `GET /metrics` (calls by method and code, commit
+  results and durations, open streams, per-database head/floor/epoch/
+  role, replication lag and connection, the library's commit counters);
+  `--log-format json`; `chron status [--max-lag N]` with exit codes;
+  runbooks in `docs/operations.md`.
 
 ## 0.1.0 - 2026-10-18
 

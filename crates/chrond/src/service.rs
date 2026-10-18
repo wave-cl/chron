@@ -201,11 +201,14 @@ impl Chron for ChronService {
         let dbn = self.db(&req)?;
         let r = req.into_inner();
         let node = self.node.clone();
-        let committed =
+        let name = dbn.name.clone();
+        let start = std::time::Instant::now();
+        let result =
             tokio::task::spawn_blocking(move || node.commit_guarded(&dbn, r.appends, r.epoch))
                 .await
-                .map_err(|e| codec::join("commit", e))??;
-        Ok(Response::new(codec::committed(committed)))
+                .map_err(|e| codec::join("commit", e))?;
+        self.node.metrics.commit(&name, start, &result);
+        Ok(Response::new(codec::committed(result?)))
     }
 
     type ReadAggregateStream = EventStream;

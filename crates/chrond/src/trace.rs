@@ -14,10 +14,11 @@ pub struct Log;
 
 impl OnEos for Log {
     fn on_eos(self, trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span) {
-        let status = trailers
+        let status: i32 = trailers
             .and_then(|t| t.get("grpc-status"))
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("0");
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         tracing::info!(parent: span, status, duration_ms = stream_duration.as_millis() as u64, "done");
     }
 }

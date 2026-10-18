@@ -210,3 +210,88 @@ pub async fn db_drop(conn: &Conn, format: Format, name: &str) -> anyhow::Result<
     );
     Ok(())
 }
+
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+    /// Degraded when a replica is this many events or more behind its
+    /// leader. Ignored on a leader, and when the lag is not yet known.
+    #[arg(long)]
+    max_lag: Option<u64>,
+}
+
+/// One screen of health; exit 1 when degraded.
+pub async fn status(conn: &Conn, format: Format, a: StatusArgs) -> anyhow::Result<()> {
+    let i = client::connect(conn).await?.info().await?;
+    let lag = i.leader_head.map(|l| l.saturating_sub(i.head));
+    let mut reasons: Vec<String> = Vec::new();
+    if i.role == chron_client::Role::Replica && !i.replica_connected {
+        reasons.push(format!(
+            "replica disconnected{}",
+            i.last_replication_error
+                .as_deref()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default()
+        ));
+    }
+    if i.role == chron_client::Role::Fenced {
+        reasons.push(format!("fenced by epoch {}", i.fenced_by.unwrap_or(0)));
+    }
+    if let (Some(max), Some(lag)) = (a.max_lag, lag)
+        && i.role == chron_client::Role::Replica
+        && lag > max
+    {
+        reasons.push(format!("lag {lag} above {max}"));
+    }
+    let healthy = reasons.is_empty();
+    let mut human = format!(
+        "database {}\nrole {}{}\ndb_id {}  epoch {}\nhead {}  floor {}  lag {}",
+        i.database,
+        i.role,
+        i.replicating_from
+            .as_deref()
+            .map(|f| format!(" (of {f})"))
+            .unwrap_or_default(),
+        i.db_id,
+        i.epoch,
+        i.head,
+        i.floor,
+        lag.map_or("-".to_string(), |l| l.to_string())
+    );
+    if i.role == chron_client::Role::Replica {
+        human.push_str(&format!(
+            "\nreplica {}  last_error {}",
+            if i.replica_connected {
+                "connected"
+            } else {
+                "disconnected"
+            },
+            i.last_replication_error.as_deref().unwrap_or("none")
+        ));
+    }
+    if let Some(by) = i.fenced_by {
+        human.push_str(&format!("\nfenced_by {by}"));
+    }
+    human.push_str(&format!(
+        "\nstatus {}",
+        if healthy {
+            "healthy".to_string()
+        } else {
+            format!("degraded: {}", reasons.join("; "))
+        }
+    ));
+    print_value(
+        format,
+        human,
+        json!({
+            "database": i.database, "role": i.role.to_string(), "replicating_from": i.replicating_from,
+            "db_id": i.db_id.to_string(), "epoch": i.epoch, "head": i.head, "floor": i.floor,
+            "leader_head": i.leader_head, "lag": lag, "replica_connected": i.replica_connected,
+            "last_replication_error": i.last_replication_error, "fenced_by": i.fenced_by,
+            "healthy": healthy, "reasons": reasons,
+        }),
+    );
+    if !healthy {
+        anyhow::bail!("degraded: {}", reasons.join("; "));
+    }
+    Ok(())
+}

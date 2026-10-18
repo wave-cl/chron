@@ -45,6 +45,9 @@ enum Commands {
     Head,
     /// Path, head, floor, segments and options of the served database.
     Info,
+    /// One screen of health; exit 1 when degraded (a replica disconnected,
+    /// a fenced node, lag above --max-lag), 2 when unreachable.
+    Status(cmd::admin::StatusArgs),
     /// Make everything committed so far durable.
     Flush,
     /// Write a backup by name under the daemon's backup directory.
@@ -137,6 +140,7 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Len { aggregate } => cmd::admin::len(conn, format, &aggregate).await,
         Commands::Head => cmd::admin::head(conn, format).await,
         Commands::Info => cmd::admin::info(conn, format).await,
+        Commands::Status(a) => cmd::admin::status(conn, format, a).await,
         Commands::Flush => cmd::admin::flush(conn, format).await,
         Commands::Backup(a) => cmd::admin::backup(conn, format, a).await,
         Commands::Apply { archive } => cmd::admin::apply(conn, format, archive).await,

@@ -20,6 +20,7 @@ use tonic::metadata::MetadataMap;
 
 use crate::auth;
 use crate::codec;
+use crate::metrics::Metrics;
 use crate::replica::Puller;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +156,7 @@ pub struct Node {
     /// Pokes the discoverer (a puller reconnected).
     pub discover_now: tokio::sync::Notify,
     pub discover_interval: Duration,
+    pub metrics: Arc<Metrics>,
     pub cancel: CancellationToken,
 }
 
@@ -168,6 +170,7 @@ impl Node {
         max_message_bytes: usize,
         db_opts: chron::Options,
         discover_interval: Duration,
+        metrics: Arc<Metrics>,
         cancel: CancellationToken,
     ) -> Node {
         Node {
@@ -190,6 +193,7 @@ impl Node {
             discovery_error: Mutex::new(None),
             discover_now: tokio::sync::Notify::new(),
             discover_interval,
+            metrics,
             cancel,
         }
     }

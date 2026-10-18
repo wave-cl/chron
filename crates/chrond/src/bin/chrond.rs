@@ -108,6 +108,13 @@ struct Cli {
     /// databases (it also asks whenever a puller reconnects).
     #[arg(long, env = "CHROND_DISCOVER_INTERVAL", default_value_t = 10)]
     discover_interval: u64,
+    /// Serve Prometheus metrics at GET /metrics on this address (plain
+    /// HTTP, no token: keep it on a private interface).
+    #[arg(long, env = "CHROND_METRICS_LISTEN")]
+    metrics_listen: Option<SocketAddr>,
+    /// Log lines as human text or one JSON object per line.
+    #[arg(long, env = "CHROND_LOG_FORMAT", value_enum, default_value_t = chrond::logging::LogFormat::Text)]
+    log_format: chrond::logging::LogFormat,
 }
 
 fn read(path: &PathBuf, what: &str) -> anyhow::Result<Vec<u8>> {
@@ -117,13 +124,14 @@ fn read(path: &PathBuf, what: &str) -> anyhow::Result<Vec<u8>> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("CHROND_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
     let cli = Cli::parse();
+    let filter = EnvFilter::try_from_env("CHROND_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing::subscriber::set_global_default(chrond::logging::subscriber(
+        cli.log_format,
+        filter,
+        std::io::stderr,
+    ))
+    .expect("the first subscriber");
     let mut opts = chrond::Options::new(cli.data_dir, cli.listen);
     opts.fsync = !cli.no_fsync;
     opts.verify_all_segments = cli.verify_all_segments;
@@ -169,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
     opts.keepalive_interval = std::time::Duration::from_secs(cli.keepalive_interval);
     opts.keepalive_timeout = std::time::Duration::from_secs(cli.keepalive_timeout);
     opts.discover_interval = std::time::Duration::from_secs(cli.discover_interval.max(1));
+    opts.metrics_listen = cli.metrics_listen;
     opts.max_message_bytes = cli.max_message_bytes;
     opts.request_timeout = cli.request_timeout.map(std::time::Duration::from_secs);
     opts.concurrency_per_connection = cli.concurrency_per_connection;

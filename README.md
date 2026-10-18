@@ -243,6 +243,7 @@ chrond --data-dir DIR --listen 0.0.0.0:4242 [--no-fsync] [--verify-all-segments]
        [--backup-dir DIR]
        [--max-message-bytes N] [--request-timeout SECS] [--concurrency-per-connection N]
        [--keepalive-interval SECS] [--keepalive-timeout SECS]
+       [--metrics-listen 127.0.0.1:9100] [--log-format text|json] [--discover-interval SECS]
        [--replicate-from http://leader:4242 [--replicate-token SECRET | --replicate-token-file FILE]
         [--replicate-ca ca.pem] [--replicate-cert c.pem --replicate-key c.key] [--replicate-domain NAME]]
        [--promote]
@@ -253,10 +254,14 @@ Flags fall back to environment variables: `CHRON_DATA_DIR`,
 `CHRON_TOKEN_FILE`, `CHROND_ADMIN_TOKEN`, `CHROND_ADMIN_TOKEN_FILE`,
 `CHROND_BACKUP_DIR`, `CHROND_MAX_MESSAGE_BYTES`, `CHROND_REQUEST_TIMEOUT`,
 `CHROND_KEEPALIVE_INTERVAL`, `CHROND_KEEPALIVE_TIMEOUT`,
+`CHROND_METRICS_LISTEN`, `CHROND_LOG_FORMAT`, `CHROND_DISCOVER_INTERVAL`,
 `CHRON_REPLICATE_FROM`, `CHRON_REPLICATE_TOKEN`, `CHRON_REPLICATE_TOKEN_FILE`,
 `CHROND_REPLICATE_CA` / `_CERT` / `_KEY` / `_DOMAIN`. Logging follows
 `CHROND_LOG` (an `EnvFilter`, default `info`) on stderr, one line per call
-with its method, peer, gRPC status and duration. Ctrl-C or SIGTERM stops
+with its method, peer, gRPC status and duration; `--log-format json`
+writes one JSON object per line (`timestamp`, `level`, `target`,
+`message`, the event's fields, and `span.method` / `span.peer` inside a
+call). Ctrl-C or SIGTERM stops
 it: every stream ends with `UNAVAILABLE`, the server drains, the database
 is flushed.
 
@@ -312,6 +317,7 @@ chron all [--from N] [--limit N] [--backward]
 chron tag <TAG> [--from N] [--limit N] [--backward]
 chron tail [--from N | --from-head] [--tag T]        # from the floor by default
 chron len <AGGREGATE> | head | info | flush
+chron status [--max-lag N]                           # exit 0 healthy, 1 degraded, 2 unreachable
 chron backup <NAME> [--since N] | apply <NAME>       # names under the daemon's --backup-dir
 chron retain <FLOOR>
 chron health [--service NAME]                        # exit 0 SERVING, 1 NOT_SERVING, 2 unreachable
@@ -335,6 +341,26 @@ keys are accepted by `commit`); an empty payload or metadata is `null`;
 an error is `{"error","code"}` on stderr. Exit codes: 0 ok, 1 the daemon
 refused or an offline command failed, 2 usage (including unreadable
 files and bad base64) or an unreachable daemon.
+
+## Operations
+
+`--metrics-listen ADDR` serves Prometheus metrics at `GET /metrics` over
+plain HTTP with no token: keep it on a private interface. Counters are
+updated as things happen (`chron_rpc_calls_total{db,method,code}`,
+`chron_rpc_duration_seconds`, `chron_streams_open`,
+`chron_commits_total{db,result}`, `chron_commit_duration_seconds`,
+`chron_replication_errors_total`,
+`chron_replication_chunks_applied_total`); gauges are read on each scrape
+(`chron_head`, `chron_floor`, `chron_segments`, `chron_segment_bytes`,
+`chron_epoch`, `chron_role{role}`, `chron_replica_connected`,
+`chron_leader_head`, `chron_replication_lag_events`,
+`chron_fenced_by_epoch`), as are the library's commit counters
+(`chron_events_committed_total`, `chron_transactions_committed_total`,
+`chron_commit_batches_total`, `chron_fsyncs_total`,
+`chron_fsync_seconds_total`). `chron status [--max-lag N]` is the
+one-screen check with an exit code. [docs/operations.md](docs/operations.md)
+holds the runbooks: promotion and failover, restoring a replica,
+retention, rotating tokens, upgrading, and reading the metrics.
 
 ## Replication
 

@@ -1,0 +1,468 @@
+//! Prometheus metrics: counters and histograms updated as things happen,
+//! and a collector that reads every database's state on each scrape.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
+
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::MetricFamily;
+use prometheus::{
+    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+};
+
+use crate::node::{Node, Role};
+
+/// Seconds, from a millisecond to half a minute.
+pub const BUCKETS: &[f64] = &[
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Every `chron.v1.Chron` method and whether it streams.
+pub const METHODS: &[(&str, bool)] = &[
+    ("/chron.v1.Chron/Commit", false),
+    ("/chron.v1.Chron/ReadAggregate", true),
+    ("/chron.v1.Chron/ReadAll", true),
+    ("/chron.v1.Chron/ReadTag", true),
+    ("/chron.v1.Chron/AggregateLen", false),
+    ("/chron.v1.Chron/Head", false),
+    ("/chron.v1.Chron/Subscribe", true),
+    ("/chron.v1.Chron/Flush", false),
+    ("/chron.v1.Chron/Info", false),
+    ("/chron.v1.Chron/Backup", false),
+    ("/chron.v1.Chron/ApplyBackup", false),
+    ("/chron.v1.Chron/Retain", false),
+    ("/chron.v1.Chron/Replicate", true),
+    ("/chron.v1.Chron/Promote", false),
+    ("/chron.v1.Chron/Fence", false),
+    ("/chron.v1.Chron/CreateDatabase", false),
+    ("/chron.v1.Chron/ListDatabases", false),
+    ("/chron.v1.Chron/DropDatabase", false),
+    ("/grpc.health.v1.Health/Check", false),
+    ("/grpc.health.v1.Health/Watch", true),
+];
+
+/// The method label for a request path: the path itself when it is a
+/// known method, else `unknown` (so arbitrary paths cannot grow the
+/// label set). The bool says whether it streams.
+pub fn method_label(path: &str) -> (&'static str, bool) {
+    METHODS
+        .iter()
+        .find(|(m, _)| *m == path)
+        .map(|(m, s)| (*m, *s))
+        .unwrap_or(("unknown", false))
+}
+
+/// gRPC status codes spelled as go-grpc-prometheus does, so existing
+/// dashboards apply.
+pub fn code_label(code: i32) -> &'static str {
+    match code {
+        0 => "OK",
+        1 => "Canceled",
+        2 => "Unknown",
+        3 => "InvalidArgument",
+        4 => "DeadlineExceeded",
+        5 => "NotFound",
+        6 => "AlreadyExists",
+        7 => "PermissionDenied",
+        8 => "ResourceExhausted",
+        9 => "FailedPrecondition",
+        10 => "Aborted",
+        11 => "OutOfRange",
+        12 => "Unimplemented",
+        13 => "Internal",
+        14 => "Unavailable",
+        15 => "DataLoss",
+        16 => "Unauthenticated",
+        _ => "Unknown",
+    }
+}
+
+/// How a commit went, for `chron_commits_total`.
+pub fn commit_result(r: &Result<chron::Committed, tonic::Status>) -> &'static str {
+    match r {
+        Ok(_) => "ok",
+        Err(s) => match s.code() {
+            tonic::Code::FailedPrecondition
+                if s.metadata()
+                    .contains_key(chron_proto::CONFLICT_ACTUAL_LENGTH_HEADER) =>
+            {
+                "conflict"
+            }
+            tonic::Code::FailedPrecondition => "refused",
+            tonic::Code::InvalidArgument => "invalid",
+            tonic::Code::ResourceExhausted => "too_large",
+            _ => "error",
+        },
+    }
+}
+
+pub struct Metrics {
+    registry: Registry,
+    pub rpc_calls: IntCounterVec,
+    pub rpc_duration: HistogramVec,
+    pub streams_open: IntGaugeVec,
+    pub commits: IntCounterVec,
+    pub commit_duration: HistogramVec,
+    pub replication_errors: IntCounterVec,
+    pub chunks_applied: IntCounterVec,
+    start_time: IntGauge,
+}
+
+fn counter(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
+    IntCounterVec::new(Opts::new(name, help), labels).expect("valid metric")
+}
+
+fn gauge(name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
+    IntGaugeVec::new(Opts::new(name, help), labels).expect("valid metric")
+}
+
+fn histogram(name: &str, help: &str, labels: &[&str]) -> HistogramVec {
+    HistogramVec::new(
+        HistogramOpts::new(name, help).buckets(BUCKETS.to_vec()),
+        labels,
+    )
+    .expect("valid metric")
+}
+
+impl Metrics {
+    pub fn new() -> Arc<Metrics> {
+        let registry = Registry::new();
+        let rpc_calls = counter(
+            "chron_rpc_calls_total",
+            "gRPC calls completed, by method and status code",
+            &["db", "method", "code"],
+        );
+        let rpc_duration = histogram(
+            "chron_rpc_duration_seconds",
+            "gRPC call duration from request to end of stream",
+            &["db", "method"],
+        );
+        let streams_open = gauge(
+            "chron_streams_open",
+            "server streams currently open",
+            &["db", "method"],
+        );
+        let commits = counter(
+            "chron_commits_total",
+            "Commit calls by result: ok, conflict, refused, invalid, too_large, error",
+            &["db", "result"],
+        );
+        let commit_duration = histogram(
+            "chron_commit_duration_seconds",
+            "Commit duration including the write gate and the fsync",
+            &["db"],
+        );
+        let replication_errors = counter(
+            "chron_replication_errors_total",
+            "replication failures recorded by a replica",
+            &["db"],
+        );
+        let chunks_applied = counter(
+            "chron_replication_chunks_applied_total",
+            "replication chunks applied by a replica",
+            &["db"],
+        );
+        let build_info = gauge("chron_build_info", "chrond version", &["version"]);
+        build_info
+            .with_label_values(&[env!("CARGO_PKG_VERSION")])
+            .set(1);
+        let start_time = IntGauge::new(
+            "chron_start_time_seconds",
+            "when the daemon started, unix seconds",
+        )
+        .expect("valid metric");
+        start_time.set(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        );
+        for c in [
+            Box::new(rpc_calls.clone()) as Box<dyn Collector>,
+            Box::new(rpc_duration.clone()),
+            Box::new(streams_open.clone()),
+            Box::new(commits.clone()),
+            Box::new(commit_duration.clone()),
+            Box::new(replication_errors.clone()),
+            Box::new(chunks_applied.clone()),
+            Box::new(build_info),
+            Box::new(start_time.clone()),
+        ] {
+            registry.register(c).expect("unique metric");
+        }
+        Arc::new(Metrics {
+            registry,
+            rpc_calls,
+            rpc_duration,
+            streams_open,
+            commits,
+            commit_duration,
+            replication_errors,
+            chunks_applied,
+            start_time,
+        })
+    }
+
+    /// Registers the collector that reads the node's databases on scrape.
+    pub fn attach(&self, node: &Arc<Node>) {
+        self.registry
+            .register(Box::new(NodeCollector::new(Arc::downgrade(node))))
+            .expect("one node per registry");
+    }
+
+    /// The Prometheus text exposition. Reads every database's info, so
+    /// run it on the blocking pool.
+    pub fn render(&self) -> String {
+        let families = self.registry.gather();
+        TextEncoder::new()
+            .encode_to_string(&families)
+            .unwrap_or_default()
+    }
+
+    pub fn started_at(&self) -> i64 {
+        self.start_time.get()
+    }
+
+    /// Observes one commit.
+    pub fn commit(&self, db: &str, start: Instant, r: &Result<chron::Committed, tonic::Status>) {
+        self.commits
+            .with_label_values(&[db, commit_result(r)])
+            .inc();
+        self.commit_duration
+            .with_label_values(&[db])
+            .observe(start.elapsed().as_secs_f64());
+    }
+}
+
+/// On every scrape: head, floor, segments, bytes, epoch, fsync, role,
+/// replication state and the library's commit counters, per database.
+struct NodeCollector {
+    node: Weak<Node>,
+    head: IntGaugeVec,
+    floor: IntGaugeVec,
+    segments: IntGaugeVec,
+    segment_bytes: IntGaugeVec,
+    epoch: IntGaugeVec,
+    fsync_enabled: IntGaugeVec,
+    role: IntGaugeVec,
+    fenced_by: IntGaugeVec,
+    replica_connected: IntGaugeVec,
+    leader_head: IntGaugeVec,
+    lag: IntGaugeVec,
+    events: IntCounterVec,
+    transactions: IntCounterVec,
+    batches: IntCounterVec,
+    fsyncs: IntCounterVec,
+    fsync_seconds: prometheus::CounterVec,
+    last_stats: Mutex<HashMap<String, chron::Stats>>,
+}
+
+impl NodeCollector {
+    fn new(node: Weak<Node>) -> Self {
+        NodeCollector {
+            node,
+            head: gauge(
+                "chron_head",
+                "one past the last committed position",
+                &["db"],
+            ),
+            floor: gauge("chron_floor", "the first readable position", &["db"]),
+            segments: gauge("chron_segments", "segment files", &["db"]),
+            segment_bytes: gauge("chron_segment_bytes", "bytes in segment files", &["db"]),
+            epoch: gauge("chron_epoch", "the fencing epoch", &["db"]),
+            fsync_enabled: gauge(
+                "chron_fsync_enabled",
+                "1 when commits sync to disk",
+                &["db"],
+            ),
+            role: gauge(
+                "chron_role",
+                "1 for the daemon's current role, 0 for the others",
+                &["db", "role"],
+            ),
+            fenced_by: gauge(
+                "chron_fenced_by_epoch",
+                "the epoch that fenced this daemon (present while fenced)",
+                &["db"],
+            ),
+            replica_connected: gauge(
+                "chron_replica_connected",
+                "1 while a replica holds a stream from its leader (replicas only)",
+                &["db"],
+            ),
+            leader_head: gauge(
+                "chron_leader_head",
+                "the leader's head as the replica last saw it",
+                &["db"],
+            ),
+            lag: gauge(
+                "chron_replication_lag_events",
+                "events the replica is behind its leader",
+                &["db"],
+            ),
+            events: counter(
+                "chron_events_committed_total",
+                "events landed, by the daemon or by replication",
+                &["db"],
+            ),
+            transactions: counter(
+                "chron_transactions_committed_total",
+                "transactions landed",
+                &["db"],
+            ),
+            batches: counter(
+                "chron_commit_batches_total",
+                "index commits that landed transactions (group commit batches)",
+                &["db"],
+            ),
+            fsyncs: counter(
+                "chron_fsyncs_total",
+                "segment syncs on the commit path",
+                &["db"],
+            ),
+            fsync_seconds: prometheus::CounterVec::new(
+                Opts::new("chron_fsync_seconds_total", "time spent in those syncs"),
+                &["db"],
+            )
+            .expect("valid metric"),
+            last_stats: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn collectors(&self) -> Vec<&dyn Collector> {
+        vec![
+            &self.head,
+            &self.floor,
+            &self.segments,
+            &self.segment_bytes,
+            &self.epoch,
+            &self.fsync_enabled,
+            &self.role,
+            &self.fenced_by,
+            &self.replica_connected,
+            &self.leader_head,
+            &self.lag,
+            &self.events,
+            &self.transactions,
+            &self.batches,
+            &self.fsyncs,
+            &self.fsync_seconds,
+        ]
+    }
+
+    fn refresh(&self) {
+        let Some(node) = self.node.upgrade() else {
+            return;
+        };
+        let role = node.role();
+        // Gauges that are "present only while ..." are reset so a database
+        // that left that state (or was dropped) stops reporting.
+        for g in [
+            &self.fenced_by,
+            &self.replica_connected,
+            &self.leader_head,
+            &self.lag,
+        ] {
+            g.reset();
+        }
+        let mut last = self.last_stats.lock().unwrap_or_else(|p| p.into_inner());
+        for dbn in node.databases() {
+            let db = dbn.name.as_str();
+            self.head.with_label_values(&[db]).set(dbn.db.head() as i64);
+            self.floor
+                .with_label_values(&[db])
+                .set(dbn.db.floor() as i64);
+            self.epoch
+                .with_label_values(&[db])
+                .set(dbn.db.epoch() as i64);
+            if let Ok(info) = dbn.db.info() {
+                self.segments
+                    .with_label_values(&[db])
+                    .set(info.segments as i64);
+                self.segment_bytes
+                    .with_label_values(&[db])
+                    .set(info.bytes as i64);
+                self.fsync_enabled
+                    .with_label_values(&[db])
+                    .set((info.fsync == chron::Fsync::Always) as i64);
+            }
+            for (r, name) in [
+                (Role::Leader, "leader"),
+                (Role::Replica, "replica"),
+                (Role::Fenced, "fenced"),
+            ] {
+                self.role
+                    .with_label_values(&[db, name])
+                    .set((role == r) as i64);
+            }
+            if role == Role::Fenced {
+                self.fenced_by
+                    .with_label_values(&[db])
+                    .set(node.fenced_by().unwrap_or(0) as i64);
+            }
+            if role == Role::Replica {
+                let st = dbn.replica_status();
+                self.replica_connected
+                    .with_label_values(&[db])
+                    .set(st.connected as i64);
+                if let Some(lh) = st.leader_head {
+                    self.leader_head.with_label_values(&[db]).set(lh as i64);
+                    self.lag
+                        .with_label_values(&[db])
+                        .set(lh.saturating_sub(dbn.db.head()) as i64);
+                }
+            }
+            let now = dbn.db.stats();
+            let prev = last.insert(db.to_string(), now).unwrap_or_default();
+            self.events
+                .with_label_values(&[db])
+                .inc_by(now.events.saturating_sub(prev.events));
+            self.transactions
+                .with_label_values(&[db])
+                .inc_by(now.transactions.saturating_sub(prev.transactions));
+            self.batches
+                .with_label_values(&[db])
+                .inc_by(now.batches.saturating_sub(prev.batches));
+            self.fsyncs
+                .with_label_values(&[db])
+                .inc_by(now.fsyncs.saturating_sub(prev.fsyncs));
+            self.fsync_seconds
+                .with_label_values(&[db])
+                .inc_by(now.fsync_nanos.saturating_sub(prev.fsync_nanos) as f64 / 1e9);
+        }
+    }
+}
+
+impl Collector for NodeCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.collectors()
+            .into_iter()
+            .flat_map(|c| c.desc())
+            .collect()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.refresh();
+        self.collectors()
+            .into_iter()
+            .flat_map(|c| c.collect())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_methods_share_one_label() {
+        assert_eq!(method_label("/chron.v1.Chron/Nope"), ("unknown", false));
+        assert_eq!(
+            method_label("/chron.v1.Chron/Subscribe"),
+            ("/chron.v1.Chron/Subscribe", true)
+        );
+        assert_eq!(code_label(9), "FailedPrecondition");
+        assert_eq!(code_label(99), "Unknown");
+    }
+}

@@ -213,7 +213,7 @@ async fn pull(
                         node.discover_now.notify_one();
                         break s;
                     }
-                    Err(e) => record_error(dbn, e.message().to_string()),
+                    Err(e) => record_error(node, dbn, e.message().to_string()),
                 }
             },
         };
@@ -223,13 +223,17 @@ async fn pull(
         });
         match tail(node, dbn, s, cancel).await {
             Ok(()) => return,
-            Err(e) => record_error(dbn, e),
+            Err(e) => record_error(node, dbn, e),
         }
     }
 }
 
-pub fn record_error(dbn: &DbNode, e: String) {
+pub fn record_error(node: &Node, dbn: &DbNode, e: String) {
     tracing::warn!(database = %dbn.name, error = %e, "replication");
+    node.metrics
+        .replication_errors
+        .with_label_values(&[&dbn.name])
+        .inc();
     dbn.record_replica(|r| {
         r.connected = false;
         r.last_error = Some(e);
@@ -277,6 +281,10 @@ async fn tail(
             ));
         }
         dbn.record_replica(|r| r.leader_head = Some(c.head));
+        node.metrics
+            .chunks_applied
+            .with_label_values(&[&dbn.name])
+            .inc();
         if node.role() != Role::Replica {
             return Ok(());
         }

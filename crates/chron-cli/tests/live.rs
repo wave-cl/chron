@@ -664,3 +664,82 @@ fn db_subcommands_and_the_db_flag() {
         .code(1)
         .stderr(predicate::str::contains("cannot be dropped"));
 }
+
+#[test]
+fn status_exit_codes() {
+    let leader = Daemon::start();
+    leader.chron().args(["status"]).assert().success().stdout(
+        predicate::str::contains("role leader").and(predicate::str::contains("status healthy")),
+    );
+    leader
+        .chron()
+        .args(["--json", "status", "--max-lag", "0"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"healthy\":true"));
+    leader
+        .chron()
+        .args(["append", A, "-d", "one"])
+        .assert()
+        .success();
+    let replica = Daemon::start_replica_of(&leader);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let ok = replica
+            .chron()
+            .args(["status", "--max-lag", "0"])
+            .assert()
+            .get_output()
+            .status
+            .success();
+        if ok {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replica never caught up"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    replica
+        .running
+        .as_ref()
+        .unwrap()
+        .node
+        .default_db()
+        .record_replica(|r| r.leader_head = Some(11));
+    replica
+        .chron()
+        .args(["status", "--max-lag", "5"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("lag 10"))
+        .stderr(predicate::str::contains("degraded: lag 10 above 5"));
+    replica
+        .chron()
+        .args(["status", "--max-lag", "20"])
+        .assert()
+        .success();
+    Command::cargo_bin("chron")
+        .unwrap()
+        .args(["--addr", "http://127.0.0.1:1", "status"])
+        .assert()
+        .code(2);
+    drop(leader);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = replica
+            .chron()
+            .args(["status"])
+            .assert()
+            .get_output()
+            .clone();
+        if out.status.code() == Some(1)
+            && String::from_utf8_lossy(&out.stderr).contains("replica disconnected")
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never degraded");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

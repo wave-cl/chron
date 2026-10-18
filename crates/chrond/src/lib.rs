@@ -5,8 +5,12 @@
 
 mod auth;
 mod codec;
+pub mod logging;
+pub mod metrics;
+mod metrics_http;
 pub mod node;
 mod replica;
+mod rpc_metrics;
 mod service;
 #[cfg(feature = "test-util")]
 pub mod testing;
@@ -83,6 +87,9 @@ pub struct Options {
     /// How often a replica asks its leader for the list of databases
     /// (it also asks whenever a puller reconnects).
     pub discover_interval: Duration,
+    /// Serve Prometheus metrics at `GET /metrics` on this address (plain
+    /// HTTP/1, no token, no TLS: keep it private). Off when `None`.
+    pub metrics_listen: Option<SocketAddr>,
 }
 
 /// PEM bytes for the server's certificate chain and key, and optionally
@@ -127,6 +134,7 @@ impl Options {
             keepalive_interval: Duration::from_secs(30),
             keepalive_timeout: Duration::from_secs(10),
             discover_interval: Duration::from_secs(10),
+            metrics_listen: None,
         }
     }
 }
@@ -135,12 +143,15 @@ impl Options {
 /// [`shutdown`](Running::shutdown).
 pub struct Running {
     pub local_addr: SocketAddr,
+    /// Where `/metrics` is served, when `Options::metrics_listen` was set.
+    pub metrics_addr: Option<SocketAddr>,
     /// The `default` database; tests commit through it directly.
     pub db: Db,
     pub node: Arc<Node>,
     health: HealthReporter,
     cancel: CancellationToken,
     server: JoinHandle<Result<(), tonic::transport::Error>>,
+    metrics_server: Option<JoinHandle<()>>,
 }
 
 /// Opens (and recovers) every database under `data_dir`, settles the
@@ -207,6 +218,7 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         tls: opts.replicate_tls.clone(),
         max_message_bytes: opts.max_message_bytes,
     });
+    let metrics = metrics::Metrics::new();
     let node = Arc::new(Node::new(
         opts.data_dir.clone(),
         backup_dir,
@@ -215,8 +227,10 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         opts.max_message_bytes,
         db_opts,
         opts.discover_interval,
+        metrics.clone(),
         cancel.clone(),
     ));
+    metrics.attach(&node);
     let dir = opts.data_dir.clone();
     tokio::task::spawn_blocking(move || migrate_layout(&dir))
         .await
@@ -253,7 +267,25 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         .http2_keepalive_interval(Some(opts.keepalive_interval))
         .http2_keepalive_timeout(Some(opts.keepalive_timeout))
         .concurrency_limit_per_connection(opts.concurrency_per_connection)
-        .layer(trace::layer());
+        .layer(trace::layer())
+        .layer(rpc_metrics::RpcMetricsLayer::new(
+            metrics.clone(),
+            node.clone(),
+        ));
+    let (metrics_addr, metrics_server) = match opts.metrics_listen {
+        Some(addr) => {
+            if !addr.ip().is_loopback() {
+                tracing::warn!(%addr, "metrics listen beyond loopback with no token: head, role, lag and version are visible to anyone who can reach it");
+            }
+            let l = TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("cannot listen on {addr} for metrics"))?;
+            let local = l.local_addr()?;
+            let task = tokio::spawn(metrics_http::serve(l, metrics.clone(), cancel.clone()));
+            (Some(local), Some(task))
+        }
+        None => (None, None),
+    };
     if let Some(t) = opts.request_timeout {
         builder = builder.timeout(t);
     }
@@ -268,14 +300,16 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown),
     );
     let names: Vec<String> = node.databases().iter().map(|d| d.name.clone()).collect();
-    tracing::info!(%local_addr, data_dir = %opts.data_dir.display(), databases = %names.join(","), head = db.head(), role = ?node.role(), epoch = db.epoch(), "listening");
+    tracing::info!(%local_addr, metrics = ?metrics_addr, data_dir = %opts.data_dir.display(), databases = %names.join(","), head = db.head(), role = ?node.role(), epoch = db.epoch(), "listening");
     Ok(Running {
         local_addr,
+        metrics_addr,
         db,
         node,
         health,
         cancel,
         server,
+        metrics_server,
     })
 }
 
@@ -396,7 +430,7 @@ async fn settle_role(node: &Arc<Node>, opts: &Options) -> anyhow::Result<()> {
                 Ok(s) => Some(s),
                 Err(replica::CheckError::Unreachable(e)) => {
                     tracing::warn!(database = %dbn.name, error = %e, "starting disconnected; retrying");
-                    replica::record_error(&dbn, e);
+                    replica::record_error(node, &dbn, e);
                     None
                 }
                 Err(replica::CheckError::Refused(e)) => {
@@ -539,6 +573,9 @@ impl Running {
                 .and_then(|r| r.context("server")),
             Err(_) => Err(anyhow::anyhow!("the server did not stop within 10 s")),
         };
+        if let Some(m) = self.metrics_server {
+            let _ = tokio::time::timeout(Duration::from_secs(5), m).await;
+        }
         let mut flushed = Ok(());
         for dbn in self.node.databases() {
             let db = dbn.db.clone();
