@@ -129,15 +129,14 @@ fn rebuild_reports_a_torn_tail_and_a_lowered_record_limit_is_not_damage() {
 #[test]
 fn a_failed_commit_leaves_no_leftovers_for_retention_or_verification() {
     let d = tmp();
-    let db = open_with(d.path(), opts().segment_max_bytes(400));
+    // A small segment and a large failed commit, so its bytes would outlive
+    // the smaller commits that follow and the roll after them.
+    let db = open_with(d.path(), opts().segment_max_bytes(200));
     fill(&db, agg(1), 2);
     db.debug_fail_next_commit();
+    let big = "g".repeat(100);
     let mut t = db.transaction();
-    t.append(
-        agg(1),
-        Expected::Any,
-        vec![ev("ghost0"), ev("ghost1"), ev("ghost2")],
-    );
+    t.append(agg(1), Expected::Any, vec![ev(&big), ev(&big), ev(&big)]);
     assert!(matches!(t.commit(), Err(Error::Io { .. })));
     assert_eq!(db.head(), 2);
     fill(&db, agg(1), 30);
@@ -147,13 +146,13 @@ fn a_failed_commit_leaves_no_leftovers_for_retention_or_verification() {
     );
     let before = db.read_all(0, 1000).unwrap();
     assert_eq!(before.len(), 32);
-    assert!(payloads(&before).iter().all(|p| !p.starts_with("ghost")));
+    assert!(payloads(&before).iter().all(|p| !p.starts_with("ggg")));
     let floor = db.retain_from(db.head() / 2).unwrap().floor;
     assert_eq!(db.read_all(floor, 1000).unwrap(), before[floor as usize..]);
     drop(db);
     let db = open_with(
         d.path(),
-        opts().segment_max_bytes(400).verify_all_segments(true),
+        opts().segment_max_bytes(200).verify_all_segments(true),
     );
     assert_eq!(db.read_all(floor, 1000).unwrap(), before[floor as usize..]);
 }
