@@ -24,10 +24,11 @@ pub struct AppendArgs {
     /// Metadata bytes.
     #[arg(long)]
     metadata: Option<String>,
-    /// The payload.
+    /// A payload; repeatable: every -d is one event, all in one
+    /// transaction, in order.
     #[arg(short = 'd', long = "data", conflicts_with = "stdin")]
-    data: Option<String>,
-    /// Read the payload from stdin.
+    data: Vec<String>,
+    /// Read the payloads from stdin, one event per line.
     #[arg(long)]
     stdin: bool,
     /// The epoch the daemon must be at (a fencing token).
@@ -56,25 +57,32 @@ pub async fn append(conn: &Conn, format: Format, a: AppendArgs) -> anyhow::Resul
     if aggregate.is_none() && expected != Expected::Any {
         return Err(Usage("free events have no length to expect; use --expect any".into()).into());
     }
-    let payload = match (a.data, a.stdin) {
-        (Some(d), _) => d.into_bytes(),
-        (None, true) => {
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .read_to_end(&mut buf)
-                .context("read stdin")?;
-            buf
-        }
-        (None, false) => return Err(Usage("give the payload with -d or --stdin".into()).into()),
+    let payloads: Vec<Vec<u8>> = if a.stdin {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .context("read stdin")?;
+        text.lines().map(|l| l.as_bytes().to_vec()).collect()
+    } else {
+        a.data.into_iter().map(String::into_bytes).collect()
     };
-    let mut event = NewEvent::new(payload).tags(a.tags);
-    if let Some(m) = a.metadata {
-        event = event.metadata(m);
+    if payloads.is_empty() {
+        return Err(Usage("give at least one payload with -d, or lines on --stdin".into()).into());
     }
+    let events: Vec<NewEvent> = payloads
+        .into_iter()
+        .map(|p| {
+            let mut event = NewEvent::new(p).tags(a.tags.clone());
+            if let Some(m) = &a.metadata {
+                event = event.metadata(m.clone());
+            }
+            event
+        })
+        .collect();
     let mut txn = Transaction::new();
     match aggregate {
-        Some(id) => txn.append_one(id, expected, event),
-        None => txn.append_free(vec![event]),
+        Some(id) => txn.append(id, expected, events),
+        None => txn.append_free(events),
     };
     send(conn, format, txn, a.epoch).await
 }

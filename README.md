@@ -310,7 +310,7 @@ clients hold no thread.
 ## The CLI
 
 ```
-chron append <AGGREGATE|free> [--expect any|new|N] [--tag T]... [--metadata M] (-d PAYLOAD | --stdin)
+chron append <AGGREGATE|free> [--expect any|new|N] [--tag T]... [--metadata M] (-d PAYLOAD... | --stdin)   # every -d (or stdin line) is one event, all in one transaction
 chron commit (-f FILE | --stdin)   # {"appends":[{"aggregate":"<uuid>"|null,"expect":"new","events":[{"payload":"…","tags":["…"]}]}]}
 chron read <AGGREGATE> [--from N] [--limit N] [--backward]
 chron all [--from N] [--limit N] [--backward]
@@ -445,6 +445,14 @@ cargo doc --workspace --no-deps                                       # warning-
 cargo bench -p chron-db   # criterion: append in both fsync modes, the three reads
 cargo run -p bank -- open alice   # the example: deposit <id> 50, withdraw, balances [--follow], history <id>; --addr for a daemon
 ```
+
+`cargo run -p chron-load -- --addr http://127.0.0.1:4242 --replica
+http://127.0.0.1:4243 --duration 600 --backup-dir ./backups --backup-every
+60 --retain-every 300` loads a leader and a replica while checking
+invariants (dense positions, payloads matching their records, aggregate
+lengths, restored backups, retention floors, replica equality at the
+end); it exits 1 on any violation and prints counts and commit latency
+percentiles (`--json` for a machine-readable report).
 
 CI runs the first four on every push and pull request, then
 `cargo package --workspace --locked` so the crates are known to package.

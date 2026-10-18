@@ -6,7 +6,16 @@ crates share one version.
 
 ## Unreleased
 
-Nothing yet.
+### chron-cli
+
+- `chron append` takes several `-d` payloads (one event each, one
+  transaction) and reads one event per line from `--stdin`.
+
+### tools
+
+- `chron-load` (not published): a load generator that checks invariants
+  while it runs (dense positions, payload/record agreement, lengths,
+  restored backups, retention floors, a replica compared at the end).
 
 ## 0.2.0 - 2026-10-18
 

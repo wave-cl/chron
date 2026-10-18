@@ -750,3 +750,36 @@ fn status_exit_codes() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn append_takes_several_payloads_in_one_transaction() {
+    let d = Daemon::start();
+    d.chron()
+        .args([
+            "append", A, "--expect", "new", "--tag", "t", "-d", "one", "-d", "two", "-d", "three",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("committed 0..2 (next 3)")
+                .and(predicate::str::contains("count 3")),
+        );
+    d.chron().args(["len", A]).assert().success().stdout("3\n");
+    d.chron().args(["read", A]).assert().success().stdout(
+        predicate::str::contains(format!("0  {A}#0  [t]  one"))
+            .and(predicate::str::contains(format!("2  {A}#2  [t]  three"))),
+    );
+    d.chron()
+        .args(["append", "free", "--stdin"])
+        .write_stdin("four\nfive\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("committed 3..4 (next 5)"));
+    d.chron()
+        .args(["append", "free", "--stdin"])
+        .write_stdin("")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("at least one payload"));
+    d.chron().args(["append", A]).assert().code(2);
+}

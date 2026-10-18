@@ -355,6 +355,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "chron-load"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chron-client",
+ "chron-db",
+ "chrond",
+ "clap",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "uuid",
+]
+
+[[package]]
 name = "chron-proto"
 version = "0.2.0"
 dependencies = [
