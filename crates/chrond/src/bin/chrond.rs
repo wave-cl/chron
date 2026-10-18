@@ -73,6 +73,22 @@ struct Cli {
     /// Read the bearer token from this file.
     #[arg(long, env = "CHRON_TOKEN_FILE")]
     token_file: Option<PathBuf>,
+    /// Promote, fence, retain, backup, apply and replicate need this token
+    /// (it opens every other call too); without it --token covers them.
+    #[arg(
+        long,
+        env = "CHROND_ADMIN_TOKEN",
+        hide_env_values = true,
+        conflicts_with = "admin_token_file"
+    )]
+    admin_token: Option<String>,
+    /// Read the admin token from this file.
+    #[arg(long, env = "CHROND_ADMIN_TOKEN_FILE")]
+    admin_token_file: Option<PathBuf>,
+    /// Directory for backups taken and applied over the daemon, by bare
+    /// file name; without it those calls are refused.
+    #[arg(long, env = "CHROND_BACKUP_DIR")]
+    backup_dir: Option<PathBuf>,
     /// Largest request or response message, in bytes.
     #[arg(long, env = "CHROND_MAX_MESSAGE_BYTES", default_value_t = 64 * 1024 * 1024)]
     max_message_bytes: usize,
@@ -82,6 +98,12 @@ struct Cli {
     /// Concurrent calls per connection.
     #[arg(long, default_value_t = 256)]
     concurrency_per_connection: usize,
+    /// Seconds between HTTP/2 pings to idle connections.
+    #[arg(long, env = "CHROND_KEEPALIVE_INTERVAL", default_value_t = 30)]
+    keepalive_interval: u64,
+    /// Seconds to wait for a ping's answer before closing the connection.
+    #[arg(long, env = "CHROND_KEEPALIVE_TIMEOUT", default_value_t = 10)]
+    keepalive_timeout: u64,
 }
 
 fn read(path: &PathBuf, what: &str) -> anyhow::Result<Vec<u8>> {
@@ -137,6 +159,10 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     opts.token = token(cli.token, cli.token_file, "token file")?;
+    opts.admin_token = token(cli.admin_token, cli.admin_token_file, "admin token file")?;
+    opts.backup_dir = cli.backup_dir;
+    opts.keepalive_interval = std::time::Duration::from_secs(cli.keepalive_interval);
+    opts.keepalive_timeout = std::time::Duration::from_secs(cli.keepalive_timeout);
     opts.max_message_bytes = cli.max_message_bytes;
     opts.request_timeout = cli.request_timeout.map(std::time::Duration::from_secs);
     opts.concurrency_per_connection = cli.concurrency_per_connection;

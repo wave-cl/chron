@@ -49,7 +49,8 @@ enum Commands {
     Flush,
     /// Write a backup to a path on the daemon's filesystem.
     Backup(cmd::admin::BackupArgs),
-    /// Apply an incremental backup from a path on the daemon's filesystem.
+    /// Apply an incremental backup by its name under the daemon's backup
+    /// directory.
     Apply { archive: String },
     /// Drop segments wholly below a position.
     Retain { floor: u64 },

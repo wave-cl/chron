@@ -141,8 +141,9 @@ message InfoResponse {
   bool fsync = 15;
 }
 
-// A backup written by the daemon to `archive` on its own filesystem: full
-// without `since`, incremental from `since` with it.
+// A backup written by the daemon as the bare file name `archive` under its
+// backup directory (`--backup-dir`; refused without one): full without
+// `since`, incremental from `since` with it.
 message BackupRequest {
   string archive = 1;
   optional uint64 since = 2;
@@ -160,6 +161,8 @@ message BackupMeta {
   optional bytes db_id = 9;
 }
 
+// Applies the incremental backup named `archive` under the daemon's backup
+// directory.
 message ApplyBackupRequest { string archive = 1; }
 
 // A replica pulls whole transactions from `from_position` on.
@@ -208,7 +211,13 @@ message RetainResponse {
 // the floor is OUT_OF_RANGE; a locked directory, a wrong backup base head
 // or an existing restore target is FAILED_PRECONDITION; damage and I/O
 // failures are INTERNAL. A write refused because of the node's role or
-// epoch is FAILED_PRECONDITION with the metadata `chron-epoch`.
+// epoch is FAILED_PRECONDITION with the metadata `chron-epoch`. A missing
+// or wrong bearer token is UNAUTHENTICATED; an administrative call
+// (Promote, Fence, Retain, Backup, ApplyBackup, Replicate) without the
+// admin token, when the daemon has one, is PERMISSION_DENIED. A
+// replication stream meets a transaction larger than the message limit
+// with RESOURCE_EXHAUSTED. Subscribe and Replicate end with UNAVAILABLE
+// when the daemon is fenced or stops.
 service Chron {
   rpc Commit(CommitRequest) returns (CommitResponse);
   rpc ReadAggregate(ReadAggregateRequest) returns (stream Event);

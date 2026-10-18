@@ -59,7 +59,12 @@ async fn replica_tails_existing_data_and_live_commits_including_a_long_transacti
 async fn replica_refuses_writes_and_apply_but_backs_up_and_retains() {
     let mut leader = Server::start().await;
     fill(&mut leader.client, agg(1), 2).await;
-    let mut replica = Server::start_replica_of(&leader).await;
+    let addr = leader.addr();
+    let mut replica = Server::start_with(move |o| {
+        with_backup_dir(o);
+        o.replicate_from = Some(addr);
+    })
+    .await;
     let err = replica
         .client
         .commit(pb::CommitRequest {
@@ -78,20 +83,20 @@ async fn replica_refuses_writes_and_apply_but_backs_up_and_retains() {
     let err = replica
         .client
         .apply_backup(pb::ApplyBackupRequest {
-            archive: "/nonexistent".into(),
+            archive: "nonexistent.chronbak".into(),
         })
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition);
-    let archive = replica.dir.path().join("b.chronbak");
     replica
         .client
         .backup(pb::BackupRequest {
-            archive: archive.display().to_string(),
+            archive: "b.chronbak".into(),
             since: None,
         })
         .await
         .unwrap();
+    assert!(replica.dir.path().join("backups/b.chronbak").exists());
     replica
         .client
         .retain(pb::RetainRequest { floor: 0 })
@@ -207,7 +212,7 @@ async fn promotion_bumps_the_epoch_fences_the_old_leader_and_the_old_leader_rejo
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replica_of_a_different_database_and_a_diverged_replica_are_refused() {
-    let mut leader = Server::start().await;
+    let mut leader = Server::start_with(with_backup_dir).await;
     fill(&mut leader.client, agg(1), 3).await;
     let other = tempfile::tempdir().unwrap();
     {
@@ -229,11 +234,11 @@ async fn a_replica_of_a_different_database_and_a_diverged_replica_are_refused() 
     .expect("refused");
     assert!(err.to_string().contains("is database"), "{err}");
 
-    let archive = leader.dir.path().join("full.chronbak");
+    let archive = leader.dir.path().join("backups/full.chronbak");
     leader
         .client
         .backup(pb::BackupRequest {
-            archive: archive.display().to_string(),
+            archive: "full.chronbak".into(),
             since: None,
         })
         .await

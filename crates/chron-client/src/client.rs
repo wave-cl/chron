@@ -392,8 +392,9 @@ impl Client {
         })
     }
 
-    /// A backup written by the daemon to `archive` on its own filesystem;
-    /// incremental from `since` when given.
+    /// A backup written by the daemon as the bare file name `archive`
+    /// under its backup directory; incremental from `since` when given.
+    /// An admin call.
     pub async fn backup(
         &self,
         archive: &str,

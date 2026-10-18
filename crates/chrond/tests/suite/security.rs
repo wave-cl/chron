@@ -269,3 +269,195 @@ async fn request_timeout_does_not_cut_streams() {
     assert_eq!(ev.position, 0);
     s.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn backup_names_are_confined_to_the_backup_dir() {
+    let mut s = Server::start_with(with_backup_dir).await;
+    fill(&mut s.client, agg(1), 1).await;
+    let outside_before: Vec<_> = std::fs::read_dir(s.dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    for name in [
+        "../escape.chronbak",
+        "/etc/escape",
+        "a/b",
+        "",
+        ".",
+        "..",
+        "a\\b",
+    ] {
+        let err = s
+            .client
+            .backup(pb::BackupRequest {
+                archive: name.into(),
+                since: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::InvalidArgument,
+            "{name:?}: {}",
+            err.message()
+        );
+        let err = s
+            .client
+            .apply_backup(pb::ApplyBackupRequest {
+                archive: name.into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "apply {name:?}");
+    }
+    let outside_after: Vec<_> = std::fs::read_dir(s.dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(outside_before, outside_after, "nothing written outside");
+    assert!(!std::path::Path::new("/etc/escape").exists());
+    s.client
+        .backup(pb::BackupRequest {
+            archive: "ok.chronbak".into(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    assert!(s.dir.path().join("backups/ok.chronbak").exists());
+    assert_eq!(
+        std::fs::read_dir(s.dir.path().join("backups"))
+            .unwrap()
+            .count(),
+        1,
+        "only the one archive"
+    );
+    s.stop().await;
+
+    let mut s = Server::start().await;
+    let err = s
+        .client
+        .backup(pb::BackupRequest {
+            archive: "x.chronbak".into(),
+            since: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(err.message().contains("--backup-dir"), "{}", err.message());
+    s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_calls_need_the_admin_token_when_one_is_set() {
+    let s = Server::start_with_no_client(|o| {
+        o.token = Some("s3cret".into());
+        o.admin_token = Some("adm1n".into());
+        with_backup_dir(o);
+    })
+    .await;
+    let addr = s.running.as_ref().unwrap().local_addr;
+    let channel = plain_channel(addr).await;
+    let commit = || pb::CommitRequest {
+        appends: vec![append(Some(agg(1)), any(), vec![new_event("x", &[])])],
+        epoch: None,
+    };
+    let mut user = with_token(channel.clone(), "s3cret");
+    user.commit(commit()).await.unwrap();
+    for (what, err) in [
+        (
+            "retain",
+            user.retain(pb::RetainRequest { floor: 0 }).await.err(),
+        ),
+        ("promote", user.promote(pb::PromoteRequest {}).await.err()),
+        (
+            "fence",
+            user.fence(pb::FenceRequest { epoch: 9 }).await.err(),
+        ),
+        (
+            "backup",
+            user.backup(pb::BackupRequest {
+                archive: "b.chronbak".into(),
+                since: None,
+            })
+            .await
+            .err(),
+        ),
+        (
+            "apply",
+            user.apply_backup(pb::ApplyBackupRequest {
+                archive: "b.chronbak".into(),
+            })
+            .await
+            .err(),
+        ),
+        (
+            "replicate",
+            user.replicate(pb::ReplicateRequest {
+                from_position: 0,
+                last_fingerprint: None,
+            })
+            .await
+            .err(),
+        ),
+    ] {
+        let err = err.expect(what);
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "{what}: {}",
+            err.message()
+        );
+    }
+    assert_eq!(
+        head_of(&mut user).await.unwrap(),
+        1,
+        "the fence refused above did not land"
+    );
+    let mut admin = with_token(channel.clone(), "adm1n");
+    admin.retain(pb::RetainRequest { floor: 0 }).await.unwrap();
+    admin
+        .backup(pb::BackupRequest {
+            archive: "b.chronbak".into(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    admin.commit(commit()).await.unwrap();
+    assert_eq!(
+        with_token(channel.clone(), "nope")
+            .retain(pb::RetainRequest { floor: 0 })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unauthenticated
+    );
+    // The scheme is matched case-insensitively.
+    let mut lower = ChronClient::with_interceptor(
+        channel.clone(),
+        TokenInterceptor("bearer adm1n".parse().unwrap()),
+    );
+    lower.retain(pb::RetainRequest { floor: 0 }).await.unwrap();
+    s.stop().await;
+
+    // Without an admin token the main token covers the admin calls.
+    let s = Server::start_with_no_client(|o| o.token = Some("s3cret".into())).await;
+    let mut user = with_token(
+        plain_channel(s.running.as_ref().unwrap().local_addr).await,
+        "s3cret",
+    );
+    user.retain(pb::RetainRequest { floor: 0 }).await.unwrap();
+    s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zero_request_timeout_is_refused() {
+    let err = Server::try_start_in(
+        tempfile::tempdir().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+        |o| o.request_timeout = Some(Duration::ZERO),
+    )
+    .await
+    .err()
+    .expect("refused");
+    assert!(err.to_string().contains("request-timeout"), "{err}");
+}

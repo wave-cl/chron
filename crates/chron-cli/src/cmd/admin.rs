@@ -72,7 +72,7 @@ pub async fn flush(conn: &Conn, format: Format) -> anyhow::Result<()> {
 
 #[derive(Args, Debug)]
 pub struct BackupArgs {
-    /// Where the daemon writes the archive, on its own filesystem.
+    /// File name under the daemon's backup directory (--backup-dir).
     archive: String,
     /// Incremental: the events from this position on.
     #[arg(long)]

@@ -3,9 +3,10 @@
 //! check and the commit one critical section.
 
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use chron::{Committed, Db};
 use chron_proto::v1 as pb;
@@ -14,6 +15,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
+use crate::auth;
 use crate::codec;
 use crate::replica::Puller;
 
@@ -62,6 +64,11 @@ pub struct Upstream {
 pub struct Node {
     pub db: Db,
     pub data_dir: PathBuf,
+    /// Where Backup writes and ApplyBackup reads; both refused without it.
+    pub backup_dir: Option<PathBuf>,
+    /// Required on the administrative calls when set.
+    pub admin_token: Option<Arc<[u8]>>,
+    diverged_warned: Mutex<Option<Instant>>,
     role: watch::Sender<Role>,
     /// Readers check the role and epoch and commit; writers flip the role.
     write_gate: RwLock<()>,
@@ -78,6 +85,8 @@ impl Node {
     pub fn new(
         db: Db,
         data_dir: PathBuf,
+        backup_dir: Option<PathBuf>,
+        admin_token: Option<&str>,
         upstream: Option<Upstream>,
         max_message_bytes: usize,
         cancel: CancellationToken,
@@ -85,6 +94,9 @@ impl Node {
         Node {
             db,
             data_dir,
+            backup_dir,
+            admin_token: admin_token.map(|t| Arc::from(t.as_bytes())),
+            diverged_warned: Mutex::new(None),
             role: watch::Sender::new(Role::Leader),
             write_gate: RwLock::new(()),
             upstream,
@@ -166,6 +178,55 @@ impl Node {
 
     pub fn record_replica(&self, f: impl FnOnce(&mut ReplicaStatus)) {
         f(&mut self.replica.lock().unwrap_or_else(|p| p.into_inner()));
+    }
+
+    /// PERMISSION_DENIED unless the call carries the admin token (when one
+    /// is configured; otherwise the interceptor's check is enough).
+    pub fn require_admin(&self, meta: &tonic::metadata::MetadataMap) -> Result<(), Status> {
+        let Some(want) = &self.admin_token else {
+            return Ok(());
+        };
+        match auth::bearer(meta) {
+            Some(t) if auth::matches(t, want) => Ok(()),
+            _ => Err(Status::permission_denied(
+                "this call needs the admin token (--admin-token on the daemon)",
+            )),
+        }
+    }
+
+    /// `name` under the backup directory: a bare file name, nothing that
+    /// could leave the directory.
+    pub fn backup_path(&self, name: &str) -> Result<PathBuf, Status> {
+        let Some(dir) = &self.backup_dir else {
+            return Err(Status::failed_precondition(
+                "backups over the daemon are disabled: start it with --backup-dir",
+            ));
+        };
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains(['/', '\\', '\0'])
+            || Path::new(name).components().count() != 1
+            || Path::new(name).has_root()
+        {
+            return Err(Status::invalid_argument(format!(
+                "{name:?} is not a bare file name; backups live under the daemon's --backup-dir"
+            )));
+        }
+        Ok(dir.join(name))
+    }
+
+    /// A diverged replica keeps knocking; log it at most once a minute.
+    pub fn warn_diverged(&self, message: &str) {
+        let mut last = self
+            .diverged_warned
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        if last.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60)) {
+            *last = Some(now);
+            tracing::warn!(message, "a replica was refused as diverged");
+        }
     }
 
     /// FAILED_PRECONDITION carrying this node's epoch.

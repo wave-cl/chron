@@ -119,6 +119,11 @@ impl Server {
     }
 }
 
+/// Backups under `<tempdir>/backups`, beside the data directory.
+pub fn with_backup_dir(o: &mut chrond::Options) {
+    o.backup_dir = Some(o.data_dir.parent().unwrap().join("backups"));
+}
+
 /// A free TCP port: bound then released, so a daemon can be restarted on it.
 pub fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -364,10 +364,12 @@ impl Chron for ChronService {
         &self,
         req: Request<pb::BackupRequest>,
     ) -> Result<Response<pb::BackupMeta>, Status> {
+        self.node.require_admin(req.metadata())?;
         let r = req.into_inner();
+        let path = self.node.backup_path(&r.archive)?;
         let meta = blocking(self.db(), "backup", move |db| match r.since {
-            Some(since) => db.backup_since(&r.archive, since),
-            None => db.backup(&r.archive),
+            Some(since) => db.backup_since(&path, since),
+            None => db.backup(&path),
         })
         .await?;
         Ok(Response::new(codec::backup_meta(meta)))
@@ -377,10 +379,11 @@ impl Chron for ChronService {
         &self,
         req: Request<pb::ApplyBackupRequest>,
     ) -> Result<Response<pb::BackupMeta>, Status> {
+        self.node.require_admin(req.metadata())?;
         if let Some(s) = self.node.write_refusal() {
             return Err(s);
         }
-        let archive = req.into_inner().archive;
+        let archive = self.node.backup_path(&req.into_inner().archive)?;
         let node = self.node.clone();
         let meta = tokio::task::spawn_blocking(move || {
             node.write_guarded(|db| db.apply_backup(&archive).map_err(codec::status))
@@ -394,6 +397,7 @@ impl Chron for ChronService {
         &self,
         req: Request<pb::RetainRequest>,
     ) -> Result<Response<pb::RetainResponse>, Status> {
+        self.node.require_admin(req.metadata())?;
         let floor = req.into_inner().floor;
         let r = blocking(self.db(), "retain", move |db| db.retain_from(floor)).await?;
         Ok(Response::new(codec::retained(r)))
@@ -405,6 +409,7 @@ impl Chron for ChronService {
         &self,
         req: Request<pb::ReplicateRequest>,
     ) -> Result<Response<Self::ReplicateStream>, Status> {
+        self.node.require_admin(req.metadata())?;
         if let Some(s) = self.node.write_refusal() {
             return Err(s);
         }
@@ -413,9 +418,11 @@ impl Chron for ChronService {
         let from = r.from_position;
         let head = db.head();
         if from > head {
-            return Err(self.node.refuse(format!(
+            let m = format!(
                 "diverged: the replica is at {from}, this database at {head}; reset the replica from a backup of this database"
-            )));
+            );
+            self.node.warn_diverged(&m);
+            return Err(self.node.refuse(m));
         }
         let floor = db.floor();
         if from < floor {
@@ -434,9 +441,11 @@ impl Chron for ChronService {
             } else {
                 let ours = blocking(&db, "fingerprint", move |db| db.fingerprint(from - 1)).await?;
                 if ours != Some(theirs) {
-                    return Err(self.node.refuse(format!(
+                    let m = format!(
                         "diverged: the histories differ before position {from}; reset the replica from a backup of this database"
-                    )));
+                    );
+                    self.node.warn_diverged(&m);
+                    return Err(self.node.refuse(m));
                 }
             }
         }
@@ -522,8 +531,9 @@ impl Chron for ChronService {
 
     async fn promote(
         &self,
-        _: Request<pb::PromoteRequest>,
+        req: Request<pb::PromoteRequest>,
     ) -> Result<Response<pb::PromoteResponse>, Status> {
+        self.node.require_admin(req.metadata())?;
         match self.node.role() {
             Role::Leader => return Err(self.node.refuse("already the leader")),
             Role::Fenced => {
@@ -546,6 +556,7 @@ impl Chron for ChronService {
         &self,
         req: Request<pb::FenceRequest>,
     ) -> Result<Response<pb::FenceResponse>, Status> {
+        self.node.require_admin(req.metadata())?;
         let by = req.into_inner().epoch;
         let node = self.node.clone();
         tokio::task::spawn_blocking(move || node.fence(by))

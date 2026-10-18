@@ -46,7 +46,13 @@ type Layer = TraceLayer<
 >;
 
 fn span(req: &http::Request<tonic::body::Body>) -> Span {
-    tracing::info_span!("rpc", method = %req.uri().path())
+    let peer = req
+        .extensions()
+        .get::<tonic::transport::server::TcpConnectInfo>()
+        .and_then(|i| i.remote_addr())
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    tracing::info_span!("rpc", method = %req.uri().path(), %peer)
 }
 
 pub fn layer() -> Layer {

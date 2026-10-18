@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chron_client::{ClientError, Expected, NewEvent, Role, Transaction};
+use chron_client::{ClientConfig, ClientError, Expected, NewEvent, Role, Transaction};
 use tokio_stream::StreamExt;
 
 use crate::common::*;
@@ -117,7 +117,11 @@ async fn subscribe_rebuilds_library_events() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn info_flush_backup_apply_retain_promote_fence_typed() {
-    let f = Fixture::start().await;
+    let f = Fixture::start_with(
+        |o| o.backup_dir = Some(o.data_dir.parent().unwrap().join("backups")),
+        ClientConfig::default(),
+    )
+    .await;
     f.client
         .append(agg(1), Expected::New, vec![NewEvent::new("one")])
         .await
@@ -130,26 +134,17 @@ async fn info_flush_backup_apply_retain_promote_fence_typed() {
     );
     assert!(info.db_id.is_some());
     assert!(!info.options.verify_all_segments);
-    let archive = f.dir.path().join("full.chronbak");
-    let meta = f
-        .client
-        .backup(archive.to_str().unwrap(), None)
-        .await
-        .unwrap();
+    let meta = f.client.backup("full.chronbak", None).await.unwrap();
+    assert!(f.dir.path().join("backups/full.chronbak").exists());
     assert_eq!((meta.head, meta.format, meta.db_id), (1, 1, info.db_id));
     f.client
         .append(agg(1), Expected::Exact(1), vec![NewEvent::new("two")])
         .await
         .unwrap();
-    let inc = f.dir.path().join("inc.chronbak");
-    let meta = f
-        .client
-        .backup(inc.to_str().unwrap(), Some(1))
-        .await
-        .unwrap();
+    let meta = f.client.backup("inc.chronbak", Some(1)).await.unwrap();
     assert_eq!((meta.base_head, meta.head), (Some(1), 2));
     assert!(matches!(
-        f.client.apply_backup(inc.to_str().unwrap()).await,
+        f.client.apply_backup("inc.chronbak").await,
         Err(ClientError::FailedPrecondition(_))
     ));
     let r = f.client.retain(2).await.unwrap();

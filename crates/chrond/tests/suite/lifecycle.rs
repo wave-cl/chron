@@ -35,13 +35,13 @@ async fn info_flush_shutdown_and_lock() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn backup_over_rpc_restores_offline_and_retain_moves_the_floor() {
-    let mut s = Server::start().await;
+    let mut s = Server::start_with(with_backup_dir).await;
     fill(&mut s.client, agg(1), 5).await;
-    let archive = s.dir.path().join("full.chronbak");
+    let archive = s.dir.path().join("backups/full.chronbak");
     let meta = s
         .client
         .backup(pb::BackupRequest {
-            archive: archive.display().to_string(),
+            archive: "full.chronbak".into(),
             since: None,
         })
         .await
@@ -49,11 +49,11 @@ async fn backup_over_rpc_restores_offline_and_retain_moves_the_floor() {
         .into_inner();
     assert_eq!((meta.incremental, meta.head), (false, 5));
     fill(&mut s.client, agg(1), 2).await;
-    let inc = s.dir.path().join("inc.chronbak");
+    let inc = s.dir.path().join("backups/inc.chronbak");
     let meta = s
         .client
         .backup(pb::BackupRequest {
-            archive: inc.display().to_string(),
+            archive: "inc.chronbak".into(),
             since: Some(5),
         })
         .await
@@ -66,7 +66,7 @@ async fn backup_over_rpc_restores_offline_and_retain_moves_the_floor() {
     let wrong = s
         .client
         .apply_backup(pb::ApplyBackupRequest {
-            archive: inc.display().to_string(),
+            archive: "inc.chronbak".into(),
         })
         .await
         .unwrap_err();

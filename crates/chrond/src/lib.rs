@@ -59,6 +59,13 @@ pub struct Options {
     /// Every `chron.v1.Chron` call must carry `authorization: Bearer
     /// <token>`. The health service stays open.
     pub token: Option<String>,
+    /// When set, Promote, Fence, Retain, Backup, ApplyBackup and Replicate
+    /// need this token instead (it opens every other call too). Unset,
+    /// `token` covers them.
+    pub admin_token: Option<String>,
+    /// Where Backup writes and ApplyBackup reads, by bare file name.
+    /// Unset, both are refused. Created if missing.
+    pub backup_dir: Option<PathBuf>,
     /// Largest request or response message. Must be at least the
     /// database's `max_record_bytes`.
     pub max_message_bytes: usize,
@@ -105,6 +112,8 @@ impl Options {
             max_record_bytes: None,
             tls: None,
             token: None,
+            admin_token: None,
+            backup_dir: None,
             max_message_bytes: 64 * 1024 * 1024,
             request_timeout: None,
             concurrency_per_connection: 256,
@@ -141,11 +150,31 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
     if let Some(n) = opts.max_record_bytes {
         db_opts = db_opts.max_record_bytes(n);
     }
-    if let Some(t) = &opts.token
-        && t.is_empty()
-    {
+    if opts.token.as_deref() == Some("") || opts.admin_token.as_deref() == Some("") {
         anyhow::bail!("the token is empty");
     }
+    if opts.request_timeout == Some(Duration::ZERO) {
+        anyhow::bail!(
+            "--request-timeout 0 would end every call at once; leave it unset for no bound"
+        );
+    }
+    if !opts.listen.ip().is_loopback() && opts.token.is_none() && opts.tls.is_none() {
+        tracing::warn!(
+            listen = %opts.listen,
+            "listening beyond loopback with no token and no TLS: anyone who can reach this address can read and write the database"
+        );
+    }
+    let backup_dir = match &opts.backup_dir {
+        Some(d) => {
+            std::fs::create_dir_all(d)
+                .with_context(|| format!("cannot create the backup directory {}", d.display()))?;
+            Some(
+                d.canonicalize()
+                    .with_context(|| format!("backup directory {}", d.display()))?,
+            )
+        }
+        None => None,
+    };
     let dir = opts.data_dir.clone();
     let db = tokio::task::spawn_blocking(move || Db::open(&dir, db_opts))
         .await
@@ -177,6 +206,8 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
     let node = Arc::new(Node::new(
         db.clone(),
         opts.data_dir.clone(),
+        backup_dir,
+        opts.admin_token.as_deref(),
         upstream,
         opts.max_message_bytes,
         cancel.clone(),
@@ -193,7 +224,12 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         ChronServer::new(service::ChronService::new(node.clone()))
             .max_decoding_message_size(n)
             .max_encoding_message_size(n),
-        auth::BearerAuth::new(opts.token.as_deref()),
+        auth::BearerAuth::new(
+            &[opts.token.as_deref(), opts.admin_token.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        ),
     );
     let (health, health_svc) = tonic_health::server::health_reporter();
     health

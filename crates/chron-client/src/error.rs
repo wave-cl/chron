@@ -27,6 +27,9 @@ pub enum ClientError {
     FailedPrecondition(String),
     #[error("unauthenticated: {0}")]
     Unauthenticated(String),
+    /// The call needs the daemon's admin token.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     #[error("unavailable: {0}")]
     Unavailable(String),
     #[error("cannot connect: {0}")]
@@ -67,6 +70,7 @@ impl From<Status> for ClientError {
             }
             Code::InvalidArgument => ClientError::InvalidArgument(s.message().to_string()),
             Code::OutOfRange => ClientError::OutOfRange(s.message().to_string()),
+            Code::PermissionDenied => ClientError::PermissionDenied(s.message().to_string()),
             Code::Unauthenticated => ClientError::Unauthenticated(s.message().to_string()),
             Code::Unavailable => ClientError::Unavailable(s.message().to_string()),
             // A connection-level failure (a TLS handshake refused after the

@@ -400,7 +400,8 @@ fn promote_fence_and_epoch_flags() {
 
 #[test]
 fn info_flush_backup_restore_inspect_and_retain() {
-    let d = Daemon::start();
+    let d =
+        Daemon::start_with(|o| o.backup_dir = Some(o.data_dir.parent().unwrap().join("backups")));
     d.chron()
         .args(["append", A, "-d", "one"])
         .assert()
@@ -415,10 +416,9 @@ fn info_flush_backup_restore_inspect_and_retain() {
         .assert()
         .success()
         .stdout("flushed\n");
-    let archive = d.dir.path().join("full.chronbak");
+    let archive = d.dir.path().join("backups/full.chronbak");
     d.chron()
-        .args(["backup"])
-        .arg(&archive)
+        .args(["backup", "full.chronbak"])
         .assert()
         .success()
         .stdout(predicate::str::contains("full backup to head 1"));
@@ -426,16 +426,13 @@ fn info_flush_backup_restore_inspect_and_retain() {
         .args(["append", A, "-d", "two"])
         .assert()
         .success();
-    let inc = d.dir.path().join("inc.chronbak");
     d.chron()
-        .args(["backup", "--since", "1"])
-        .arg(&inc)
+        .args(["backup", "--since", "1", "inc.chronbak"])
         .assert()
         .success()
         .stdout(predicate::str::contains("incremental backup 1..2"));
     d.chron()
-        .args(["apply"])
-        .arg(&inc)
+        .args(["apply", "inc.chronbak"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("FailedPrecondition"));
