@@ -10,8 +10,16 @@ use tonic::{Request, Status};
 
 /// The token after `Bearer ` (any case) in `authorization`, if any.
 pub fn bearer(meta: &MetadataMap) -> Option<&str> {
-    let v = meta.get("authorization")?.to_str().ok()?;
-    let (scheme, rest) = v.split_at_checked(7)?;
+    parse(meta.get("authorization")?.to_str().ok()?)
+}
+
+/// The same from HTTP headers.
+pub fn bearer_headers(headers: &http::HeaderMap) -> Option<&str> {
+    parse(headers.get("authorization")?.to_str().ok()?)
+}
+
+fn parse(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.split_at_checked(7)?;
     scheme
         .eq_ignore_ascii_case("bearer ")
         .then(|| rest.trim_start())
@@ -37,14 +45,22 @@ impl BearerAuth {
     }
 }
 
-impl Interceptor for BearerAuth {
-    fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
+impl BearerAuth {
+    /// Whether these headers carry one of the configured tokens.
+    pub fn check(&self, headers: &http::HeaderMap) -> Result<(), Status> {
         if self.want.is_empty() {
-            return Ok(req);
+            return Ok(());
         }
-        match bearer(req.metadata()) {
-            Some(t) if self.want.iter().any(|w| matches(t, w)) => Ok(req),
+        match bearer_headers(headers) {
+            Some(t) if self.want.iter().any(|w| matches(t, w)) => Ok(()),
             _ => Err(Status::unauthenticated("missing or wrong bearer token")),
         }
+    }
+}
+
+impl Interceptor for BearerAuth {
+    fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
+        self.check(req.metadata().as_ref())?;
+        Ok(req)
     }
 }

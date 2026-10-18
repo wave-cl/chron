@@ -262,6 +262,12 @@ impl Node {
                 .to_str()
                 .map_err(|_| Status::invalid_argument("the chron-db metadata is not valid text"))?,
         };
+        self.resolve_name(name)
+    }
+
+    /// The database called `name`: INVALID_ARGUMENT for a bad name,
+    /// NOT_FOUND for one the daemon does not have.
+    pub fn resolve_name(&self, name: &str) -> Result<Arc<DbNode>, Status> {
         if !valid_database_name(name) {
             return Err(Status::invalid_argument(format!(
                 "{name:?} is not a database name; names are 1 to 64 of a-z, 0-9, _ and -"
@@ -355,10 +361,16 @@ impl Node {
     /// PERMISSION_DENIED unless the call carries the admin token (when one
     /// is configured; otherwise the interceptor's check is enough).
     pub fn require_admin(&self, meta: &MetadataMap) -> Result<(), Status> {
+        self.require_admin_token(auth::bearer(meta))
+    }
+
+    /// [`require_admin`](Node::require_admin) given the bearer token the
+    /// call carried, whatever the transport.
+    pub fn require_admin_token(&self, bearer: Option<&str>) -> Result<(), Status> {
         let Some(want) = &self.admin_token else {
             return Ok(());
         };
-        match auth::bearer(meta) {
+        match bearer {
             Some(t) if auth::matches(t, want) => Ok(()),
             _ => Err(Status::permission_denied(
                 "this call needs the admin token (--admin-token on the daemon)",

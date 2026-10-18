@@ -243,7 +243,8 @@ chrond --data-dir DIR --listen 0.0.0.0:4242 [--no-fsync] [--verify-all-segments]
        [--backup-dir DIR]
        [--max-message-bytes N] [--request-timeout SECS] [--concurrency-per-connection N]
        [--keepalive-interval SECS] [--keepalive-timeout SECS]
-       [--metrics-listen 127.0.0.1:9100] [--log-format text|json] [--discover-interval SECS]
+       [--metrics-listen 127.0.0.1:9100] [--http-listen 127.0.0.1:8080]
+       [--log-format text|json] [--discover-interval SECS]
        [--replicate-from http://leader:4242 [--replicate-token SECRET | --replicate-token-file FILE]
         [--replicate-ca ca.pem] [--replicate-cert c.pem --replicate-key c.key] [--replicate-domain NAME]]
        [--promote]
@@ -254,7 +255,8 @@ Flags fall back to environment variables: `CHRON_DATA_DIR`,
 `CHRON_TOKEN_FILE`, `CHROND_ADMIN_TOKEN`, `CHROND_ADMIN_TOKEN_FILE`,
 `CHROND_BACKUP_DIR`, `CHROND_MAX_MESSAGE_BYTES`, `CHROND_REQUEST_TIMEOUT`,
 `CHROND_KEEPALIVE_INTERVAL`, `CHROND_KEEPALIVE_TIMEOUT`,
-`CHROND_METRICS_LISTEN`, `CHROND_LOG_FORMAT`, `CHROND_DISCOVER_INTERVAL`,
+`CHROND_METRICS_LISTEN`, `CHROND_HTTP_LISTEN`, `CHROND_LOG_FORMAT`,
+`CHROND_DISCOVER_INTERVAL`,
 `CHRON_REPLICATE_FROM`, `CHRON_REPLICATE_TOKEN`, `CHRON_REPLICATE_TOKEN_FILE`,
 `CHROND_REPLICATE_CA` / `_CERT` / `_KEY` / `_DOMAIN`. Logging follows
 `CHROND_LOG` (an `EnvFilter`, default `info`) on stderr, one line per call
@@ -306,6 +308,62 @@ keepalives run every 30 s; `--request-timeout` bounds a call's response
 head (streams keep running) and is off by default. Finite reads are paged
 off the blocking pool and streamed under back-pressure, so stalled
 clients hold no thread.
+
+### The HTTP gateway
+
+`--http-listen ADDR` serves the same database over HTTP/1.1 and JSON for
+clients without gRPC (curl, browsers, scripts). The shapes are the CLI's
+`--json` shapes, so what `chron read --json` prints is what the gateway
+returns. The document at `/openapi.json` (OpenAPI 3.1) lists every route;
+a unit test keeps it equal to the router.
+
+```
+POST   /v1/db/{db}/commit?epoch=N            {"appends":[{"aggregate":UUID|"free","expect":"any"|"new"|N,
+                                              "events":[{"payload":..,"metadata":..,"tags":[..]}]}]}
+GET    /v1/db/{db}/events?from&limit&backward
+GET    /v1/db/{db}/aggregates/{uuid}/events?from&limit&backward
+GET    /v1/db/{db}/aggregates/{uuid}/len
+GET    /v1/db/{db}/tags/{tag}/events?from&limit&backward
+GET    /v1/db/{db}/head                      {"head":N}
+GET    /v1/db/{db}/info
+GET    /v1/db/{db}/tail?from&tag             text/event-stream
+POST   /v1/db/{db}/flush                     204
+POST   /v1/db/{db}/retain                    {"floor":N}            (admin)
+GET    /v1/databases
+POST   /v1/databases                         {"name":".."}  201     (admin)
+DELETE /v1/databases/{name}                  204                    (admin)
+GET    /v1/status
+GET    /openapi.json, GET /                  (no token)
+```
+
+```sh
+curl -s -XPOST localhost:8080/v1/db/default/commit -H 'authorization: Bearer S' \
+  -d '{"appends":[{"aggregate":"free","events":[{"payload":"hello"}]}]}'
+curl -s 'localhost:8080/v1/db/default/events?from=0&limit=10' -H 'authorization: Bearer S'
+curl -sN 'localhost:8080/v1/db/default/tail?from=0' -H 'authorization: Bearer S'
+```
+
+Reads return `{"events":[..],"next":POSITION|null}`; `limit` is at most
+4096 and defaults to 256; `next` is `null` once the log is exhausted.
+Binary payloads, metadata and tags come back as `payload_base64` and
+friends, and may be sent that way. `tail` is server-sent events: one
+`data:` line of JSON per event, a `: heartbeat` comment every 15 s, and
+a final `event: error` when the database is dropped, the node fenced or
+the daemon stops. Errors are `{"error","code",...}` with the gRPC code's
+name (`FailedPrecondition`, `OutOfRange`, …) and the same metadata as
+the gRPC call (`actual_length`, `aggregate`, `epoch`, `position`,
+`head`, `floor`), as HTTP 400, 401, 403, 404, 409 (a failed expectation
+or an existing database), 413, 416, 503 or 500.
+
+The gateway shares the daemon's tokens and TLS: with `--token` every
+`/v1` route needs `authorization: Bearer <token>`, the admin routes the
+admin token, and with `--tls-cert` the gateway is HTTPS (a client CA is
+enforced there too). Bodies are bounded by `--max-message-bytes`,
+a response's head by `--request-timeout` (408; a `tail` stream keeps
+running once it has started), and
+`chron_http_requests_total{route,status}` counts the calls. Off by
+default; on a non-loopback address without a token or TLS the daemon
+warns.
 
 ## The CLI
 

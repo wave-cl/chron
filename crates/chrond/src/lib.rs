@@ -5,10 +5,13 @@
 
 mod auth;
 mod codec;
+mod http;
+mod http_json;
 pub mod logging;
 pub mod metrics;
 mod metrics_http;
 pub mod node;
+mod ops;
 mod replica;
 mod rpc_metrics;
 mod service;
@@ -90,6 +93,9 @@ pub struct Options {
     /// Serve Prometheus metrics at `GET /metrics` on this address (plain
     /// HTTP/1, no token, no TLS: keep it private). Off when `None`.
     pub metrics_listen: Option<SocketAddr>,
+    /// Serve the HTTP/JSON gateway on this address, with the same tokens
+    /// and TLS as `listen`. Off when `None`.
+    pub http_listen: Option<SocketAddr>,
 }
 
 /// PEM bytes for the server's certificate chain and key, and optionally
@@ -135,6 +141,7 @@ impl Options {
             keepalive_timeout: Duration::from_secs(10),
             discover_interval: Duration::from_secs(10),
             metrics_listen: None,
+            http_listen: None,
         }
     }
 }
@@ -145,6 +152,9 @@ pub struct Running {
     pub local_addr: SocketAddr,
     /// Where `/metrics` is served, when `Options::metrics_listen` was set.
     pub metrics_addr: Option<SocketAddr>,
+    /// Where the HTTP/JSON gateway is served, when `Options::http_listen`
+    /// was set.
+    pub http_addr: Option<SocketAddr>,
     /// The `default` database; tests commit through it directly.
     pub db: Db,
     pub node: Arc<Node>,
@@ -152,6 +162,7 @@ pub struct Running {
     cancel: CancellationToken,
     server: JoinHandle<Result<(), tonic::transport::Error>>,
     metrics_server: Option<JoinHandle<()>>,
+    http_server: Option<JoinHandle<()>>,
 }
 
 /// Opens (and recovers) every database under `data_dir`, settles the
@@ -245,17 +256,42 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         .with_context(|| format!("cannot listen on {}", opts.listen))?;
     let local_addr = listener.local_addr()?;
     let n = opts.max_message_bytes;
+    let bearer = auth::BearerAuth::new(
+        &[opts.token.as_deref(), opts.admin_token.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+    );
     let svc = InterceptedService::new(
         ChronServer::new(service::ChronService::new(node.clone()))
             .max_decoding_message_size(n)
             .max_encoding_message_size(n),
-        auth::BearerAuth::new(
-            &[opts.token.as_deref(), opts.admin_token.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>(),
-        ),
+        bearer.clone(),
     );
+    let (http_addr, http_server) = match opts.http_listen {
+        Some(addr) => {
+            if !addr.ip().is_loopback() && opts.token.is_none() && opts.tls.is_none() {
+                tracing::warn!(%addr, "the HTTP gateway listens beyond loopback with no token and no TLS");
+            }
+            let tls = match &opts.tls {
+                Some(t) => Some(http::rustls_config(t).context("http tls")?),
+                None => None,
+            };
+            let l = TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("cannot listen on {addr} for the HTTP gateway"))?;
+            let local = l.local_addr()?;
+            let router = http::router(
+                node.clone(),
+                metrics.clone(),
+                bearer.clone(),
+                opts.request_timeout,
+            );
+            let task = tokio::spawn(http::serve(l, router, tls, cancel.clone()));
+            (Some(local), Some(task))
+        }
+        None => (None, None),
+    };
     let (health, health_svc) = tonic_health::server::health_reporter();
     health
         .set_serving::<ChronServer<service::ChronService>>()
@@ -300,16 +336,18 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown),
     );
     let names: Vec<String> = node.databases().iter().map(|d| d.name.clone()).collect();
-    tracing::info!(%local_addr, metrics = ?metrics_addr, data_dir = %opts.data_dir.display(), databases = %names.join(","), head = db.head(), role = ?node.role(), epoch = db.epoch(), "listening");
+    tracing::info!(%local_addr, metrics = ?metrics_addr, http = ?http_addr, data_dir = %opts.data_dir.display(), databases = %names.join(","), head = db.head(), role = ?node.role(), epoch = db.epoch(), "listening");
     Ok(Running {
         local_addr,
         metrics_addr,
+        http_addr,
         db,
         node,
         health,
         cancel,
         server,
         metrics_server,
+        http_server,
     })
 }
 
@@ -575,6 +613,9 @@ impl Running {
         };
         if let Some(m) = self.metrics_server {
             let _ = tokio::time::timeout(Duration::from_secs(5), m).await;
+        }
+        if let Some(h) = self.http_server {
+            let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
         }
         let mut flushed = Ok(());
         for dbn in self.node.databases() {

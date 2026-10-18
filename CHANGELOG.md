@@ -6,6 +6,13 @@ crates share one version.
 
 ## Unreleased
 
+### chrond
+
+- An HTTP/JSON gateway on `--http-listen` (`CHROND_HTTP_LISTEN`): the
+  CLI's JSON shapes over HTTP/1.1, `tail` as server-sent events,
+  `/openapi.json`, the daemon's tokens and TLS, errors with the gRPC
+  code's name and metadata, `chron_http_requests_total{route,status}`.
+
 ### chron-cli
 
 - `chron append` takes several `-d` payloads (one event each, one

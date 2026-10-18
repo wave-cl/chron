@@ -112,6 +112,10 @@ struct Cli {
     /// HTTP, no token: keep it on a private interface).
     #[arg(long, env = "CHROND_METRICS_LISTEN")]
     metrics_listen: Option<SocketAddr>,
+    /// Serve the HTTP/JSON gateway (same token and TLS as --listen) on
+    /// this address; see /openapi.json there.
+    #[arg(long, env = "CHROND_HTTP_LISTEN")]
+    http_listen: Option<SocketAddr>,
     /// Log lines as human text or one JSON object per line.
     #[arg(long, env = "CHROND_LOG_FORMAT", value_enum, default_value_t = chrond::logging::LogFormat::Text)]
     log_format: chrond::logging::LogFormat,
@@ -178,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
     opts.keepalive_timeout = std::time::Duration::from_secs(cli.keepalive_timeout);
     opts.discover_interval = std::time::Duration::from_secs(cli.discover_interval.max(1));
     opts.metrics_listen = cli.metrics_listen;
+    opts.http_listen = cli.http_listen;
     opts.max_message_bytes = cli.max_message_bytes;
     opts.request_timeout = cli.request_timeout.map(std::time::Duration::from_secs);
     opts.concurrency_per_connection = cli.concurrency_per_connection;

@@ -3,6 +3,7 @@ mod common;
 mod bin;
 mod commit;
 mod databases;
+mod http;
 mod lifecycle;
 mod metrics;
 mod reads;

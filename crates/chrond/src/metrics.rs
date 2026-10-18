@@ -106,6 +106,7 @@ pub struct Metrics {
     pub commit_duration: HistogramVec,
     pub replication_errors: IntCounterVec,
     pub chunks_applied: IntCounterVec,
+    pub http_requests: IntCounterVec,
     start_time: IntGauge,
 }
 
@@ -163,6 +164,11 @@ impl Metrics {
             "replication chunks applied by a replica",
             &["db"],
         );
+        let http_requests = counter(
+            "chron_http_requests_total",
+            "HTTP gateway requests by route and status",
+            &["route", "status"],
+        );
         let build_info = gauge("chron_build_info", "chrond version", &["version"]);
         build_info
             .with_label_values(&[env!("CARGO_PKG_VERSION")])
@@ -186,6 +192,7 @@ impl Metrics {
             Box::new(commit_duration.clone()),
             Box::new(replication_errors.clone()),
             Box::new(chunks_applied.clone()),
+            Box::new(http_requests.clone()),
             Box::new(build_info),
             Box::new(start_time.clone()),
         ] {
@@ -200,6 +207,7 @@ impl Metrics {
             commit_duration,
             replication_errors,
             chunks_applied,
+            http_requests,
             start_time,
         })
     }

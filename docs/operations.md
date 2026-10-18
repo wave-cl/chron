@@ -85,6 +85,7 @@ PromQL:
 - Mean fsync: `rate(chron_fsync_seconds_total[5m]) / rate(chron_fsyncs_total[5m])`
 - Error ratio by code: `sum by (code) (rate(chron_rpc_calls_total{code!="OK"}[5m]))`
 - Group commit effectiveness: `rate(chron_transactions_committed_total[5m]) / rate(chron_commit_batches_total[5m])`
+- Gateway error ratio: `sum by (route, status) (rate(chron_http_requests_total{status=~"5.."}[5m]))`
 
 Alerts worth having:
 

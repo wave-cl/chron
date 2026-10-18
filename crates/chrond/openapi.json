@@ -1,0 +1,1111 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "chron HTTP gateway",
+    "version": "0.2.0",
+    "description": "JSON over HTTP/1.1 for clients without gRPC. Every /v1 route needs `Authorization: Bearer <token>` when the daemon has a token; admin routes need the admin token. Positions are unsigned 64-bit integers."
+  },
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "NewEvent": {
+        "type": "object",
+        "properties": {
+          "payload": {
+            "type": "string"
+          },
+          "payload_base64": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tags_base64": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "metadata": {
+            "type": "string"
+          },
+          "metadata_base64": {
+            "type": "string"
+          }
+        }
+      },
+      "Append": {
+        "type": "object",
+        "required": [
+          "events"
+        ],
+        "properties": {
+          "aggregate": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "a UUID, \"free\" or absent for free events"
+          },
+          "expect": {
+            "description": "\"any\", \"new\", or the exact length",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ]
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NewEvent"
+            }
+          }
+        }
+      },
+      "Transaction": {
+        "type": "object",
+        "required": [
+          "appends"
+        ],
+        "properties": {
+          "appends": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Append"
+            }
+          }
+        }
+      },
+      "Event": {
+        "type": "object",
+        "properties": {
+          "position": {
+            "type": "integer"
+          },
+          "aggregate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "index": {
+            "type": "integer"
+          },
+          "recorded_at_unix_nanos": {
+            "type": "integer"
+          },
+          "first_in_txn": {
+            "type": "boolean"
+          },
+          "last_in_txn": {
+            "type": "boolean"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tags_base64": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "metadata": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata_base64": {
+            "type": "string"
+          },
+          "payload": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "payload_base64": {
+            "type": "string"
+          }
+        }
+      },
+      "Page": {
+        "type": "object",
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Event"
+            }
+          },
+          "next": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "where the next page starts; null when this page was empty or the read is exhausted backward"
+          }
+        }
+      },
+      "Committed": {
+        "type": "object",
+        "properties": {
+          "first": {
+            "type": "integer"
+          },
+          "last": {
+            "type": "integer"
+          },
+          "next": {
+            "type": "integer"
+          },
+          "appends": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "aggregate": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "first_position": {
+                  "type": "integer"
+                },
+                "first_index": {
+                  "type": "integer"
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "new_len": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Info": {
+        "type": "object",
+        "properties": {
+          "database": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "db_id": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "leader",
+              "replica",
+              "fenced",
+              "unknown"
+            ]
+          },
+          "epoch": {
+            "type": "integer"
+          },
+          "head": {
+            "type": "integer"
+          },
+          "floor": {
+            "type": "integer"
+          },
+          "segments": {
+            "type": "integer"
+          },
+          "bytes": {
+            "type": "integer"
+          },
+          "fsync": {
+            "type": "string",
+            "enum": [
+              "always",
+              "never"
+            ]
+          },
+          "options": {
+            "type": "object"
+          },
+          "replicating_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replica_connected": {
+            "type": "boolean"
+          },
+          "leader_head": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_replication_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fenced_by": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        }
+      },
+      "DatabaseInfo": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "head": {
+            "type": "integer"
+          },
+          "floor": {
+            "type": "integer"
+          },
+          "epoch": {
+            "type": "integer"
+          },
+          "db_id": {
+            "type": "string"
+          }
+        }
+      },
+      "Retained": {
+        "type": "object",
+        "properties": {
+          "floor": {
+            "type": "integer"
+          },
+          "segments_removed": {
+            "type": "integer"
+          },
+          "bytes_freed": {
+            "type": "integer"
+          }
+        }
+      },
+      "Status": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string"
+          },
+          "epoch": {
+            "type": "integer"
+          },
+          "head": {
+            "type": "integer"
+          },
+          "fenced_by": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "replicating_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "databases": {
+            "type": "integer"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "error",
+          "code"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "description": "the gRPC code's name: InvalidArgument (400), Unauthenticated (401), PermissionDenied (403), NotFound (404), AlreadyExists or FailedPrecondition (409), ResourceExhausted (413), OutOfRange (416), Unavailable (503), Internal (500)"
+          },
+          "actual_length": {
+            "type": "integer"
+          },
+          "aggregate": {
+            "type": "string"
+          },
+          "epoch": {
+            "type": "integer"
+          },
+          "position": {
+            "type": "integer"
+          },
+          "floor": {
+            "type": "integer"
+          },
+          "head": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    {
+      "bearer": []
+    }
+  ],
+  "paths": {
+    "/v1/db/{db}/commit": {
+      "post": {
+        "summary": "Commit a transaction",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Committed"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database name",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "epoch",
+            "in": "query",
+            "required": false,
+            "description": "a fencing token: the epoch the daemon must be at",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Transaction"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/db/{db}/events": {
+      "get": {
+        "summary": "Events in global order from a position",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database name",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "description": "first position or index (backward: the inclusive upper bound; default 0, or the end backward)",
+            "schema": {
+              "type": "integer",
+              "format": "uint64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "at most this many events (1..4096, default 256)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "backward",
+            "in": "query",
+            "required": false,
+            "description": "newest first",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/db/{db}/aggregates/{uuid}/events": {
+      "get": {
+        "summary": "An aggregate's events from an index",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database name",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "uuid",
+            "in": "path",
+            "required": true,
+            "description": "the aggregate",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "description": "first position or index (backward: the inclusive upper bound; default 0, or the end backward)",
+            "schema": {
+              "type": "integer",
+              "format": "uint64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "at most this many events (1..4096, default 256)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "backward",
+            "in": "query",
+            "required": false,
+            "description": "newest first",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/db/{db}/aggregates/{uuid}/len": {
+      "get": {
+        "summary": "How many events an aggregate has",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "len": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database name",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "uuid",
+            "in": "path",
+            "required": true,
+            "description": "the aggregate",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/db/{db}/tags/{tag}/events": {
+      "get": {
+        "summary": "Events carrying a tag (UTF-8 tags only)",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database name",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "tag",
+            "in": "path",
+            "required": true,
+            "description": "the tag",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "description": "first position or index (backward: the inclusive upper bound; default 0, or the end backward)",
+            "schema": {
+              "type": "integer",
+              "format": "uint64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "at most this many events (1..4096, default 256)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "backward",
+            "in": "query",
+            "required": false,
+            "description": "newest first",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/db/{db}/head": {
+      "get": {
+        "summary": "The next global position",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "head": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database name",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/db/{db}/info": {
+      "get": {
+        "summary": "What the daemon reports about the database",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Info"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database name",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/db/{db}/tail": {
+      "get": {
+        "summary": "Committed events from a position, then live ones, as server-sent events",
+        "responses": {
+          "200": {
+            "description": "server-sent events: `data:` holds an Event; a final `event: error` carries an Error",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database name",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "description": "start position (default 0)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "tag",
+            "in": "query",
+            "required": false,
+            "description": "only events carrying this tag",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/db/{db}/flush": {
+      "post": {
+        "summary": "Sync everything committed so far",
+        "responses": {
+          "204": {
+            "description": "done"
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database name",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/db/{db}/retain": {
+      "post": {
+        "summary": "Drop whole segments below a position",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Retained"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database name",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "floor"
+                ],
+                "properties": {
+                  "floor": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "description": "Needs the admin token when the daemon has one."
+      }
+    },
+    "/v1/databases": {
+      "get": {
+        "summary": "Every database",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "databases": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/DatabaseInfo"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "description": "Needs the admin token when the daemon has one."
+      },
+      "post": {
+        "summary": "Create an empty database (on the leader)",
+        "responses": {
+          "201": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatabaseInfo"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "description": "Needs the admin token when the daemon has one."
+      }
+    },
+    "/v1/databases/{name}": {
+      "delete": {
+        "summary": "Drop a database and its data (on the leader; never default)",
+        "responses": {
+          "204": {
+            "description": "done"
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "the database",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "description": "Needs the admin token when the daemon has one."
+      }
+    },
+    "/v1/status": {
+      "get": {
+        "summary": "The daemon's role, epoch and head",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "This document",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/": {
+      "get": {
+        "summary": "A pointer to /openapi.json",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
