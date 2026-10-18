@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       # cargo resolves rust-toolchain.toml (1.98.0, clippy, rustfmt) itself;
       # the version is printed so a green run shows what it checked with.
@@ -27,5 +28,9 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo nextest run --workspace --no-fail-fast
+      # The library on its own: a workspace build unifies the daemon's
+      # `chron/tokio` onto it, so only a package-scoped build proves the
+      # feature-less library compiles.
+      - run: cargo clippy -p chron --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo nextest run --workspace --all-features --no-fail-fast

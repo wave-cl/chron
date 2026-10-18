@@ -1,29 +1,43 @@
-[package]
-name = "chron"
+[workspace]
+resolver = "2"
+members = ["crates/chron"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/wave-cl/chron"
-description = "Embeddable event-sourcing log: append-only segments + redb indexes, multi-aggregate atomic transactions, tags"
 
-[dependencies]
+[workspace.dependencies]
+chron = { path = "crates/chron" }
+chron-proto = { path = "crates/chron-proto" }
+chrond = { path = "crates/chrond" }
+
 redb = "4"
 uuid = "1"
 bytes = "1"
 crc32fast = "1"
 thiserror = "2"
-
-[dev-dependencies]
+anyhow = "1"
+# No features here on purpose: `workspace = true` can only add features,
+# and the library must pull in nothing beyond `sync`.
+tokio = "1"
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = "0.7"
+futures = "0.3"
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tonic-prost-build = "0.14"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proptest = "1"
 tempfile = "3"
-crc32fast = "1"
-uuid = { version = "1", features = ["v4"] }
+assert_cmd = "2"
+predicates = "3"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
-
-[[test]]
-name = "suite"
-path = "tests/suite/main.rs"
-
-[[bench]]
-name = "chron"
-harness = false

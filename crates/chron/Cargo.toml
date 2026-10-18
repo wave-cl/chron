@@ -1,0 +1,29 @@
+[package]
+name = "chron"
+description = "Embeddable event-sourcing log: append-only segments + redb indexes, multi-aggregate atomic transactions, tags"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+redb = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+crc32fast = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+crc32fast = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+criterion = { workspace = true }
+
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"
+
+[[bench]]
+name = "chron"
+harness = false
