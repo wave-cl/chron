@@ -38,12 +38,17 @@ const FIXED_LEN: usize = 1 + 1 + 8 + 16 + 8 + 8 + 1;
 /// An event to append.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NewEvent {
+    /// Tags the event is indexed under. Stored sorted and without
+    /// duplicates, whatever order they were given in.
     pub tags: Vec<Bytes>,
+    /// Opaque bytes beside the payload; empty when absent.
     pub metadata: Bytes,
+    /// The event itself, opaque to the database.
     pub payload: Bytes,
 }
 
 impl NewEvent {
+    /// An event with this payload, no tags and no metadata.
     pub fn new(payload: impl Into<Bytes>) -> Self {
         NewEvent {
             tags: Vec::new(),
@@ -52,7 +57,8 @@ impl NewEvent {
         }
     }
 
-    /// Adds one tag.
+    /// Adds one tag. Tags are stored sorted and deduplicated, so the order
+    /// given here is not kept and a repeated tag counts once.
     pub fn tag(mut self, tag: impl Into<Bytes>) -> Self {
         self.tags.push(tag.into());
         self
@@ -64,6 +70,7 @@ impl NewEvent {
         self
     }
 
+    /// Sets the metadata.
     pub fn metadata(mut self, metadata: impl Into<Bytes>) -> Self {
         self.metadata = metadata.into();
         self
@@ -82,17 +89,24 @@ pub struct Event {
     /// Unix nanoseconds when the transaction was committed; the same for
     /// every event of one transaction.
     pub recorded_at: i64,
+    /// Transaction-boundary and free-event flags: [`FLAG_FIRST_IN_TXN`],
+    /// [`FLAG_LAST_IN_TXN`], [`FLAG_FREE`].
     pub flags: u8,
+    /// The tags the event carries, sorted, without duplicates.
     pub tags: Vec<Bytes>,
+    /// Opaque bytes beside the payload; empty when none were given.
     pub metadata: Bytes,
+    /// The event itself.
     pub payload: Bytes,
 }
 
 impl Event {
+    /// Whether this event began its transaction.
     pub fn is_first_in_txn(&self) -> bool {
         self.flags & FLAG_FIRST_IN_TXN != 0
     }
 
+    /// Whether this event ended its transaction.
     pub fn is_last_in_txn(&self) -> bool {
         self.flags & FLAG_LAST_IN_TXN != 0
     }
@@ -102,6 +116,7 @@ impl Event {
         self.aggregate.is_none()
     }
 
+    /// Whether the event carries `tag`.
     pub fn has_tag(&self, tag: &[u8]) -> bool {
         self.tags.iter().any(|t| t.as_ref() == tag)
     }

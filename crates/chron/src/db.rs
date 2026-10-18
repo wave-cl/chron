@@ -176,6 +176,7 @@ impl Db {
         })
     }
 
+    /// The directory the database lives in.
     pub fn path(&self) -> &Path {
         self.inner.layout.root()
     }

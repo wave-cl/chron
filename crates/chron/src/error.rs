@@ -15,9 +15,12 @@ pub enum Error {
     /// `fdatasync`, ...) so the message says what the database was doing.
     #[error("io error during {op} on {path}: {source}")]
     Io {
+        /// The file or directory involved.
         path: PathBuf,
+        /// The call that failed (`open`, `write`, `fdatasync`, ...).
         op: &'static str,
         #[source]
+        /// The underlying error.
         source: std::io::Error,
     },
 
@@ -26,21 +29,30 @@ pub enum Error {
     /// segment files do not contain).
     #[error("corrupt database: {path} at offset {offset}: {reason}")]
     Corrupt {
+        /// The file or directory involved.
         path: PathBuf,
+        /// Byte offset in `path` where the problem was found.
         offset: u64,
+        /// What was found.
         reason: String,
     },
 
     /// Another process (or another `Db` in this process) holds `LOCK`.
     #[error("database at {path} is locked by another writer")]
-    Locked { path: PathBuf },
+    Locked {
+        /// The locked directory's `LOCK` file.
+        path: PathBuf,
+    },
 
     /// An append's expectation about the aggregate's length did not hold.
     /// The whole transaction was refused; nothing was written.
     #[error("aggregate {aggregate} has {actual} events, append expected {expected:?}")]
     ExpectedLength {
+        /// The aggregate the append named.
         aggregate: Uuid,
+        /// What the append expected.
         expected: Expected,
+        /// How many events the aggregate has.
         actual: u64,
     },
 
@@ -51,52 +63,90 @@ pub enum Error {
     /// An append in the transaction carried no events. `aggregate` is
     /// `None` for a free append.
     #[error("append to {} has no events", aggregate.map_or("no aggregate".to_string(), |a| format!("aggregate {a}")))]
-    EmptyAppend { aggregate: Option<Uuid> },
+    EmptyAppend {
+        /// The aggregate, or `None` for a free append.
+        aggregate: Option<Uuid>,
+    },
 
-    /// One event's frame and body exceed `Options::max_record_bytes`.
+    /// One event's frame and body exceed `Options::max_record_bytes`, or
+    /// the 4 GiB a frame can describe.
     #[error("record of {size} bytes exceeds the maximum of {max}")]
-    RecordTooLarge { size: usize, max: usize },
+    RecordTooLarge {
+        /// The record's frame plus body, in bytes.
+        size: usize,
+        /// The configured limit.
+        max: usize,
+    },
 
-    /// A tag longer than 255 bytes, or more than 255 tags on one event.
+    /// A tag longer than 255 bytes, or more than 255 tags on one event
+    /// (counted before duplicates are dropped).
     #[error("invalid tag: {0}")]
     InvalidTag(String),
 
-    /// A read from a global position past the head.
+    /// A global position past the head: from a read, a subscription's
+    /// catch-up, `retain_from`, `backup_since` or `replication_chunk`.
     #[error("position {position} is past the head {head}")]
-    PositionOutOfRange { position: u64, head: u64 },
+    PositionOutOfRange {
+        /// The position asked for.
+        position: u64,
+        /// The head at the time.
+        head: u64,
+    },
 
-    /// A read, backup or subscription from a position below the retention
-    /// floor: its segment was dropped.
+    /// A position below the retention floor, whose segment was dropped:
+    /// from a read, a subscription, `backup_since` or `replication_chunk`.
     #[error("position {position} is below the floor {floor}")]
-    BelowFloor { position: u64, floor: u64 },
+    BelowFloor {
+        /// The position asked for.
+        position: u64,
+        /// The floor at the time.
+        floor: u64,
+    },
 
     /// `restore_backup` was given a directory that already exists.
     #[error("{path} already exists")]
-    AlreadyExists { path: PathBuf },
+    AlreadyExists {
+        /// The directory that exists.
+        path: PathBuf,
+    },
 
     /// An incremental backup applies onto `base_head`, but the database is
     /// at `head`.
     #[error("{archive} applies onto head {base_head} but the database is at head {head}")]
     WrongBaseHead {
+        /// The archive.
         archive: PathBuf,
+        /// The head the archive applies onto.
         base_head: u64,
+        /// The head at the time.
         head: u64,
     },
 
     /// `adopt_id` on a database that already holds events.
     #[error("the database is not empty (head {head}); only an empty one can adopt an identity")]
-    NotEmpty { head: u64 },
+    NotEmpty {
+        /// The database's head.
+        head: u64,
+    },
 
     /// A replication chunk that does not start at the head.
     #[error("replication chunk starts at {from} but the head is {head}")]
-    ReplicationGap { from: u64, head: u64 },
+    ReplicationGap {
+        /// Where the chunk starts.
+        from: u64,
+        /// The head it would have had to start at.
+        head: u64,
+    },
 
     /// Data from another database: a backup or chunk whose identity is
     /// not this database's.
     #[error("{what} is from database {theirs}; this is database {ours}")]
     WrongDatabase {
+        /// The archive or stream that carried the other identity.
         what: String,
+        /// The identity it carried.
         theirs: Uuid,
+        /// This database's identity.
         ours: Uuid,
     },
 
@@ -104,18 +154,30 @@ pub enum Error {
     /// given a full one.
     #[error("{archive} is a {kind:?} backup; a {} one was needed", match kind { crate::BackupKind::Full => "incremental", crate::BackupKind::Incremental => "full" })]
     WrongBackupKind {
+        /// The archive.
         archive: PathBuf,
+        /// What the archive is.
         kind: crate::BackupKind,
     },
 
     /// The index and the data disagree about a position: the index lists
     /// it but the record at the place it names says otherwise.
     #[error("position {position}: {reason}")]
-    Inconsistent { position: u64, reason: String },
+    Inconsistent {
+        /// The position the index and the data disagree about.
+        position: u64,
+        /// How they disagree.
+        reason: String,
+    },
 
     /// `set_epoch` below the current epoch.
     #[error("epoch {epoch} is below the current epoch {current}")]
-    EpochNotNewer { epoch: u64, current: u64 },
+    EpochNotNewer {
+        /// The epoch asked for.
+        epoch: u64,
+        /// The epoch in force.
+        current: u64,
+    },
 
     /// The redb index failed.
     #[error("index: {0}")]

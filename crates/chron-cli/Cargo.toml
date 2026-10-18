@@ -10,6 +10,8 @@ repository.workspace = true
 [[bin]]
 name = "chron"
 path = "src/main.rs"
+# The binary shares the library's name; only the library is documented.
+doc = false
 
 [dependencies]
 chron = { workspace = true }

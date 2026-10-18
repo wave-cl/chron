@@ -45,15 +45,19 @@ const COPY_CHUNK: usize = 1 << 20;
 #[non_exhaustive]
 pub enum BackupKind {
     #[default]
+    /// A snapshot to restore into a new directory.
     Full,
+    /// A range of events to apply onto a database at the archive's base head.
     Incremental,
 }
 
 /// What an archive holds; written in its header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupMeta {
+    /// The archive format version.
     pub format: u32,
     #[serde(default)]
+    /// Full or incremental.
     pub kind: BackupKind,
     /// Incremental only: the head the target must be at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,7 +66,9 @@ pub struct BackupMeta {
     /// head) is in the archive.
     pub head: u64,
     #[serde(default)]
+    /// The retention floor at the time: nothing below it is in the archive.
     pub floor: u64,
+    /// When the archive was written.
     pub created_at_unix_nanos: i64,
     /// Entries in the archive.
     #[serde(default)]

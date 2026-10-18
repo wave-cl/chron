@@ -17,7 +17,9 @@ use crate::segment;
 pub struct Retained {
     /// The floor now in force: the base of the first kept segment.
     pub floor: u64,
+    /// Segment files deleted by this call.
     pub segments_removed: usize,
+    /// Bytes those files took.
     pub bytes_freed: u64,
 }
 

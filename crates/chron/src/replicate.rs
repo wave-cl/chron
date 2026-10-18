@@ -13,8 +13,11 @@ use crate::txn;
 /// Positions `from..to` as back-to-back frames; `to` ends a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
+    /// The first position in the chunk.
     pub from: u64,
+    /// One past the last position: a transaction boundary.
     pub to: u64,
+    /// The records exactly as the segments hold them.
     pub frames: Vec<u8>,
 }
 

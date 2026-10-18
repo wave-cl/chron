@@ -69,6 +69,7 @@ impl Transaction {
         }
     }
 
+    /// Appends `events` to `aggregate`, checked against `expected` at commit.
     pub fn append(
         &mut self,
         aggregate: Uuid,
@@ -95,6 +96,7 @@ impl Transaction {
         self
     }
 
+    /// Appends one event to `aggregate`.
     pub fn append_one(
         &mut self,
         aggregate: Uuid,
@@ -104,7 +106,7 @@ impl Transaction {
         self.append(aggregate, expected, vec![event])
     }
 
-    /// True when no `append` was called.
+    /// True when neither `append` nor `append_free` was called.
     pub fn is_empty(&self) -> bool {
         self.appends.is_empty()
     }
@@ -143,6 +145,7 @@ pub struct AppendResult {
     /// Index within the aggregate of the append's first event; 0 for a
     /// free append.
     pub first_index: u64,
+    /// Events appended.
     pub count: u64,
     /// The aggregate's length after this append; 0 for a free append.
     pub new_len: u64,

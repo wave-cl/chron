@@ -22,6 +22,7 @@ pub struct Options {
     pub segment_max_bytes: u64,
     /// Largest frame plus body of one event.
     pub max_record_bytes: usize,
+    /// When commits reach the disk.
     pub fsync: Fsync,
     /// Read every segment on open, checking each record's crc, that
     /// positions run consecutively across segments, and that the index
@@ -42,25 +43,31 @@ impl Default for Options {
 }
 
 impl Options {
+    /// The defaults: 256 MiB segments, 16 MiB records, [`Fsync::Always`],
+    /// no verification on open.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the segment size at which the writer rolls.
     pub fn segment_max_bytes(mut self, bytes: u64) -> Self {
         self.segment_max_bytes = bytes;
         self
     }
 
+    /// Sets the largest frame plus body of one event.
     pub fn max_record_bytes(mut self, bytes: usize) -> Self {
         self.max_record_bytes = bytes;
         self
     }
 
+    /// Sets when commits reach the disk.
     pub fn fsync(mut self, fsync: Fsync) -> Self {
         self.fsync = fsync;
         self
     }
 
+    /// Sets whether every segment is read and checked on open.
     pub fn verify_all_segments(mut self, verify: bool) -> Self {
         self.verify_all_segments = verify;
         self

@@ -17,6 +17,8 @@
 //! anything in the segment files at or past the committed head was never
 //! acknowledged and is truncated.
 
+#![deny(missing_docs)]
+
 mod backup;
 mod db;
 mod error;

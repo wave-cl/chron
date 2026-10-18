@@ -81,8 +81,8 @@ pub async fn append(conn: &Conn, format: Format, a: AppendArgs) -> anyhow::Resul
 
 #[derive(Args, Debug)]
 pub struct CommitArgs {
-    /// A JSON file: {"appends":[{"aggregate":"<uuid>"|null,"expect":"any"|"new"|<n>,
-    /// "events":[{"payload":"…","tags":["…"],"metadata":"…"}]}]}. `payload_base64`
+    /// A JSON file: `{"appends":[{"aggregate":"UUID"|null,"expect":"any"|"new"|N,
+    /// "events":[{"payload":"…","tags":["…"],"metadata":"…"}]}]}`; `payload_base64`
     /// and `metadata_base64` carry binary values.
     #[arg(short = 'f', long, conflicts_with = "stdin")]
     file: Option<std::path::PathBuf>,
