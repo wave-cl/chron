@@ -1,6 +1,8 @@
-//! The `Chron` service over one [`Db`].
+//! The `Chron` service over one [`Node`].
 
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use chron::{Db, Event, Uuid};
@@ -13,20 +15,33 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
 use crate::codec;
+use crate::node::{Node, Role};
+use crate::replica;
 
 /// Events per page through the library, and the channel depth of a stream.
 const PAGE: usize = 256;
+/// Events per replication chunk.
+const CHUNK: usize = 1024;
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send + 'static>>;
+type ChunkStream =
+    Pin<Box<dyn Stream<Item = Result<pb::ReplicationChunk, Status>> + Send + 'static>>;
 
 pub struct ChronService {
-    db: Db,
-    cancel: CancellationToken,
+    node: Arc<Node>,
 }
 
 impl ChronService {
-    pub fn new(db: Db, cancel: CancellationToken) -> Self {
-        ChronService { db, cancel }
+    pub fn new(node: Arc<Node>) -> Self {
+        ChronService { node }
+    }
+
+    fn db(&self) -> &Db {
+        &self.node.db
+    }
+
+    fn cancel(&self) -> CancellationToken {
+        self.node.cancel.clone()
     }
 
     async fn blocking<T: Send + 'static>(
@@ -34,7 +49,7 @@ impl ChronService {
         op: &'static str,
         f: impl FnOnce(Db) -> chron::Result<T> + Send + 'static,
     ) -> Result<T, Status> {
-        let db = self.db.clone();
+        let db = self.db().clone();
         tokio::task::spawn_blocking(move || f(db))
             .await
             .map_err(|e| codec::join(op, e))?
@@ -132,17 +147,12 @@ impl Chron for ChronService {
         &self,
         req: Request<pb::CommitRequest>,
     ) -> Result<Response<pb::CommitResponse>, Status> {
-        let appends = req.into_inner().appends;
-        let db = self.db.clone();
-        let committed = tokio::task::spawn_blocking(move || -> Result<chron::Committed, Status> {
-            let mut txn = db.transaction();
-            for a in appends {
-                codec::apply_append(&mut txn, a)?;
-            }
-            txn.commit().map_err(codec::status)
-        })
-        .await
-        .map_err(|e| codec::join("commit", e))??;
+        let r = req.into_inner();
+        let node = self.node.clone();
+        let committed =
+            tokio::task::spawn_blocking(move || node.commit_guarded(r.appends, r.epoch))
+                .await
+                .map_err(|e| codec::join("commit", e))??;
         Ok(Response::new(codec::committed(committed)))
     }
 
@@ -159,7 +169,7 @@ impl Chron for ChronService {
             backward: r.backward,
         };
         Ok(Response::new(finite(
-            self.db.clone(),
+            self.db().clone(),
             read,
             r.from_index,
             r.limit,
@@ -176,13 +186,13 @@ impl Chron for ChronService {
         if !r.backward {
             // A bad starting position is the call's status, not the
             // stream's first item.
-            self.db.read_all(r.from, 0).map_err(codec::status)?;
+            self.db().read_all(r.from, 0).map_err(codec::status)?;
         }
         let read = Read::All {
             backward: r.backward,
         };
         Ok(Response::new(finite(
-            self.db.clone(),
+            self.db().clone(),
             read,
             r.from,
             r.limit,
@@ -201,7 +211,7 @@ impl Chron for ChronService {
             backward: r.backward,
         };
         Ok(Response::new(finite(
-            self.db.clone(),
+            self.db().clone(),
             read,
             r.from,
             r.limit,
@@ -224,7 +234,7 @@ impl Chron for ChronService {
         _: Request<pb::HeadRequest>,
     ) -> Result<Response<pb::HeadResponse>, Status> {
         Ok(Response::new(pb::HeadResponse {
-            head: self.db.head(),
+            head: self.db().head(),
         }))
     }
 
@@ -236,12 +246,12 @@ impl Chron for ChronService {
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let r = req.into_inner();
         let mut sub = match r.tag {
-            Some(tag) => self.db.subscribe_tag(tag, r.from),
-            None => self.db.subscribe(r.from),
+            Some(tag) => self.db().subscribe_tag(tag, r.from),
+            None => self.db().subscribe(r.from),
         }
         .batch(PAGE);
         let (tx, rx) = mpsc::channel(PAGE);
-        let cancel = self.cancel.clone();
+        let cancel = self.cancel();
         tokio::spawn(async move {
             loop {
                 let next = tokio::select! {
@@ -277,13 +287,27 @@ impl Chron for ChronService {
         _: Request<pb::InfoRequest>,
     ) -> Result<Response<pb::InfoResponse>, Status> {
         let info = self.blocking("info", |db| db.info()).await?;
+        let node = &self.node;
+        let role = node.role();
+        let replica = node.replica_status();
         Ok(Response::new(pb::InfoResponse {
-            path: self.db.path().display().to_string(),
+            path: self.db().path().display().to_string(),
             head: info.head,
             floor: info.floor,
             segments: info.segments as u64,
             bytes: info.bytes,
-            options: Some(codec::options(self.db.options())),
+            options: Some(codec::options(self.db().options())),
+            db_id: info.db_id.as_bytes().to_vec(),
+            epoch: info.epoch,
+            role: role.wire() as i32,
+            replicating_from: node
+                .replicate_from
+                .clone()
+                .filter(|_| role == Role::Replica),
+            replica_connected: role == Role::Replica && replica.connected,
+            leader_head: replica.leader_head.filter(|_| role == Role::Replica),
+            last_replication_error: replica.last_error.filter(|_| role == Role::Replica),
+            fenced_by: node.fenced_by().filter(|_| role == Role::Fenced),
         }))
     }
 
@@ -305,6 +329,9 @@ impl Chron for ChronService {
         &self,
         req: Request<pb::ApplyBackupRequest>,
     ) -> Result<Response<pb::BackupMeta>, Status> {
+        if let Some(s) = self.node.write_refusal() {
+            return Err(s);
+        }
         let archive = req.into_inner().archive;
         let meta = self
             .blocking("apply_backup", move |db| db.apply_backup(&archive))
@@ -326,4 +353,170 @@ impl Chron for ChronService {
             bytes_freed: r.bytes_freed,
         }))
     }
+
+    type ReplicateStream = ChunkStream;
+
+    async fn replicate(
+        &self,
+        req: Request<pb::ReplicateRequest>,
+    ) -> Result<Response<Self::ReplicateStream>, Status> {
+        if let Some(s) = self.node.write_refusal() {
+            return Err(s);
+        }
+        let r = req.into_inner();
+        let db = self.db().clone();
+        let from = r.from_position;
+        let head = db.head();
+        if from > head {
+            return Err(self.node.refuse(format!(
+                "diverged: the replica is at {from}, this database at {head}; reset the replica from a backup of this database"
+            )));
+        }
+        let floor = db.floor();
+        if from < floor {
+            return Err(Status::out_of_range(format!(
+                "position {from} is below the floor {floor}; restore the replica from a full backup"
+            )));
+        }
+        if let Some(theirs) = r.last_fingerprint
+            && from > 0
+        {
+            let ours = self
+                .blocking("fingerprint", move |db| db.fingerprint(from - 1))
+                .await?;
+            if ours != Some(theirs) {
+                return Err(self.node.refuse(format!(
+                    "diverged: the histories differ before position {from}; reset the replica from a backup of this database"
+                )));
+            }
+        }
+        let (tx, rx) = mpsc::channel(4);
+        let node = self.node.clone();
+        let cancel = self.cancel();
+        tokio::spawn(async move {
+            let mut cursor = from;
+            loop {
+                let db2 = db.clone();
+                let chunk = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tx.closed() => return,
+                    c = tokio::task::spawn_blocking(move || db2.replication_chunk(cursor, CHUNK)) => c,
+                };
+                let chunk = match chunk {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => {
+                        let _ = tx.send(Err(codec::status(e))).await;
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(codec::join("replicate", e))).await;
+                        return;
+                    }
+                };
+                match chunk {
+                    Some(c) => {
+                        let item = pb::ReplicationChunk {
+                            db_id: db.id().as_bytes().to_vec(),
+                            from: c.from,
+                            to: c.to,
+                            frames: c.frames,
+                            head: db.head(),
+                            epoch: db.epoch(),
+                        };
+                        cursor = c.to;
+                        if tx.send(Ok(item)).await.is_err() {
+                            return;
+                        }
+                    }
+                    None => {
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = tx.closed() => return,
+                            _ = db.wait_for_async(cursor + 1) => {}
+                        }
+                        if let Some(s) = node.write_refusal() {
+                            let _ = tx.send(Err(s)).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn promote(
+        &self,
+        _: Request<pb::PromoteRequest>,
+    ) -> Result<Response<pb::PromoteResponse>, Status> {
+        match self.node.role() {
+            Role::Leader => return Err(self.node.refuse("already the leader")),
+            Role::Fenced => {
+                return Err(self
+                    .node
+                    .refuse("fenced; restart it with --replicate-from the new leader"));
+            }
+            Role::Replica => {}
+        }
+        if let Some(p) = self.node.puller.lock().await.take() {
+            p.stop().await;
+        }
+        let node = self.node.clone();
+        let (epoch, head) = tokio::task::spawn_blocking(move || node.promote_locked())
+            .await
+            .map_err(|e| codec::join("promote", e))??;
+        spawn_fencer(self.node.clone(), epoch);
+        Ok(Response::new(pb::PromoteResponse { epoch, head }))
+    }
+
+    async fn fence(
+        &self,
+        req: Request<pb::FenceRequest>,
+    ) -> Result<Response<pb::FenceResponse>, Status> {
+        let by = req.into_inner().epoch;
+        let node = self.node.clone();
+        tokio::task::spawn_blocking(move || node.fence(by))
+            .await
+            .map_err(|e| codec::join("fence", e))??;
+        Ok(Response::new(pb::FenceResponse {
+            epoch: self.db().epoch(),
+        }))
+    }
+}
+
+/// Tells the old leader, with retries, that `epoch` exists. Best effort:
+/// the epoch on Commit is the guarantee, this call is the courtesy.
+fn spawn_fencer(node: Arc<Node>, epoch: u64) {
+    let Some(addr) = node.replicate_from.clone() else {
+        return;
+    };
+    let token = node.replicate_token.clone();
+    let cancel = node.cancel.clone();
+    let handle = tokio::spawn(async move {
+        let mut backoff = Duration::from_millis(200);
+        loop {
+            match replica::connect(&addr, token.as_deref()).await {
+                Ok(mut client) => match client.fence(pb::FenceRequest { epoch }).await {
+                    Ok(_) => {
+                        tracing::info!(%addr, epoch, "old leader fenced");
+                        return;
+                    }
+                    Err(s) if s.code() == tonic::Code::FailedPrecondition => {
+                        tracing::warn!(%addr, epoch, status = %s.message(), "old leader did not take the fence");
+                        return;
+                    }
+                    Err(s) => {
+                        tracing::warn!(%addr, epoch, status = %s.message(), "fence failed; retrying")
+                    }
+                },
+                Err(e) => tracing::warn!(%addr, epoch, error = %e, "fence failed; retrying"),
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(5));
+        }
+    });
+    *node.fencer.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
 }

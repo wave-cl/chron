@@ -202,6 +202,7 @@ pub fn backup_meta_to_wire(m: BackupMeta) -> pb::BackupMeta {
         files: m.files,
         bytes: m.bytes,
         format: m.format,
+        db_id: m.db_id.map(|u| u.as_bytes().to_vec()),
     }
 }
 
@@ -219,7 +220,7 @@ pub fn backup_meta_from_wire(m: pb::BackupMeta) -> BackupMeta {
         created_at_unix_nanos: m.created_at_unix_nanos,
         files: m.files,
         bytes: m.bytes,
-        db_id: None,
+        db_id: m.db_id.as_deref().and_then(|b| aggregate(b).ok()),
     }
 }
 

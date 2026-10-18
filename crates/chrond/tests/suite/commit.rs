@@ -18,6 +18,7 @@ async fn commit_two_aggregates_and_free_events_returns_positions_and_results() {
                 append(None, None, vec![new_event("free", &["t"])]),
                 append(Some(agg(2)), exact(0), vec![new_event("b0", &[])]),
             ],
+            epoch: None,
         })
         .await
         .unwrap()
@@ -61,6 +62,7 @@ async fn conflict_is_failed_precondition_with_headers_and_nothing_written() {
                 append(Some(agg(2)), new(), vec![new_event("b", &[])]),
                 append(Some(agg(1)), exact(5), vec![new_event("a", &[])]),
             ],
+            epoch: None,
         })
         .await
         .unwrap_err();
@@ -103,12 +105,17 @@ async fn conflict_is_failed_precondition_with_headers_and_nothing_written() {
 async fn malformed_requests_are_invalid_argument() {
     let mut s = Server::start().await;
     let cases = vec![
-        pb::CommitRequest { appends: vec![] },
+        pb::CommitRequest {
+            appends: vec![],
+            epoch: None,
+        },
         pb::CommitRequest {
             appends: vec![append(Some(agg(1)), any(), vec![])],
+            epoch: None,
         },
         pb::CommitRequest {
             appends: vec![append(None, exact(0), vec![new_event("f", &[])])],
+            epoch: None,
         },
         pb::CommitRequest {
             appends: vec![pb::Append {
@@ -116,6 +123,7 @@ async fn malformed_requests_are_invalid_argument() {
                 expected: any(),
                 events: vec![new_event("x", &[])],
             }],
+            epoch: None,
         },
         pb::CommitRequest {
             appends: vec![append(
@@ -127,6 +135,7 @@ async fn malformed_requests_are_invalid_argument() {
                     payload: b"x".to_vec(),
                 }],
             )],
+            epoch: None,
         },
     ];
     for req in cases {

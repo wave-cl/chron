@@ -21,6 +21,12 @@ struct Cli {
     /// Read every segment on open, checking crcs and the index.
     #[arg(long)]
     verify_all_segments: bool,
+    /// Follow the leader at this address as a read-only replica.
+    #[arg(long, env = "CHRON_REPLICATE_FROM")]
+    replicate_from: Option<String>,
+    /// Bearer token sent to the leader.
+    #[arg(long, env = "CHRON_REPLICATE_TOKEN", hide_env_values = true)]
+    replicate_token: Option<String>,
 }
 
 #[tokio::main]
@@ -35,6 +41,8 @@ async fn main() -> anyhow::Result<()> {
     let mut opts = chrond::Options::new(cli.data_dir, cli.listen);
     opts.fsync = !cli.no_fsync;
     opts.verify_all_segments = cli.verify_all_segments;
+    opts.replicate_from = cli.replicate_from;
+    opts.replicate_token = cli.replicate_token;
     let running = chrond::start(opts).await?;
     signal().await;
     tracing::info!("signal received, stopping");

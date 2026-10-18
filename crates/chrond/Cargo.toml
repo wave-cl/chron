@@ -30,6 +30,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+chron = { workspace = true, features = ["tokio"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [[test]]

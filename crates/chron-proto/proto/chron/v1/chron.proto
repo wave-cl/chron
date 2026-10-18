@@ -41,7 +41,21 @@ message Append {
   repeated NewEvent events = 3;
 }
 
-message CommitRequest { repeated Append appends = 1; }
+message CommitRequest {
+  repeated Append appends = 1;
+  // Fencing token: the epoch the writer last saw in Info. Absent: no
+  // check. Stale, or newer than the daemon's epoch, is FAILED_PRECONDITION
+  // with the metadata `chron-epoch` carrying the daemon's epoch; a newer
+  // one also fences the daemon.
+  optional uint64 epoch = 2;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_LEADER = 1;
+  ROLE_REPLICA = 2;
+  ROLE_FENCED = 3;
+}
 
 message AppendResult {
   optional bytes aggregate = 1;
@@ -115,6 +129,14 @@ message InfoResponse {
   uint64 segments = 4;
   uint64 bytes = 5;
   Options options = 6;
+  bytes db_id = 7;
+  uint64 epoch = 8;
+  Role role = 9;
+  optional string replicating_from = 10;
+  bool replica_connected = 11;
+  optional uint64 leader_head = 12;
+  optional string last_replication_error = 13;
+  optional uint64 fenced_by = 14;
 }
 
 // A backup written by the daemon to `archive` on its own filesystem: full
@@ -133,9 +155,41 @@ message BackupMeta {
   uint64 files = 6;
   uint64 bytes = 7;
   uint32 format = 8;
+  optional bytes db_id = 9;
 }
 
 message ApplyBackupRequest { string archive = 1; }
+
+// A replica pulls whole transactions from `from_position` on.
+// `last_fingerprint` is the crc32 of the frame at `from_position - 1` as
+// the replica holds it; absent when it has none. A mismatch means the two
+// histories diverged.
+message ReplicateRequest {
+  uint64 from_position = 1;
+  optional uint32 last_fingerprint = 2;
+}
+
+// Positions [from, to) as back-to-back frames exactly as the leader's
+// segments hold them; `to` ends a transaction. `head` and `epoch` are the
+// leader's when the chunk was cut. Never ends on its own.
+message ReplicationChunk {
+  bytes db_id = 1;
+  uint64 from = 2;
+  uint64 to = 3;
+  bytes frames = 4;
+  uint64 head = 5;
+  uint64 epoch = 6;
+}
+
+message PromoteRequest {}
+message PromoteResponse {
+  uint64 epoch = 1;
+  uint64 head = 2;
+}
+
+// Tells a leader that a newer epoch exists; it refuses writes from then on.
+message FenceRequest { uint64 epoch = 1; }
+message FenceResponse { uint64 epoch = 1; }
 
 message RetainRequest { uint64 floor = 1; }
 message RetainResponse {
@@ -151,7 +205,8 @@ message RetainResponse {
 // malformed request is INVALID_ARGUMENT; a position past the head or below
 // the floor is OUT_OF_RANGE; a locked directory, a wrong backup base head
 // or an existing restore target is FAILED_PRECONDITION; damage and I/O
-// failures are INTERNAL.
+// failures are INTERNAL. A write refused because of the node's role or
+// epoch is FAILED_PRECONDITION with the metadata `chron-epoch`.
 service Chron {
   rpc Commit(CommitRequest) returns (CommitResponse);
   rpc ReadAggregate(ReadAggregateRequest) returns (stream Event);
@@ -165,4 +220,7 @@ service Chron {
   rpc Backup(BackupRequest) returns (BackupMeta);
   rpc ApplyBackup(ApplyBackupRequest) returns (BackupMeta);
   rpc Retain(RetainRequest) returns (RetainResponse);
+  rpc Replicate(ReplicateRequest) returns (stream ReplicationChunk);
+  rpc Promote(PromoteRequest) returns (PromoteResponse);
+  rpc Fence(FenceRequest) returns (FenceResponse);
 }

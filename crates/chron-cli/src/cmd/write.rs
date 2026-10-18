@@ -62,6 +62,7 @@ pub async fn append(addr: &str, format: Format, a: AppendArgs) -> anyhow::Result
     let resp = c
         .commit(pb::CommitRequest {
             appends: vec![append],
+            epoch: None,
         })
         .await?
         .into_inner();
@@ -169,7 +170,13 @@ pub async fn commit(addr: &str, format: Format, a: CommitArgs) -> anyhow::Result
         });
     }
     let mut c = client::connect(addr).await?;
-    let resp = c.commit(pb::CommitRequest { appends }).await?.into_inner();
+    let resp = c
+        .commit(pb::CommitRequest {
+            appends,
+            epoch: None,
+        })
+        .await?
+        .into_inner();
     print_commit(format, &resp);
     Ok(())
 }

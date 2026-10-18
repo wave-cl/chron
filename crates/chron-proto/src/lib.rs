@@ -14,3 +14,6 @@ pub mod convert;
 pub const CONFLICT_ACTUAL_LENGTH_HEADER: &str = "chron-actual-length";
 /// On the same status: the conflicting aggregate's hyphenated UUID.
 pub const CONFLICT_AGGREGATE_HEADER: &str = "chron-aggregate";
+/// On a `FAILED_PRECONDITION` for a write the node's role or epoch
+/// refused: the node's epoch, as decimal text.
+pub const EPOCH_HEADER: &str = "chron-epoch";

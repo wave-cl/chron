@@ -29,8 +29,68 @@ impl Server {
         }
     }
 
+    /// Starts on a fresh directory with `f` adjusting the options.
+    pub async fn start_with(f: impl FnOnce(&mut chrond::Options)) -> Server {
+        let dir = tempfile::tempdir().unwrap();
+        Self::start_in(dir, "127.0.0.1:0".parse().unwrap(), f).await
+    }
+
+    /// Starts on an existing temp dir (its `data` subdirectory) at `addr`.
+    pub async fn start_in(
+        dir: tempfile::TempDir,
+        addr: std::net::SocketAddr,
+        f: impl FnOnce(&mut chrond::Options),
+    ) -> Server {
+        Self::try_start_in(dir, addr, f)
+            .await
+            .expect("the daemon starts")
+    }
+
+    pub async fn try_start_in(
+        dir: tempfile::TempDir,
+        addr: std::net::SocketAddr,
+        f: impl FnOnce(&mut chrond::Options),
+    ) -> anyhow::Result<Server> {
+        let mut opts = chrond::Options::new(dir.path().join("data"), addr);
+        opts.fsync = false;
+        f(&mut opts);
+        let running = chrond::start(opts).await?;
+        let client = ChronClient::connect(format!("http://{}", running.local_addr))
+            .await
+            .expect("connect");
+        Ok(Server {
+            dir,
+            running: Some(running),
+            client,
+        })
+    }
+
+    pub fn addr(&self) -> String {
+        format!("http://{}", self.running.as_ref().unwrap().local_addr)
+    }
+
+    /// A fresh replica of `leader`.
+    pub async fn start_replica_of(leader: &Server) -> Server {
+        let addr = leader.addr();
+        Self::start_with(move |o| o.replicate_from = Some(addr)).await
+    }
+
     pub fn data_dir(&self) -> std::path::PathBuf {
         self.dir.path().join("data")
+    }
+
+    pub async fn info(&mut self) -> pb::InfoResponse {
+        self.client
+            .info(pb::InfoRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    }
+
+    /// Stops the daemon and keeps the directory and client out of the way.
+    pub async fn stop_keep_dir(mut self) -> tempfile::TempDir {
+        self.running.take().unwrap().shutdown().await.unwrap();
+        self.dir
     }
 
     /// Stops the daemon and hands back the directory so a test can reopen
@@ -39,6 +99,48 @@ impl Server {
         self.running.take().unwrap().shutdown().await.unwrap();
         self.dir
     }
+}
+
+/// A free TCP port: bound then released, so a daemon can be restarted on it.
+pub fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
+/// Polls `f` every 20 ms for up to 10 s.
+pub async fn wait_until<F, Fut>(what: &str, mut f: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if f().await {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+pub async fn read_all_payloads(client: &mut ChronClient<Channel>) -> Vec<String> {
+    let events = collect(
+        client
+            .read_all(pb::ReadAllRequest {
+                from: 0,
+                limit: 0,
+                backward: false,
+            })
+            .await
+            .unwrap()
+            .into_inner(),
+    )
+    .await
+    .unwrap();
+    payloads(&events)
 }
 
 pub fn agg(n: u128) -> Uuid {
@@ -93,6 +195,7 @@ pub async fn fill(client: &mut ChronClient<Channel>, aggregate: Uuid, n: usize) 
                     any(),
                     vec![new_event(&format!("e{i}"), &[])],
                 )],
+                epoch: None,
             })
             .await
             .unwrap();
