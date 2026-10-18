@@ -21,6 +21,11 @@ pub struct Options {
     /// Largest frame plus body of one event.
     pub max_record_bytes: usize,
     pub fsync: Fsync,
+    /// Read every segment on open, checking each record's crc, that
+    /// positions run consecutively across segments, and that the index
+    /// places every record where it is. Costs a full read of the data;
+    /// off by default, when only the tail is checked.
+    pub verify_all_segments: bool,
 }
 
 impl Default for Options {
@@ -29,6 +34,7 @@ impl Default for Options {
             segment_max_bytes: 256 * 1024 * 1024,
             max_record_bytes: 16 * 1024 * 1024,
             fsync: Fsync::Always,
+            verify_all_segments: false,
         }
     }
 }
@@ -50,6 +56,11 @@ impl Options {
 
     pub fn fsync(mut self, fsync: Fsync) -> Self {
         self.fsync = fsync;
+        self
+    }
+
+    pub fn verify_all_segments(mut self, verify: bool) -> Self {
+        self.verify_all_segments = verify;
         self
     }
 }

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::db::Layout;
 use crate::error::{Error, Result};
 use crate::event;
-use crate::index::Index;
+use crate::index::{Index, POS};
 use crate::options::Options;
 use crate::segment::{self, HEADER_LEN, ScanItem, Scanner, SegmentWriter};
 
@@ -22,6 +22,79 @@ pub(crate) struct Recovered {
 }
 
 /// One good record found by a scan.
+pub(crate) struct Record {
+    pub position: u64,
+    pub offset: u64,
+    pub frame_len: u32,
+}
+
+pub(crate) enum Item {
+    Record(Record),
+    /// The scan stopped at `offset`; `clean` when the file ends exactly on
+    /// a record boundary.
+    Tail {
+        offset: u64,
+        clean: bool,
+        reason: String,
+    },
+}
+
+/// Walks one segment's records in order: whole, crc-valid, decodable, at
+/// consecutive positions from the header's base. Stops at the first fault
+/// and reports it as a [`Item::Tail`].
+pub(crate) struct Records {
+    scanner: Scanner,
+    expected: u64,
+}
+
+impl Records {
+    pub(crate) fn open(path: &Path, base: u64, max_record: usize) -> Result<Self> {
+        Ok(Records {
+            scanner: Scanner::open(path, HEADER_LEN, max_record)?,
+            expected: base,
+        })
+    }
+
+    pub(crate) fn next(&mut self) -> Result<Item> {
+        match self.scanner.next()? {
+            ScanItem::Record { offset, body } => {
+                let frame_len = (segment::FRAME_LEN + body.len()) as u32;
+                let event = match event::decode_body(&body) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        return Ok(Item::Tail {
+                            offset,
+                            clean: false,
+                            reason: e.to_string(),
+                        });
+                    }
+                };
+                if event.position != self.expected {
+                    return Ok(Item::Tail {
+                        offset,
+                        clean: false,
+                        reason: format!(
+                            "record carries position {} where {} was expected",
+                            event.position, self.expected
+                        ),
+                    });
+                }
+                self.expected += 1;
+                Ok(Item::Record(Record {
+                    position: event.position,
+                    offset,
+                    frame_len,
+                }))
+            }
+            ScanItem::Tail { offset, reason } => Ok(Item::Tail {
+                offset,
+                clean: reason == segment::TailReason::Clean,
+                reason: reason.to_string(),
+            }),
+        }
+    }
+}
+
 struct Found {
     offset: u64,
     next_offset: u64,
@@ -35,44 +108,19 @@ struct Scanned {
 }
 
 fn scan_segment(path: &Path, base: u64, max_record: usize) -> Result<Scanned> {
-    let mut scanner = Scanner::open(path, HEADER_LEN, max_record)?;
-    let mut records = Vec::new();
-    let mut expected = base;
+    let mut records = Records::open(path, base, max_record)?;
+    let mut found = Vec::new();
     loop {
-        match scanner.next()? {
-            ScanItem::Record { offset, body } => {
-                let next_offset = offset + (segment::FRAME_LEN + body.len()) as u64;
-                let ev = match event::decode_body(&body) {
-                    Ok(ev) => ev,
-                    Err(e) => {
-                        return Ok(Scanned {
-                            records,
-                            end_offset: offset,
-                            reason: e.to_string(),
-                        });
-                    }
-                };
-                if ev.position != expected {
-                    return Ok(Scanned {
-                        records,
-                        end_offset: offset,
-                        reason: format!(
-                            "record carries position {} where {expected} was expected",
-                            ev.position
-                        ),
-                    });
-                }
-                records.push(Found {
-                    offset,
-                    next_offset,
-                });
-                expected += 1;
-            }
-            ScanItem::Tail { offset, reason } => {
+        match records.next()? {
+            Item::Record(r) => found.push(Found {
+                offset: r.offset,
+                next_offset: r.offset + u64::from(r.frame_len),
+            }),
+            Item::Tail { offset, reason, .. } => {
                 return Ok(Scanned {
-                    records,
+                    records: found,
                     end_offset: offset,
-                    reason: reason.to_string(),
+                    reason,
                 });
             }
         }
@@ -101,7 +149,9 @@ pub(crate) fn recover(layout: &Layout, opts: &Options) -> Result<Recovered> {
             }
             // A roll that crashed before its header was complete.
             Ok(None) if k + 1 == n => remove(&path, &dir)?,
-            Ok(None) => return Err(Error::corrupt(&path, 0, "segment shorter than a header")),
+            Ok(None) => {
+                return Err(Error::corrupt(&path, 0, "segment shorter than a header"));
+            }
             Err(reason) => return Err(Error::corrupt(&path, 0, reason)),
         }
     }
@@ -114,7 +164,7 @@ pub(crate) fn recover(layout: &Layout, opts: &Options) -> Result<Recovered> {
         let (_, path) = segments.pop().unwrap();
         remove(&path, &dir)?;
     }
-    let Some((tail_base, tail_path)) = segments.pop() else {
+    let Some((tail_base, tail_path)) = segments.last().cloned() else {
         if head != 0 {
             return Err(Error::corrupt(
                 layout.index_file(),
@@ -179,6 +229,10 @@ pub(crate) fn recover(layout: &Layout, opts: &Options) -> Result<Recovered> {
         }
     }
 
+    if opts.verify_all_segments {
+        verify_all(&segments, head, &index, opts.max_record_bytes)?;
+    }
+
     Ok(Recovered {
         index,
         head,
@@ -186,4 +240,68 @@ pub(crate) fn recover(layout: &Layout, opts: &Options) -> Result<Recovered> {
         tail_path,
         tail_len: truncate_to,
     })
+}
+
+/// Reads every record of every segment, checking crc, consecutive
+/// positions reaching exactly the next segment's base (or the head), and
+/// that the index places each record where it is.
+fn verify_all(
+    segments: &[(u64, PathBuf)],
+    head: u64,
+    index: &Index,
+    max_record: usize,
+) -> Result<()> {
+    let txn = index.begin_read()?;
+    let pos = txn.open_table(POS)?;
+    for (k, (base, path)) in segments.iter().enumerate() {
+        let end = segments.get(k + 1).map_or(head, |(next, _)| *next);
+        let mut records = Records::open(path, *base, max_record)?;
+        loop {
+            match records.next()? {
+                Item::Record(r) => {
+                    if r.position >= end {
+                        return Err(Error::corrupt(
+                            path,
+                            r.offset,
+                            format!(
+                                "record at position {} past the segment's end {end}",
+                                r.position
+                            ),
+                        ));
+                    }
+                    let want = (*base, r.offset, r.frame_len);
+                    let got = pos.get(r.position)?.map(|v| v.value());
+                    if got != Some(want) {
+                        return Err(Error::corrupt(
+                            path,
+                            r.offset,
+                            format!(
+                                "index places position {} at {got:?}, the data has it at {want:?}",
+                                r.position
+                            ),
+                        ));
+                    }
+                }
+                Item::Tail {
+                    offset,
+                    clean,
+                    reason,
+                } => {
+                    if !clean {
+                        return Err(Error::corrupt(path, offset, reason));
+                    }
+                    let reached = records.expected;
+                    if reached != end {
+                        return Err(Error::corrupt(
+                            path,
+                            offset,
+                            format!("segment ends at position {reached}, {end} expected"),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }

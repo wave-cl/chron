@@ -151,6 +151,80 @@ fn a_flipped_byte_in_an_earlier_segment_fails_the_read() {
 }
 
 #[test]
+fn verify_all_segments_catches_a_flipped_byte_in_an_early_segment() {
+    let d = tmp();
+    let o = durable().segment_max_bytes(200);
+    let db = open_with(d.path(), o.clone());
+    fill(&db, agg(1), 6);
+    assert!(segments(d.path()).len() >= 3);
+    let (_, offset, _) = db.debug_locate(0).unwrap().unwrap();
+    drop(db);
+    flip(&segments(d.path())[0], offset + 20);
+    assert!(
+        Db::open(d.path(), o.clone()).is_ok(),
+        "without the option only the tail is checked"
+    );
+    match Db::open(d.path(), o.verify_all_segments(true)) {
+        Err(Error::Corrupt { offset: at, .. }) => assert_eq!(at, offset),
+        other => panic!("unexpected {:?}", other.map(|_| ())),
+    }
+}
+
+#[test]
+fn verify_all_segments_passes_on_a_healthy_multi_segment_db() {
+    let d = tmp();
+    let o = opts().segment_max_bytes(300);
+    let before = {
+        let db = open_with(d.path(), o.clone());
+        for i in 0..40u64 {
+            let mut t = db.transaction();
+            t.append_one(
+                agg(1 + i as u128 % 2),
+                Expected::Any,
+                tagged(&format!("e{i}"), &["t"]),
+            );
+            t.append_free(vec![ev("free")]);
+            t.commit().unwrap();
+        }
+        assert!(segments(d.path()).len() > 3);
+        db.read_all(0, 1000).unwrap()
+    };
+    let db = open_with(d.path(), o.verify_all_segments(true));
+    assert_eq!(db.read_all(0, 1000).unwrap(), before);
+    assert_eq!(db.head(), 80);
+    fill(&db, agg(1), 1);
+    assert_eq!(db.head(), 81);
+}
+
+#[test]
+fn verify_all_segments_catches_a_shifted_index_entry() {
+    let d = tmp();
+    let db = open(d.path());
+    fill(&db, agg(1), 3);
+    drop(db);
+    {
+        use redb::ReadableTable;
+        const POS: redb::TableDefinition<u64, (u64, u64, u32)> = redb::TableDefinition::new("pos");
+        let index = redb::Database::open(d.path().join("index.redb")).unwrap();
+        let txn = index.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(POS).unwrap();
+            let (base, offset, len) = t.get(1).unwrap().unwrap().value();
+            t.insert(1, (base, offset + 1, len)).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    assert!(
+        Db::open(d.path(), opts()).is_ok(),
+        "the tail check looks at the head only"
+    );
+    assert!(matches!(
+        Db::open(d.path(), opts().verify_all_segments(true)),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
 fn torn_roll() {
     let d = tmp();
     let db = open_with(d.path(), durable());
