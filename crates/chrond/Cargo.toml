@@ -16,7 +16,7 @@ path = "src/bin/chrond.rs"
 
 [dependencies]
 chron = { workspace = true, features = ["tokio"] }
-chron-proto = { workspace = true }
+chron-proto = { workspace = true, features = ["convert"] }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
