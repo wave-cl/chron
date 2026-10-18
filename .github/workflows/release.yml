@@ -46,11 +46,6 @@ jobs:
             target: aarch64-unknown-linux-musl
           - os: macos-15
             target: aarch64-apple-darwin
-          # Intel macOS runners are scarce to absent; the Intel binary is
-          # cross-compiled on Apple silicon (same SDK) and not smoke-run.
-          - os: macos-15
-            target: x86_64-apple-darwin
-            cross: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +60,6 @@ jobs:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked -p chrond -p chron-cli --target ${{ matrix.target }}
       - name: smoke
-        if: ${{ !matrix.cross }}
         run: |
           out=target/${{ matrix.target }}/release
           "$out/chron" --version

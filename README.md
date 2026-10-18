@@ -25,7 +25,7 @@ published as `chron-db` with its library target named `chron`. A project
 that also depends on that other `chron` renames one of them, for example
 `chron = { package = "chron-db", version = "0.1" }`. Prebuilt `chrond` and
 `chron` binaries for Linux (x86_64 and aarch64, static musl) and macOS
-(Apple silicon and Intel) are attached to each
+(Apple silicon) are attached to each
 [GitHub Release](https://github.com/wave-cl/chron/releases) with a
 `SHA256SUMS` file.
 
@@ -406,7 +406,7 @@ git push origin main && git push origin v0.2.0
 
 `main` goes first so the tag's workflow finds its commit there. The tag
 triggers `.github/workflows/release.yml`: it checks the tag against the
-version, runs the gate, builds `chrond` and `chron` for the four targets,
+version, runs the gate, builds `chrond` and `chron` for the three targets,
 publishes the five crates to crates.io in dependency order (`cargo
 publish --workspace`, with the repository secret `CARGO_REGISTRY_TOKEN`:
 a crates.io token allowed to publish new and update crates, set once with
