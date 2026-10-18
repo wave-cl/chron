@@ -6,6 +6,9 @@ pub mod v1 {
     tonic::include_proto!("chron.v1");
 }
 
+#[cfg(feature = "convert")]
+pub mod convert;
+
 /// On a `FAILED_PRECONDITION` from `Commit`: the conflicting aggregate's
 /// actual length, as decimal text.
 pub const CONFLICT_ACTUAL_LENGTH_HEADER: &str = "chron-actual-length";

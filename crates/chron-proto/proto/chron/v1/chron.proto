@@ -132,6 +132,7 @@ message BackupMeta {
   int64 created_at_unix_nanos = 5;
   uint64 files = 6;
   uint64 bytes = 7;
+  uint32 format = 8;
 }
 
 message ApplyBackupRequest { string archive = 1; }

@@ -322,6 +322,8 @@ dependencies = [
 name = "chron-proto"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "chron",
  "prost",
  "tonic",
  "tonic-prost",
