@@ -1,6 +1,8 @@
 //! Transactions: several appends, one commit, one position range.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::MutexGuard;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,7 +18,7 @@ use crate::event::{
 };
 use crate::index::{AGG_INDEX, AGG_LEN, HEAD_KEY, META, POS, TAG};
 use crate::options::Fsync;
-use crate::segment::{self, FRAME_LEN};
+use crate::segment::{self, FRAME_LEN, SegmentWriter};
 
 /// What an append asserts about the aggregate's current length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +205,182 @@ fn check_shape(appends: &[PendingAppend], max_record: usize) -> Result<()> {
     Ok(())
 }
 
+/// Lands one transaction whose frames are already encoded in `buf`: writes
+/// them at the segment's end, syncs per the options, records every entry
+/// and the new head in `wtxn`, commits (the commit point), publishes the
+/// head and rolls the segment when it is full. Called under the writer
+/// lock.
+fn land(
+    inner: &Inner,
+    w: &mut MutexGuard<'_, SegmentWriter>,
+    wtxn: redb::WriteTransaction,
+    buf: &[u8],
+    entries: &[Entry],
+    lens: &HashMap<Uuid, u64>,
+    new_head: u64,
+) -> Result<()> {
+    // Bytes first, synced before the index commit vouches for them.
+    let base = w.base();
+    let at = w.write_at_end(buf)?;
+    if inner.opts.fsync == Fsync::Always {
+        w.sync_data()?;
+    }
+    {
+        let mut pos = wtxn.open_table(POS)?;
+        let mut agg_index = wtxn.open_table(AGG_INDEX)?;
+        let mut tag = wtxn.open_table(TAG)?;
+        let mut agg_len = wtxn.open_table(AGG_LEN)?;
+        let mut meta = wtxn.open_table(META)?;
+        for e in entries {
+            pos.insert(e.position, (base, at + e.rel_offset, e.frame_len))?;
+            if let Some(id) = &e.aggregate {
+                agg_index.insert((id.as_bytes(), e.index), e.position)?;
+            }
+            for t in &e.tags {
+                tag.insert((t.as_ref(), e.position), ())?;
+            }
+        }
+        for (id, len) in lens {
+            agg_len.insert(id.as_bytes(), *len)?;
+        }
+        meta.insert(HEAD_KEY, new_head)?;
+    }
+    // Commit point.
+    wtxn.commit()?;
+
+    w.advance(buf.len() as u64);
+    inner.publish_head(new_head);
+    if w.len() >= inner.opts.segment_max_bytes {
+        inner.roll(w, new_head);
+    }
+    Ok(())
+}
+
+/// One transaction's worth of imported frames.
+struct Group {
+    start: usize,
+    end: usize,
+    entries: Vec<Entry>,
+    lens: HashMap<Uuid, u64>,
+    new_head: u64,
+}
+
+/// Appends `frames` (back-to-back `len, crc, body` records, as an
+/// incremental backup carries them) through the normal landing path, one
+/// transaction at a time. Every frame is checked before anything is
+/// written: it must decode, positions must continue from the head,
+/// transactions must be whole and well flagged, and aggregate indices must
+/// be dense. The head must be `base_head` first and `expect_head` after.
+pub(crate) fn import_frames(
+    inner: &Inner,
+    archive: &Path,
+    frames: &[u8],
+    base_head: u64,
+    expect_head: u64,
+) -> Result<u64> {
+    let mut w = inner.writer.lock().unwrap_or_else(|p| p.into_inner());
+    let head = inner.head.load(Ordering::Acquire);
+    if head != base_head {
+        return Err(Error::WrongBaseHead {
+            archive: archive.to_path_buf(),
+            base_head,
+            head,
+        });
+    }
+    let corrupt = |offset: u64, reason: String| Error::corrupt(archive, offset, reason);
+
+    let rtxn = inner.index.begin_read()?;
+    let agg_len = rtxn.open_table(AGG_LEN)?;
+    let mut lens: HashMap<Uuid, u64> = HashMap::new();
+    let mut groups: Vec<Group> = Vec::new();
+    let mut open: Option<Group> = None;
+    let mut position = head;
+    let mut walker = segment::Frames::new(frames);
+    let mut last_offset = 0;
+    while let Some((offset, frame)) = walker.next(archive, inner.opts.max_record_bytes)? {
+        last_offset = offset;
+        let body = segment::check_frame(archive, offset, frame, inner.opts.max_record_bytes)?;
+        let ev = event::decode_body(body).map_err(|e| corrupt(offset, e.to_string()))?;
+        if ev.position != position {
+            return Err(corrupt(
+                offset,
+                format!(
+                    "record carries position {} where {position} was expected",
+                    ev.position
+                ),
+            ));
+        }
+        if ev.is_first_in_txn() != open.is_none() {
+            return Err(corrupt(offset, "transaction flags out of order".into()));
+        }
+        let group = open.get_or_insert_with(|| Group {
+            start: offset as usize,
+            end: offset as usize,
+            entries: Vec::new(),
+            lens: HashMap::new(),
+            new_head: position,
+        });
+        if let Some(id) = ev.aggregate {
+            let cur = match group.lens.get(&id).or_else(|| lens.get(&id)) {
+                Some(l) => *l,
+                None => agg_len.get(id.as_bytes())?.map_or(0, |v| v.value()),
+            };
+            if ev.index != cur {
+                return Err(corrupt(
+                    offset,
+                    format!("aggregate {id} index {} where {cur} was expected", ev.index),
+                ));
+            }
+            group.lens.insert(id, cur + 1);
+        }
+        let last = ev.is_last_in_txn();
+        group.entries.push(Entry {
+            position,
+            rel_offset: offset - group.start as u64,
+            frame_len: frame.len() as u32,
+            aggregate: ev.aggregate,
+            index: ev.index,
+            tags: ev.tags,
+        });
+        position += 1;
+        if last {
+            let mut g = open.take().unwrap();
+            g.end = offset as usize + frame.len();
+            g.new_head = position;
+            lens.extend(g.lens.iter().map(|(k, v)| (*k, *v)));
+            groups.push(g);
+        }
+    }
+    if open.is_some() {
+        return Err(corrupt(
+            last_offset,
+            "frames end inside a transaction".into(),
+        ));
+    }
+    if position != expect_head {
+        return Err(corrupt(
+            frames.len() as u64,
+            format!("frames end at position {position}, the archive says {expect_head}"),
+        ));
+    }
+    drop(agg_len);
+    drop(rtxn);
+
+    for g in groups {
+        let wtxn = inner.index.begin_write()?;
+        land(
+            inner,
+            &mut w,
+            wtxn,
+            &frames[g.start..g.end],
+            &g.entries,
+            &g.lens,
+            g.new_head,
+        )?;
+    }
+    Ok(position)
+}
+
 pub(crate) fn commit(inner: &Inner, appends: Vec<PendingAppend>, mode: Mode) -> Result<Committed> {
     check_shape(&appends, inner.opts.max_record_bytes)?;
 
@@ -296,13 +474,9 @@ pub(crate) fn commit(inner: &Inner, appends: Vec<PendingAppend>, mode: Mode) -> 
     }
     let new_head = position;
 
-    // Bytes first, synced before the index commit vouches for them.
-    let base = w.base();
-    let at = w.write_at_end(&buf)?;
-    if inner.opts.fsync == Fsync::Always || mode == Mode::WriteWithoutCommit {
-        w.sync_data()?;
-    }
     if mode == Mode::WriteWithoutCommit {
+        w.write_at_end(&buf)?;
+        w.sync_data()?;
         return Ok(Committed {
             first: head,
             last: new_head - 1,
@@ -310,35 +484,7 @@ pub(crate) fn commit(inner: &Inner, appends: Vec<PendingAppend>, mode: Mode) -> 
             appends: results,
         });
     }
-
-    {
-        let mut pos = wtxn.open_table(POS)?;
-        let mut agg_index = wtxn.open_table(AGG_INDEX)?;
-        let mut tag = wtxn.open_table(TAG)?;
-        let mut agg_len = wtxn.open_table(AGG_LEN)?;
-        let mut meta = wtxn.open_table(META)?;
-        for e in &entries {
-            pos.insert(e.position, (base, at + e.rel_offset, e.frame_len))?;
-            if let Some(id) = &e.aggregate {
-                agg_index.insert((id.as_bytes(), e.index), e.position)?;
-            }
-            for t in &e.tags {
-                tag.insert((t.as_ref(), e.position), ())?;
-            }
-        }
-        for (id, len) in &lens {
-            agg_len.insert(id.as_bytes(), *len)?;
-        }
-        meta.insert(HEAD_KEY, new_head)?;
-    }
-    // Commit point.
-    wtxn.commit()?;
-
-    w.advance(buf.len() as u64);
-    inner.publish_head(new_head);
-    if w.len() >= inner.opts.segment_max_bytes {
-        inner.roll(&mut w, new_head);
-    }
+    land(inner, &mut w, wtxn, &buf, &entries, &lens, new_head)?;
 
     Ok(Committed {
         first: head,

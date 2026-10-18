@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
+use crate::backup::{self, BackupMeta};
 use crate::error::{Error, Result};
 use crate::event::{self, Event};
 use crate::index::{self, Index, Location};
@@ -199,6 +200,31 @@ impl Db {
     /// or below the current one is a no-op.
     pub fn retain_from(&self, floor: u64) -> Result<Retained> {
         retain::retain(&self.inner, floor, true)
+    }
+
+    /// Writes a full backup of everything committed so far to `archive`
+    /// while the database stays in use. The archive holds exactly the
+    /// events below the head at the moment it was taken; restore it with
+    /// [`restore_backup`](crate::restore_backup).
+    pub fn backup(&self, archive: impl AsRef<Path>) -> Result<BackupMeta> {
+        backup::write_full(&self.inner, archive.as_ref())
+    }
+
+    /// Writes an incremental backup holding the events at positions
+    /// `since..head`, to be applied with [`apply_backup`](Db::apply_backup)
+    /// onto a database whose head is `since`. `since` past the head is
+    /// [`Error::PositionOutOfRange`]; below the floor,
+    /// [`Error::BelowFloor`].
+    pub fn backup_since(&self, archive: impl AsRef<Path>, since: u64) -> Result<BackupMeta> {
+        backup::write_incremental(&self.inner, archive.as_ref(), since)
+    }
+
+    /// Appends the events of an incremental backup. The archive is read
+    /// and checked in full before anything is written; the head must equal
+    /// the archive's base head, else [`Error::WrongBaseHead`] and nothing
+    /// changes.
+    pub fn apply_backup(&self, archive: impl AsRef<Path>) -> Result<BackupMeta> {
+        backup::apply(&self.inner, archive.as_ref())
     }
 
     /// How many events the aggregate has; 0 for one never written.

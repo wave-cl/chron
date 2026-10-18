@@ -17,6 +17,7 @@
 //! anything in the segment files at or past the committed head was never
 //! acknowledged and is truncated.
 
+mod backup;
 mod db;
 mod error;
 mod event;
@@ -29,6 +30,7 @@ mod segment;
 mod subscribe;
 mod txn;
 
+pub use backup::{BackupKind, BackupMeta, inspect_backup, restore_backup};
 pub use db::{Db, Info};
 pub use error::{Error, Result};
 pub use event::{

@@ -15,11 +15,11 @@ pub fn opts() -> Options {
     Options::new().fsync(Fsync::Never)
 }
 
-pub fn open(dir: &Path) -> Db {
+pub fn open(dir: impl AsRef<Path>) -> Db {
     Db::open(dir, opts()).unwrap()
 }
 
-pub fn open_with(dir: &Path, opts: Options) -> Db {
+pub fn open_with(dir: impl AsRef<Path>, opts: Options) -> Db {
     Db::open(dir, opts).unwrap()
 }
 

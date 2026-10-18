@@ -257,6 +257,52 @@ pub(crate) fn check_frame<'a>(
     Ok(body)
 }
 
+/// Walks back-to-back `len, crc, body` frames held in memory. The crc is
+/// the caller's to check ([`check_frame`]); this only cuts the frames.
+pub(crate) struct Frames<'a> {
+    buf: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Frames<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
+        Frames { buf, at: 0 }
+    }
+
+    /// The next `(offset, frame)`, or `None` at the end. A frame that does
+    /// not fit is `Corrupt` at `path`.
+    pub(crate) fn next(
+        &mut self,
+        path: &Path,
+        max_record: usize,
+    ) -> Result<Option<(u64, &'a [u8])>> {
+        let remaining = self.buf.len() - self.at;
+        if remaining == 0 {
+            return Ok(None);
+        }
+        let offset = self.at as u64;
+        if remaining < FRAME_LEN {
+            return Err(Error::corrupt(path, offset, "short frame"));
+        }
+        let body_len =
+            u32::from_be_bytes(self.buf[self.at..self.at + 4].try_into().unwrap()) as usize;
+        let frame_len = FRAME_LEN + body_len;
+        if body_len == 0 || frame_len > max_record {
+            return Err(Error::corrupt(
+                path,
+                offset,
+                format!("implausible body length {body_len}"),
+            ));
+        }
+        if remaining < frame_len {
+            return Err(Error::corrupt(path, offset, "short body"));
+        }
+        let frame = &self.buf[self.at..self.at + frame_len];
+        self.at += frame_len;
+        Ok(Some((offset, frame)))
+    }
+}
+
 /// Reads the record the index placed at `offset` with a frame of `frame_len`
 /// bytes, in one positional read, and checks it.
 pub(crate) fn read_record_at(
@@ -567,6 +613,33 @@ mod tests {
         let f = File::open(&path).unwrap();
         assert!(matches!(
             read_record_at(&f, &path, offsets[0], u32::MAX, MAX),
+            Err(Error::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn frames_walks_back_to_back_records() {
+        let mut buf = Vec::new();
+        frame_record(b"one", &mut buf);
+        frame_record(b"second", &mut buf);
+        let p = Path::new("x");
+        let mut f = Frames::new(&buf);
+        let (o1, f1) = f.next(p, MAX).unwrap().unwrap();
+        assert_eq!((o1, check_frame(p, o1, f1, MAX).unwrap()), (0, &b"one"[..]));
+        let (o2, f2) = f.next(p, MAX).unwrap().unwrap();
+        assert_eq!(
+            (o2, check_frame(p, o2, f2, MAX).unwrap()),
+            (11, &b"second"[..])
+        );
+        assert!(f.next(p, MAX).unwrap().is_none());
+        let mut short = Frames::new(&buf[..buf.len() - 1]);
+        short.next(p, MAX).unwrap();
+        assert!(matches!(
+            short.next(p, MAX),
+            Err(Error::Corrupt { offset: 11, .. })
+        ));
+        assert!(matches!(
+            Frames::new(&buf[..3]).next(p, MAX),
             Err(Error::Corrupt { .. })
         ));
     }

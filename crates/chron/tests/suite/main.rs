@@ -1,5 +1,6 @@
 mod common;
 
+mod backup;
 mod concurrency;
 mod free;
 mod limits;

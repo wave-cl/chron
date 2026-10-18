@@ -213,7 +213,7 @@ fn rebuild_of_an_empty_directory_gives_head_zero() {
             dropped: 0
         }
     );
-    let db = open(&d.path().join("fresh"));
+    let db = open(d.path().join("fresh"));
     assert_eq!(db.head(), 0);
     fill(&db, agg(1), 1);
     assert_eq!(db.head(), 1);
