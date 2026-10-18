@@ -23,7 +23,7 @@ pub struct AppendArgs {
     tags: Vec<String>,
     /// Metadata bytes.
     #[arg(long)]
-    meta: Option<String>,
+    metadata: Option<String>,
     /// The payload.
     #[arg(short = 'd', long = "data", conflicts_with = "stdin")]
     data: Option<String>,
@@ -68,7 +68,7 @@ pub async fn append(conn: &Conn, format: Format, a: AppendArgs) -> anyhow::Resul
         (None, false) => return Err(Usage("give the payload with -d or --stdin".into()).into()),
     };
     let mut event = NewEvent::new(payload).tags(a.tags);
-    if let Some(m) = a.meta {
+    if let Some(m) = a.metadata {
         event = event.metadata(m);
     }
     let mut txn = Transaction::new();
@@ -82,8 +82,8 @@ pub async fn append(conn: &Conn, format: Format, a: AppendArgs) -> anyhow::Resul
 #[derive(Args, Debug)]
 pub struct CommitArgs {
     /// A JSON file: `{"appends":[{"aggregate":"UUID"|null,"expect":"any"|"new"|N,
-    /// "events":[{"payload":"…","tags":["…"],"metadata":"…"}]}]}`; `payload_base64`
-    /// and `metadata_base64` carry binary values.
+    /// "events":[{"payload":"…","tags":["…"],"metadata":"…"}]}]}`; `payload_base64`,
+    /// `metadata_base64` and `tags_base64` carry binary values.
     #[arg(short = 'f', long, conflicts_with = "stdin")]
     file: Option<std::path::PathBuf>,
     /// Read the JSON from stdin.
@@ -124,17 +124,23 @@ struct EventJson {
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
+    tags_base64: Vec<String>,
+    #[serde(default)]
     metadata: Option<String>,
     #[serde(default)]
     metadata_base64: Option<String>,
 }
 
+fn decode_base64(b: &str, what: &str) -> anyhow::Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(b)
+        .map_err(|e| Usage(format!("{what} is not base64: {e}")).into())
+}
+
 fn bytes(text: Option<String>, b64: Option<String>, what: &str) -> anyhow::Result<Vec<u8>> {
     match (text, b64) {
         (Some(t), None) => Ok(t.into_bytes()),
-        (None, Some(b)) => base64::engine::general_purpose::STANDARD
-            .decode(b)
-            .with_context(|| format!("{what}_base64 is not base64")),
+        (None, Some(b)) => decode_base64(&b, &format!("{what}_base64")),
         (None, None) => Ok(Vec::new()),
         (Some(_), Some(_)) => Err(Usage(format!("give {what} or {what}_base64, not both")).into()),
     }
@@ -169,11 +175,16 @@ pub async fn commit(conn: &Conn, format: Format, a: CommitArgs) -> anyhow::Resul
         };
         let mut events = Vec::with_capacity(a.events.len());
         for e in a.events {
-            events.push(NewEvent {
-                tags: e.tags.into_iter().map(bytes::Bytes::from).collect(),
-                metadata: bytes(e.metadata, e.metadata_base64, "metadata")?.into(),
-                payload: bytes(e.payload, e.payload_base64, "payload")?.into(),
-            });
+            let mut tags: Vec<bytes::Bytes> = e.tags.into_iter().map(bytes::Bytes::from).collect();
+            for t in e.tags_base64 {
+                tags.push(decode_base64(&t, "tags_base64")?.into());
+            }
+            let mut event = NewEvent::new(bytes(e.payload, e.payload_base64, "payload")?)
+                .metadata(bytes(e.metadata, e.metadata_base64, "metadata")?);
+            for t in tags {
+                event = event.tag(t);
+            }
+            events.push(event);
         }
         match aggregate {
             Some(id) => txn.append(id, expected, events),

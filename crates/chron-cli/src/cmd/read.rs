@@ -92,7 +92,8 @@ async fn print_stream(format: Format, mut stream: EventStream) -> anyhow::Result
 
 #[derive(Args, Debug)]
 pub struct TailArgs {
-    /// Start at this position (default 0).
+    /// Start at this position (default: the floor, the oldest readable
+    /// position).
     #[arg(long, conflicts_with = "from_head")]
     from: Option<u64>,
     /// Start at the current head: only new events.
@@ -105,10 +106,10 @@ pub struct TailArgs {
 
 pub async fn tail(conn: &Conn, format: Format, a: TailArgs) -> anyhow::Result<()> {
     let c = client::connect(conn).await?;
-    let from = if a.from_head {
-        c.head().await?
-    } else {
-        a.from.unwrap_or(0)
+    let from = match (a.from_head, a.from) {
+        (true, _) => c.head().await?,
+        (false, Some(from)) => from,
+        (false, None) => c.info().await?.floor,
     };
     let stream = match a.tag {
         Some(tag) => c.subscribe_tag(tag, from).await?,

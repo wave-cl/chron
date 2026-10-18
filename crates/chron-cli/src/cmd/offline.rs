@@ -1,13 +1,47 @@
 use std::path::Path;
 
 use chron::{Db, Options};
+use clap::Args;
 use serde_json::json;
 
 use crate::cmd::admin::{meta_human, meta_json};
-use crate::output::{Format, print_value};
+use crate::output::{Format, Usage, print_value};
 
-pub fn rebuild_index(format: Format, path: &Path) -> anyhow::Result<()> {
-    let r = Db::rebuild_index(path, &Options::new())?;
+/// Options an offline command opens the database with.
+#[derive(Args, Debug, Clone)]
+pub struct OfflineOpts {
+    /// The record limit the database was written with, when not the
+    /// default.
+    #[arg(long)]
+    max_record_bytes: Option<usize>,
+}
+
+impl OfflineOpts {
+    fn options(&self) -> Options {
+        let mut o = Options::new();
+        if let Some(n) = self.max_record_bytes {
+            o = o.max_record_bytes(n);
+        }
+        o
+    }
+}
+
+/// A directory holding a database: a `segments` directory or an index.
+/// Opening anything else would create a new, empty database.
+fn ensure_database(path: &Path) -> anyhow::Result<()> {
+    if !path.is_dir() {
+        return Err(Usage(format!("{} is not a directory", path.display())).into());
+    }
+    let has_data = path.join("segments").is_dir() || path.join("index.redb").is_file();
+    if !has_data {
+        return Err(Usage(format!("{} holds no chron database", path.display())).into());
+    }
+    Ok(())
+}
+
+pub fn rebuild_index(format: Format, path: &Path, opts: &OfflineOpts) -> anyhow::Result<()> {
+    ensure_database(path)?;
+    let r = Db::rebuild_index(path, &opts.options())?;
     print_value(
         format,
         format!(
@@ -19,8 +53,9 @@ pub fn rebuild_index(format: Format, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn verify(format: Format, path: &Path) -> anyhow::Result<()> {
-    let db = Db::open(path, Options::new().verify_all_segments(true))?;
+pub fn verify(format: Format, path: &Path, opts: &OfflineOpts) -> anyhow::Result<()> {
+    ensure_database(path)?;
+    let db = Db::open(path, opts.options().verify_all_segments(true))?;
     let info = db.info()?;
     print_value(
         format,
@@ -33,8 +68,13 @@ pub fn verify(format: Format, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn restore(format: Format, archive: &Path, dir: &Path) -> anyhow::Result<()> {
-    let m = chron::restore_backup(archive, dir, &Options::new())?;
+pub fn restore(
+    format: Format,
+    archive: &Path,
+    dir: &Path,
+    opts: &OfflineOpts,
+) -> anyhow::Result<()> {
+    let m = chron::restore_backup(archive, dir, &opts.options())?;
     print_value(
         format,
         format!(

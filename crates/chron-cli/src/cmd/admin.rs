@@ -32,7 +32,7 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
         i.floor,
         i.segments,
         i.bytes,
-        o.fsync == chron::Fsync::Always,
+        if i.fsync { "always" } else { "never" },
         o.verify_all_segments,
         o.segment_max_bytes,
         o.max_record_bytes
@@ -54,7 +54,8 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
         json!({
             "path": i.path, "db_id": i.db_id.to_string(), "role": i.role.to_string(), "epoch": i.epoch,
             "head": i.head, "floor": i.floor, "segments": i.segments, "bytes": i.bytes,
-            "options": { "fsync": o.fsync == chron::Fsync::Always, "verify_all_segments": o.verify_all_segments,
+            "fsync": if i.fsync { "always" } else { "never" },
+            "options": { "verify_all_segments": o.verify_all_segments,
                          "segment_max_bytes": o.segment_max_bytes, "max_record_bytes": o.max_record_bytes },
             "replicating_from": i.replicating_from, "replica_connected": i.replica_connected,
             "leader_head": i.leader_head, "last_replication_error": i.last_replication_error,

@@ -18,8 +18,7 @@ pub fn parse_aggregate(s: &str) -> anyhow::Result<Option<Uuid>> {
 }
 
 pub fn aggregate_id(s: &str) -> anyhow::Result<Uuid> {
-    parse_aggregate(s)?
-        .ok_or_else(|| Usage("this command needs an aggregate, not `free`".into()).into())
+    parse_aggregate(s)?.ok_or_else(|| Usage("this command takes an aggregate UUID".into()).into())
 }
 
 /// `any`, `new`, or a number.

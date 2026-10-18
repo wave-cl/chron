@@ -47,14 +47,15 @@ enum Commands {
     Info,
     /// Make everything committed so far durable.
     Flush,
-    /// Write a backup to a path on the daemon's filesystem.
+    /// Write a backup by name under the daemon's backup directory.
     Backup(cmd::admin::BackupArgs),
     /// Apply an incremental backup by its name under the daemon's backup
     /// directory.
     Apply { archive: String },
     /// Drop segments wholly below a position.
     Retain { floor: u64 },
-    /// Whether the daemon reports SERVING (exit 0) or not (exit 1).
+    /// Whether the daemon reports SERVING (exit 0), NOT_SERVING (exit 1)
+    /// or cannot be reached (exit 2).
     Health {
         #[arg(long, default_value = "chron.v1.Chron")]
         service: String,
@@ -64,13 +65,23 @@ enum Commands {
     /// Tell a leader that a newer epoch exists; it refuses writes from then on.
     Fence { epoch: u64 },
     /// Offline: rebuild a database's index from its segment files.
-    RebuildIndex { path: std::path::PathBuf },
+    RebuildIndex {
+        path: std::path::PathBuf,
+        #[command(flatten)]
+        opts: cmd::offline::OfflineOpts,
+    },
     /// Offline: open a database checking every segment and the index.
-    Verify { path: std::path::PathBuf },
+    Verify {
+        path: std::path::PathBuf,
+        #[command(flatten)]
+        opts: cmd::offline::OfflineOpts,
+    },
     /// Offline: restore a full backup into a new directory.
     Restore {
         archive: std::path::PathBuf,
         dir: std::path::PathBuf,
+        #[command(flatten)]
+        opts: cmd::offline::OfflineOpts,
     },
     /// Offline: print a backup's header.
     Inspect { archive: std::path::PathBuf },
@@ -87,8 +98,13 @@ async fn main() {
     let code = match run(cli, format).await {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("chron: {}", output::render_error(&e));
-            output::exit_code(&e)
+            let code = output::exit_code(&e);
+            let text = output::render_error(&e);
+            match format {
+                Format::Json => eprintln!("{}", serde_json::json!({ "error": text, "code": code })),
+                Format::Human => eprintln!("chron: {text}"),
+            }
+            code
         }
     };
     std::process::exit(code);
@@ -113,9 +129,11 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Health { service } => cmd::admin::health(conn, format, &service).await,
         Commands::Promote => cmd::admin::promote(conn, format).await,
         Commands::Fence { epoch } => cmd::admin::fence(conn, format, epoch).await,
-        Commands::RebuildIndex { path } => cmd::offline::rebuild_index(format, &path),
-        Commands::Verify { path } => cmd::offline::verify(format, &path),
-        Commands::Restore { archive, dir } => cmd::offline::restore(format, &archive, &dir),
+        Commands::RebuildIndex { path, opts } => cmd::offline::rebuild_index(format, &path, &opts),
+        Commands::Verify { path, opts } => cmd::offline::verify(format, &path, &opts),
+        Commands::Restore { archive, dir, opts } => {
+            cmd::offline::restore(format, &archive, &dir, &opts)
+        }
         Commands::Inspect { archive } => cmd::offline::inspect(format, &archive),
     }
 }

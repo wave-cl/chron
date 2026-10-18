@@ -131,6 +131,69 @@ fn free_events_and_json_output() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("free events have no length"));
+    // Errors under --json are one JSON object on stderr.
+    let err = d
+        .chron()
+        .args(["--json", "read", "free"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stderr
+        .clone();
+    let err: serde_json::Value = serde_json::from_slice(&err).unwrap();
+    assert_eq!(err["code"], 2);
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .contains("takes an aggregate UUID"),
+        "{err}"
+    );
+    // An empty payload and binary tags.
+    d.chron()
+        .args(["append", "free", "--metadata", "m", "-d", ""])
+        .assert()
+        .success();
+    let file = d.dir.path().join("bin.json");
+    std::fs::write(
+        &file,
+        r#"{"appends":[{"events":[{"payload_base64":"/w==","tags_base64":["/w=="],"tags":["t"]}]}]}"#,
+    )
+    .unwrap();
+    d.chron()
+        .args(["commit", "-f"])
+        .arg(&file)
+        .assert()
+        .success();
+    let out = d
+        .chron()
+        .args(["--json", "all", "--from", "1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let lines: Vec<serde_json::Value> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines[0]["payload"], serde_json::Value::Null);
+    assert_eq!(lines[0]["metadata"], "m");
+    assert_eq!(lines[1]["payload_base64"], "/w==");
+    assert_eq!(lines[1]["tags"][0], "t");
+    assert_eq!(lines[1]["tags_base64"][0], "/w==");
+    std::fs::write(
+        &file,
+        r#"{"appends":[{"events":[{"payload_base64":"not base64!"}]}]}"#,
+    )
+    .unwrap();
+    d.chron()
+        .args(["commit", "-f"])
+        .arg(&file)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("not base64"));
 }
 
 #[test]
@@ -276,6 +339,11 @@ fn tls_and_mtls_flags() {
         .success()
         .stdout("0\n");
     d.chron().args(["head"]).assert().code(2);
+    d.chron()
+        .args(["--tls-ca", "/nonexistent/ca.pem", "head"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot read the CA"));
 
     let p2 = chrond::testing::pki();
     let tls = chrond::Tls {
@@ -406,11 +474,16 @@ fn info_flush_backup_restore_inspect_and_retain() {
         .args(["append", A, "-d", "one"])
         .assert()
         .success();
+    d.chron().args(["info"]).assert().success().stdout(
+        predicate::str::contains("head 1")
+            .and(predicate::str::contains("segments 1"))
+            .and(predicate::str::contains("fsync never")),
+    );
     d.chron()
-        .args(["info"])
+        .args(["--json", "info"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("head 1").and(predicate::str::contains("segments 1")));
+        .stdout(predicate::str::contains("\"fsync\":\"never\""));
     d.chron()
         .args(["flush"])
         .assert()
@@ -456,6 +529,28 @@ fn info_flush_backup_restore_inspect_and_retain() {
         .assert()
         .success()
         .stdout(predicate::str::contains("ok; head 1"));
+    d.chron()
+        .args(["verify", "--max-record-bytes", "1048576"])
+        .arg(&restored)
+        .assert()
+        .success();
+    let empty = d.dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    d.chron()
+        .args(["verify"])
+        .arg(&empty)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("holds no chron database"));
+    assert!(
+        std::fs::read_dir(&empty).unwrap().next().is_none(),
+        "verify created nothing"
+    );
+    d.chron()
+        .args(["rebuild-index"])
+        .arg(d.dir.path().join("missing"))
+        .assert()
+        .code(2);
     std::fs::remove_file(restored.join("index.redb")).unwrap();
     d.chron()
         .args(["rebuild-index"])
@@ -479,4 +574,32 @@ fn info_flush_backup_restore_inspect_and_retain() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("OutOfRange"));
+}
+
+#[test]
+fn admin_token_flag_and_env() {
+    let d = Daemon::start_with(|o| {
+        o.token = Some("user".into());
+        o.admin_token = Some("admin".into());
+    });
+    d.chron()
+        .env("CHRON_TOKEN", "user")
+        .args(["retain", "0"])
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::contains("PermissionDenied")
+                .and(predicate::str::contains("--admin-token")),
+        );
+    d.chron()
+        .env("CHRON_TOKEN", "user")
+        .args(["--admin-token", "admin", "retain", "0"])
+        .assert()
+        .success();
+    d.chron()
+        .env("CHRON_TOKEN", "user")
+        .env("CHRON_ADMIN_TOKEN", "admin")
+        .args(["retain", "0"])
+        .assert()
+        .success();
 }

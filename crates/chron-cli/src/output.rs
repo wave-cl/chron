@@ -53,17 +53,32 @@ pub fn event_json(e: &Event) -> Value {
     obj.insert("recorded_at_unix_nanos".into(), json!(e.recorded_at));
     obj.insert("first_in_txn".into(), json!(e.is_first_in_txn()));
     obj.insert("last_in_txn".into(), json!(e.is_last_in_txn()));
+    let (text, binary): (Vec<&[u8]>, Vec<&[u8]>) = e
+        .tags
+        .iter()
+        .map(|t| t.as_ref())
+        .partition(|t| std::str::from_utf8(t).is_ok());
     obj.insert(
         "tags".into(),
         Value::Array(
-            e.tags
-                .iter()
+            text.iter()
                 .map(|t| Value::String(String::from_utf8_lossy(t).into_owned()))
                 .collect(),
         ),
     );
+    if !binary.is_empty() {
+        obj.insert(
+            "tags_base64".into(),
+            Value::Array(
+                binary
+                    .iter()
+                    .map(|t| Value::String(base64::engine::general_purpose::STANDARD.encode(t)))
+                    .collect(),
+            ),
+        );
+    }
     text_or_base64(&mut obj, "metadata", &e.metadata, true);
-    text_or_base64(&mut obj, "payload", &e.payload, false);
+    text_or_base64(&mut obj, "payload", &e.payload, true);
     Value::Object(obj)
 }
 
