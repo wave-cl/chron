@@ -365,6 +365,63 @@ mod tests {
         assert!(ev.is_last_in_txn());
     }
 
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_event() -> impl Strategy<Value = Event> {
+            let flags = prop::sample::select(vec![
+                0u8,
+                FLAG_FIRST_IN_TXN,
+                FLAG_LAST_IN_TXN,
+                FLAG_FIRST_IN_TXN | FLAG_LAST_IN_TXN,
+            ]);
+            let tags = prop::collection::vec(
+                prop::collection::vec(any::<u8>(), 0..=MAX_TAG_BYTES).prop_map(Bytes::from),
+                0..=8,
+            );
+            let blob = || prop::collection::vec(any::<u8>(), 0..=1024).prop_map(Bytes::from);
+            (
+                flags,
+                any::<bool>(),
+                any::<u128>(),
+                any::<u64>(),
+                any::<u64>(),
+                any::<i64>(),
+                tags,
+                blob(),
+                blob(),
+            )
+                .prop_map(
+                    |(flags, free, id, index, position, recorded_at, tags, metadata, payload)| {
+                        Event {
+                            position,
+                            aggregate: (!free).then_some(Uuid::from_u128(id)),
+                            index: if free { 0 } else { index },
+                            recorded_at,
+                            flags: flags | if free { FLAG_FREE } else { 0 },
+                            tags,
+                            metadata,
+                            payload,
+                        }
+                    },
+                )
+        }
+
+        proptest! {
+            #[test]
+            fn any_event_round_trips(ev in arb_event()) {
+                let body = encode(&ev);
+                prop_assert_eq!(body.len(), body_len(&ev.tags, ev.metadata.len(), ev.payload.len()));
+                prop_assert_eq!(decode_body(&body).unwrap(), ev);
+                prop_assert_eq!(decode_body(&body[..body.len() - 1]), Err(DecodeError::Short));
+                let mut longer = body.clone();
+                longer.push(0);
+                prop_assert_eq!(decode_body(&longer), Err(DecodeError::Trailing(1)));
+            }
+        }
+    }
+
     #[test]
     fn new_event_builder() {
         let ev = NewEvent::new("p").tag("a").tags(["b", "c"]).metadata("m");
