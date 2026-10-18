@@ -215,11 +215,10 @@ async fn at_most_one_node_accepts_writes_at_any_moment() {
         let _ = tokio::time::timeout(Duration::from_secs(5), p).await;
     }
     let all = successes.lock().unwrap().clone();
+    // The third election may return the first leader, so two distinct
+    // writers is the floor; the property is below.
     let writers: std::collections::BTreeSet<usize> = all.iter().map(|s| s.0).collect();
-    assert!(
-        writers.len() >= 3,
-        "every node led at some point: {writers:?}"
-    );
+    assert!(writers.len() >= 2, "leadership never moved: {writers:?}");
     let mut overlaps = 0;
     for a in &all {
         for b in &all {
