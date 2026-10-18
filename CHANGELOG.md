@@ -6,10 +6,6 @@ crates share one version.
 
 ## Unreleased
 
-The workspace version is bumped to 0.3.0 ahead of the release, so
-`cargo package` verifies the crates against each other rather than
-against the published 0.2.0.
-
 ### chron-db
 
 - `Db::truncate_to(position)`: drops the records from a transaction
