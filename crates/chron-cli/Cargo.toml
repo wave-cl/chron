@@ -1,0 +1,32 @@
+[package]
+name = "chron-cli"
+description = "chron: the command-line client and offline maintenance tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "chron"
+path = "src/main.rs"
+
+[dependencies]
+chron = { workspace = true }
+chron-proto = { workspace = true }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+chrond = { workspace = true }
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

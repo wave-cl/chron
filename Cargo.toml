@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/chron", "crates/chron-proto", "crates/chrond"]
+members = ["crates/chron", "crates/chron-proto", "crates/chrond", "crates/chron-cli"]
 
 [workspace.package]
 version = "0.1.0"
