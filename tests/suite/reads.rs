@@ -106,6 +106,84 @@ fn tag_order_across_aggregates() {
 }
 
 #[test]
+fn read_all_backward() {
+    let d = tmp();
+    let db = open(d.path());
+    assert!(db.read_all_backward(u64::MAX, 10).unwrap().is_empty());
+    fill(&db, agg(1), 4);
+    assert_eq!(
+        positions(&db.read_all_backward(u64::MAX, 10).unwrap()),
+        [3, 2, 1, 0]
+    );
+    let got = db.read_all_backward(2, 2).unwrap();
+    assert_eq!(positions(&got), [2, 1]);
+    assert_eq!(payloads(&got), ["e2", "e1"]);
+    assert_eq!(positions(&db.read_all_backward(0, 5).unwrap()), [0]);
+    assert_eq!(positions(&db.read_all_backward(99, 1).unwrap()), [3]);
+    assert!(db.read_all_backward(3, 0).unwrap().is_empty());
+}
+
+#[test]
+fn read_aggregate_backward() {
+    let d = tmp();
+    let db = open(d.path());
+    let (a, b) = (agg(1), agg(2));
+    for i in 0..6u64 {
+        let mut t = db.transaction();
+        t.append_one(
+            if i % 2 == 0 { a } else { b },
+            Expected::Any,
+            ev(&format!("e{i}")),
+        );
+        t.commit().unwrap();
+    }
+    let got = db.read_aggregate_backward(a, u64::MAX, 10).unwrap();
+    assert_eq!(indices(&got), [2, 1, 0]);
+    assert_eq!(payloads(&got), ["e4", "e2", "e0"]);
+    assert_eq!(positions(&got), [4, 2, 0]);
+    assert_eq!(
+        indices(&db.read_aggregate_backward(b, 1, 10).unwrap()),
+        [1, 0]
+    );
+    assert_eq!(indices(&db.read_aggregate_backward(b, 1, 1).unwrap()), [1]);
+    assert!(
+        db.read_aggregate_backward(agg(9), u64::MAX, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(db.read_aggregate_backward(a, 2, 0).unwrap().is_empty());
+}
+
+#[test]
+fn read_tag_backward() {
+    let d = tmp();
+    let db = open(d.path());
+    let steps: [(&str, &[&str]); 4] = [
+        ("a0", &["t"]),
+        ("b0", &[]),
+        ("a1", &["t", "u"]),
+        ("c0", &["t"]),
+    ];
+    for (p, tags) in steps {
+        let mut t = db.transaction();
+        t.append_one(agg(1), Expected::Any, tagged(p, tags));
+        t.commit().unwrap();
+    }
+    assert_eq!(
+        positions(&db.read_tag_backward("t", u64::MAX, 10).unwrap()),
+        [3, 2, 0]
+    );
+    assert_eq!(
+        payloads(&db.read_tag_backward("t", 2, 10).unwrap()),
+        ["a1", "a0"]
+    );
+    assert_eq!(positions(&db.read_tag_backward("t", 1, 10).unwrap()), [0]);
+    assert_eq!(positions(&db.read_tag_backward("t", 3, 1).unwrap()), [3]);
+    assert!(db.read_tag_backward("v", u64::MAX, 10).unwrap().is_empty());
+    assert!(db.read_tag_backward("t", 3, 0).unwrap().is_empty());
+}
+
+#[test]
 fn empty_transaction_and_empty_append() {
     let d = tmp();
     let db = open(d.path());

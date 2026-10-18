@@ -46,4 +46,17 @@ fn segments_rotate_and_reads_cross_them() {
     assert_eq!(db.head(), 341);
     assert!(segments(d.path()).len() >= n);
     assert_eq!(db.read_all(0, 1000).unwrap().len(), 341);
+
+    let mut forward = db.read_all(0, 1000).unwrap();
+    forward.reverse();
+    assert_eq!(db.read_all_backward(u64::MAX, 1000).unwrap(), forward);
+    let mut forward = db.read_tag("t", 0, 1000).unwrap();
+    forward.reverse();
+    assert_eq!(db.read_tag_backward("t", u64::MAX, 1000).unwrap(), forward);
+    let mut forward = db.read_aggregate(agg(1), 0, 1000).unwrap();
+    forward.reverse();
+    assert_eq!(
+        db.read_aggregate_backward(agg(1), u64::MAX, 1000).unwrap(),
+        forward
+    );
 }

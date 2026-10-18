@@ -163,8 +163,37 @@ impl Db {
             .inner
             .index
             .aggregate_positions(&txn, &id, from_index, limit)?;
+        self.assemble_aggregate(&txn, id, found)
+    }
+
+    /// The aggregate's events at indices `<= from_index`, newest first, at
+    /// most `limit`. `from_index` is clamped to the aggregate's last event,
+    /// so `u64::MAX` means "from the end".
+    pub fn read_aggregate_backward(
+        &self,
+        id: Uuid,
+        from_index: u64,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let txn = self.inner.index.begin_read()?;
+        let found = self
+            .inner
+            .index
+            .aggregate_positions_rev(&txn, &id, from_index, limit)?;
+        self.assemble_aggregate(&txn, id, found)
+    }
+
+    fn assemble_aggregate(
+        &self,
+        txn: &redb::ReadTransaction,
+        id: Uuid,
+        found: Vec<(u64, u64)>,
+    ) -> Result<Vec<Event>> {
         let positions: Vec<u64> = found.iter().map(|(_, p)| *p).collect();
-        let locations = Index::locate_many(&txn, &positions)?;
+        let locations = Index::locate_many(txn, &positions)?;
         let mut out = Vec::with_capacity(found.len());
         for ((index, position), loc) in found.into_iter().zip(locations) {
             let ev = self.read_located(position, loc)?;
@@ -203,6 +232,21 @@ impl Db {
             .collect()
     }
 
+    /// Events at positions `<= from`, newest first, at most `limit`. `from`
+    /// is clamped to the newest event, so `u64::MAX` means "from the end";
+    /// empty when there are no events.
+    pub fn read_all_backward(&self, from: u64, limit: usize) -> Result<Vec<Event>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let txn = self.inner.index.begin_read()?;
+        let found = self.inner.index.positions_to(&txn, from, limit)?;
+        found
+            .into_iter()
+            .map(|(position, loc)| self.read_located(position, Some(loc)))
+            .collect()
+    }
+
     /// Every event carrying `tag` from global position `from`, at most
     /// `limit`, in global order.
     pub fn read_tag(&self, tag: impl AsRef<[u8]>, from: u64, limit: usize) -> Result<Vec<Event>> {
@@ -212,7 +256,33 @@ impl Db {
         }
         let txn = self.inner.index.begin_read()?;
         let positions = self.inner.index.tag_positions(&txn, tag, from, limit)?;
-        let locations = Index::locate_many(&txn, &positions)?;
+        self.assemble_tag(&txn, tag, positions)
+    }
+
+    /// Events carrying `tag` at positions `<= from`, newest first, at most
+    /// `limit`. `u64::MAX` means "from the end".
+    pub fn read_tag_backward(
+        &self,
+        tag: impl AsRef<[u8]>,
+        from: u64,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let tag = tag.as_ref();
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let txn = self.inner.index.begin_read()?;
+        let positions = self.inner.index.tag_positions_rev(&txn, tag, from, limit)?;
+        self.assemble_tag(&txn, tag, positions)
+    }
+
+    fn assemble_tag(
+        &self,
+        txn: &redb::ReadTransaction,
+        tag: &[u8],
+        positions: Vec<u64>,
+    ) -> Result<Vec<Event>> {
+        let locations = Index::locate_many(txn, &positions)?;
         let mut out = Vec::with_capacity(positions.len());
         for (position, loc) in positions.into_iter().zip(locations) {
             let ev = self.read_located(position, loc)?;

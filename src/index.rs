@@ -177,6 +177,64 @@ impl Index {
         Ok(out)
     }
 
+    /// `(position, location)` of the events at positions `<= from`, newest
+    /// first, at most `limit`.
+    pub(crate) fn positions_to(
+        &self,
+        txn: &ReadTransaction,
+        from: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, Location)>> {
+        let table = txn.open_table(POS)?;
+        let mut out = Vec::new();
+        for item in table.range(..=from)?.rev().take(limit) {
+            let (k, v) = item?;
+            out.push((k.value(), v.value().into()));
+        }
+        Ok(out)
+    }
+
+    /// `(index, position)` of the aggregate's events at indices
+    /// `<= from_index`, newest first.
+    pub(crate) fn aggregate_positions_rev(
+        &self,
+        txn: &ReadTransaction,
+        id: &Uuid,
+        from_index: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, u64)>> {
+        let table = txn.open_table(AGG_INDEX)?;
+        let bytes = id.as_bytes();
+        let mut out = Vec::new();
+        for item in table
+            .range((bytes, 0)..=(bytes, from_index))?
+            .rev()
+            .take(limit)
+        {
+            let (k, v) = item?;
+            out.push((k.value().1, v.value()));
+        }
+        Ok(out)
+    }
+
+    /// Positions of the events carrying `tag` at positions `<= from`,
+    /// newest first.
+    pub(crate) fn tag_positions_rev(
+        &self,
+        txn: &ReadTransaction,
+        tag: &[u8],
+        from: u64,
+        limit: usize,
+    ) -> Result<Vec<u64>> {
+        let table = txn.open_table(TAG)?;
+        let mut out = Vec::new();
+        for item in table.range((tag, 0)..=(tag, from))?.rev().take(limit) {
+            let (k, _) = item?;
+            out.push(k.value().1);
+        }
+        Ok(out)
+    }
+
     /// Positions of the events carrying `tag` from `from`, ascending.
     pub(crate) fn tag_positions(
         &self,
@@ -242,6 +300,17 @@ mod tests {
         assert_eq!(i.tag_positions(&txn, b"a", 5, 100).unwrap(), vec![8]);
         assert_eq!(i.tag_positions(&txn, b"a", 0, 2).unwrap(), vec![0, 4]);
         assert!(i.tag_positions(&txn, b"", 0, 100).unwrap().is_empty());
+        assert_eq!(
+            i.tag_positions_rev(&txn, b"a", u64::MAX, 100).unwrap(),
+            vec![8, 4, 0]
+        );
+        assert_eq!(i.tag_positions_rev(&txn, b"a", 7, 100).unwrap(), vec![4, 0]);
+        assert_eq!(i.tag_positions_rev(&txn, b"a\0", 9, 1).unwrap(), vec![9]);
+        assert!(
+            i.tag_positions_rev(&txn, b"c", u64::MAX, 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -273,6 +342,19 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert_eq!(
+            i.aggregate_positions_rev(&txn, &a, u64::MAX, 2).unwrap(),
+            vec![(4, 8), (3, 6)]
+        );
+        assert_eq!(
+            i.aggregate_positions_rev(&txn, &b, 1, 10).unwrap(),
+            vec![(1, 3), (0, 1)]
+        );
+        assert!(
+            i.aggregate_positions_rev(&txn, &Uuid::from_u128(3), u64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -301,6 +383,16 @@ mod tests {
             }
         );
         assert!(i.positions_from(&txn, u64::MAX, 5).unwrap().is_empty());
+        let back = |from, limit| -> Vec<u64> {
+            i.positions_to(&txn, from, limit)
+                .unwrap()
+                .iter()
+                .map(|(p, _)| *p)
+                .collect()
+        };
+        assert_eq!(back(u64::MAX, 2), vec![5, 4]);
+        assert_eq!(back(3, 10), vec![3, 2, 1, 0]);
+        assert_eq!(back(0, 1), vec![0]);
         assert_eq!(
             i.locate(5).unwrap(),
             Some(Location {
