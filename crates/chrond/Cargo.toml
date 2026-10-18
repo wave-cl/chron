@@ -48,6 +48,7 @@ base64 = { workspace = true }
 subtle = { workspace = true }
 http = { workspace = true }
 rcgen = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
@@ -55,7 +56,7 @@ uuid = { workspace = true }
 
 [features]
 # Certificate generation for tests: `chrond::testing`.
-test-util = ["dep:rcgen"]
+test-util = ["dep:rcgen", "dep:tempfile"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

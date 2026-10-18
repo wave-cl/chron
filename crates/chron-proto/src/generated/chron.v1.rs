@@ -215,6 +215,120 @@ pub struct InfoResponse {
     /// The database this call was addressed to (`chron-db`, or `default`).
     #[prost(string, tag = "16")]
     pub database: ::prost::alloc::string::String,
+    /// The leader's address as this node knows it: its own on a leader, the
+    /// one it follows on a replica, the last one heard on a candidate.
+    #[prost(string, optional, tag = "17")]
+    pub leader_addr: ::core::option::Option<::prost::alloc::string::String>,
+    /// On a leader with peers: how much of the majority lease is left (0
+    /// once it expired, when writes are refused).
+    #[prost(uint64, optional, tag = "18")]
+    pub lease_remaining_ms: ::core::option::Option<u64>,
+    /// The peers this node was started with (empty without --peer).
+    #[prost(string, repeated, tag = "19")]
+    pub peers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The epoch of the vote this node last gave, if any.
+    #[prost(uint64, optional, tag = "20")]
+    pub voted_epoch: ::core::option::Option<u64>,
+}
+/// A leader with peers tells each of them, every third of the lease, that
+/// it leads under `epoch`. An admin call.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HeartbeatRequest {
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    #[prost(string, tag = "2")]
+    pub leader_addr: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub head: u64,
+    #[prost(uint64, tag = "4")]
+    pub lease_ttl_ms: u64,
+}
+/// `ok` acknowledges the lease; `epoch` is the answering node's own, so a
+/// leader learns of a newer one.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HeartbeatResponse {
+    #[prost(bool, tag = "1")]
+    pub ok: bool,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    #[prost(string, optional, tag = "3")]
+    pub leader_addr: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "4")]
+    pub head: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DatabaseHead {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub head: u64,
+}
+/// A node asks a peer to vote for it as the leader under `epoch`.
+/// `last_epoch` and `databases` say how up to date the candidate is;
+/// `pre_vote` asks whether the vote would be granted without granting it;
+/// `forced` (an operator's promote) ignores a leader heard recently, and
+/// a leader that grants it fences itself first. An admin call.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RequestVoteRequest {
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    #[prost(string, tag = "2")]
+    pub candidate_addr: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub last_epoch: u64,
+    #[prost(message, repeated, tag = "4")]
+    pub databases: ::prost::alloc::vec::Vec<DatabaseHead>,
+    #[prost(bool, tag = "5")]
+    pub forced: bool,
+    #[prost(bool, tag = "6")]
+    pub pre_vote: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RequestVoteResponse {
+    #[prost(bool, tag = "1")]
+    pub granted: bool,
+    /// The answering node's own epoch.
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    /// Why the vote was refused, for the log.
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// The stored crc32 of the records at `positions`, so a copy of the
+/// database can find where its history parts from this one. An admin call.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FingerprintsRequest {
+    #[prost(uint64, repeated, tag = "1")]
+    pub positions: ::prost::alloc::vec::Vec<u64>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FingerprintAt {
+    #[prost(uint64, tag = "1")]
+    pub position: u64,
+    /// Absent past the head or below the floor.
+    #[prost(uint32, optional, tag = "2")]
+    pub crc: ::core::option::Option<u32>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FingerprintsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub fingerprints: ::prost::alloc::vec::Vec<FingerprintAt>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DiscoverRequest {}
+/// Who leads, as this node knows it. Open to any token.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DiscoverResponse {
+    #[prost(string, optional, tag = "1")]
+    pub leader_addr: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    #[prost(enumeration = "Role", tag = "3")]
+    pub role: i32,
+    #[prost(string, repeated, tag = "4")]
+    pub peers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(uint64, optional, tag = "5")]
+    pub lease_remaining_ms: ::core::option::Option<u64>,
 }
 /// One of the daemon's databases.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -366,6 +480,9 @@ pub enum Role {
     Leader = 1,
     Replica = 2,
     Fenced = 3,
+    /// With peers: no leader is known and this node holds no lease; writes
+    /// are refused until a leader is elected or heard.
+    Candidate = 4,
 }
 impl Role {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -378,6 +495,7 @@ impl Role {
             Self::Leader => "ROLE_LEADER",
             Self::Replica => "ROLE_REPLICA",
             Self::Fenced => "ROLE_FENCED",
+            Self::Candidate => "ROLE_CANDIDATE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -387,6 +505,7 @@ impl Role {
             "ROLE_LEADER" => Some(Self::Leader),
             "ROLE_REPLICA" => Some(Self::Replica),
             "ROLE_FENCED" => Some(Self::Fenced),
+            "ROLE_CANDIDATE" => Some(Self::Candidate),
             _ => None,
         }
     }
@@ -873,6 +992,96 @@ pub mod chron_client {
                 .insert(GrpcMethod::new("chron.v1.Chron", "DropDatabase"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn heartbeat(
+            &mut self,
+            request: impl tonic::IntoRequest<super::HeartbeatRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::HeartbeatResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/chron.v1.Chron/Heartbeat");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("chron.v1.Chron", "Heartbeat"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn request_vote(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RequestVoteRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RequestVoteResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/RequestVote",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("chron.v1.Chron", "RequestVote"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn discover(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DiscoverRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DiscoverResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/chron.v1.Chron/Discover");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("chron.v1.Chron", "Discover"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn fingerprints(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FingerprintsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FingerprintsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/Fingerprints",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("chron.v1.Chron", "Fingerprints"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1003,6 +1212,34 @@ pub mod chron_server {
             request: tonic::Request<super::DropDatabaseRequest>,
         ) -> std::result::Result<
             tonic::Response<super::DropDatabaseResponse>,
+            tonic::Status,
+        >;
+        async fn heartbeat(
+            &self,
+            request: tonic::Request<super::HeartbeatRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::HeartbeatResponse>,
+            tonic::Status,
+        >;
+        async fn request_vote(
+            &self,
+            request: tonic::Request<super::RequestVoteRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RequestVoteResponse>,
+            tonic::Status,
+        >;
+        async fn discover(
+            &self,
+            request: tonic::Request<super::DiscoverRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DiscoverResponse>,
+            tonic::Status,
+        >;
+        async fn fingerprints(
+            &self,
+            request: tonic::Request<super::FingerprintsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::FingerprintsResponse>,
             tonic::Status,
         >;
     }
@@ -1883,6 +2120,180 @@ pub mod chron_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DropDatabaseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/Heartbeat" => {
+                    #[allow(non_camel_case_types)]
+                    struct HeartbeatSvc<T: Chron>(pub Arc<T>);
+                    impl<T: Chron> tonic::server::UnaryService<super::HeartbeatRequest>
+                    for HeartbeatSvc<T> {
+                        type Response = super::HeartbeatResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::HeartbeatRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::heartbeat(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = HeartbeatSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/RequestVote" => {
+                    #[allow(non_camel_case_types)]
+                    struct RequestVoteSvc<T: Chron>(pub Arc<T>);
+                    impl<T: Chron> tonic::server::UnaryService<super::RequestVoteRequest>
+                    for RequestVoteSvc<T> {
+                        type Response = super::RequestVoteResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RequestVoteRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::request_vote(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RequestVoteSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/Discover" => {
+                    #[allow(non_camel_case_types)]
+                    struct DiscoverSvc<T: Chron>(pub Arc<T>);
+                    impl<T: Chron> tonic::server::UnaryService<super::DiscoverRequest>
+                    for DiscoverSvc<T> {
+                        type Response = super::DiscoverResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DiscoverRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::discover(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DiscoverSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/Fingerprints" => {
+                    #[allow(non_camel_case_types)]
+                    struct FingerprintsSvc<T: Chron>(pub Arc<T>);
+                    impl<
+                        T: Chron,
+                    > tonic::server::UnaryService<super::FingerprintsRequest>
+                    for FingerprintsSvc<T> {
+                        type Response = super::FingerprintsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FingerprintsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::fingerprints(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FingerprintsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

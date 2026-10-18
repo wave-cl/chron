@@ -247,6 +247,7 @@ chrond --data-dir DIR --listen 0.0.0.0:4242 [--no-fsync] [--verify-all-segments]
        [--log-format text|json] [--discover-interval SECS]
        [--replicate-from http://leader:4242 [--replicate-token SECRET | --replicate-token-file FILE]
         [--replicate-ca ca.pem] [--replicate-cert c.pem --replicate-key c.key] [--replicate-domain NAME]]
+       [--peer http://b:4242 --peer http://c:4242 [--advertise http://a:4242] [--lease-ttl SECS]]
        [--promote]
 ```
 
@@ -256,7 +257,8 @@ Flags fall back to environment variables: `CHRON_DATA_DIR`,
 `CHROND_BACKUP_DIR`, `CHROND_MAX_MESSAGE_BYTES`, `CHROND_REQUEST_TIMEOUT`,
 `CHROND_KEEPALIVE_INTERVAL`, `CHROND_KEEPALIVE_TIMEOUT`,
 `CHROND_METRICS_LISTEN`, `CHROND_HTTP_LISTEN`, `CHROND_LOG_FORMAT`,
-`CHROND_DISCOVER_INTERVAL`,
+`CHROND_DISCOVER_INTERVAL`, `CHROND_PEERS` (a comma list),
+`CHROND_ADVERTISE`, `CHROND_LEASE_TTL`,
 `CHRON_REPLICATE_FROM`, `CHRON_REPLICATE_TOKEN`, `CHRON_REPLICATE_TOKEN_FILE`,
 `CHROND_REPLICATE_CA` / `_CERT` / `_KEY` / `_DOMAIN`. Logging follows
 `CHROND_LOG` (an `EnvFilter`, default `info`) on stderr, one line per call
@@ -380,13 +382,16 @@ chron backup <NAME> [--since N] | apply <NAME>       # names under the daemon's 
 chron retain <FLOOR>
 chron health [--service NAME]                        # exit 0 SERVING, 1 NOT_SERVING, 2 unreachable
 chron promote | fence <EPOCH>                        # replication
+chron discover                                       # who leads, as the node at --addr knows it
 chron db create <NAME> | db list | db drop <NAME>    # databases; --db NAME (CHRON_DB) addresses one
 chron append --epoch N … | commit --epoch N …        # fencing token
 chron rebuild-index <DIR> | verify <DIR> | restore <ARCHIVE> <DIR> | inspect <ARCHIVE>   # offline, no daemon
 ```
 
 `--addr` (or `CHRON_ADDR`, default `http://127.0.0.1:4242`) names the
-daemon; `https://` enables TLS with `--tls-ca`, `--tls-cert`/`--tls-key`
+daemon, or with a comma list (`--addr http://a:4242,http://b:4242`) a
+failover group: each node is asked who leads and the leader is used
+(exit 2 with "no leader" when none names one); `https://` enables TLS with `--tls-ca`, `--tls-cert`/`--tls-key`
 and `--tls-domain` (`CHRON_TLS_*`); `--token` (`CHRON_TOKEN`) and
 `--admin-token` (`CHRON_ADMIN_TOKEN`) send the bearer tokens;
 `--max-message-bytes` (`CHRON_MAX_MESSAGE_BYTES`) matches the daemon's
@@ -408,17 +413,21 @@ updated as things happen (`chron_rpc_calls_total{db,method,code}`,
 `chron_rpc_duration_seconds`, `chron_streams_open`,
 `chron_commits_total{db,result}`, `chron_commit_duration_seconds`,
 `chron_replication_errors_total`,
-`chron_replication_chunks_applied_total`); gauges are read on each scrape
+`chron_replication_chunks_applied_total`, `chron_http_requests_total`,
+`chron_elections_total`, `chron_leader_changes_total`,
+`chron_heartbeat_failures_total{peer}`); gauges are read on each scrape
 (`chron_head`, `chron_floor`, `chron_segments`, `chron_segment_bytes`,
 `chron_epoch`, `chron_role{role}`, `chron_replica_connected`,
 `chron_leader_head`, `chron_replication_lag_events`,
-`chron_fenced_by_epoch`), as are the library's commit counters
+`chron_fenced_by_epoch`, `chron_lease_remaining_seconds`,
+`chron_leader_known`, `chron_voted_epoch`, `chron_peers`), as are the library's commit counters
 (`chron_events_committed_total`, `chron_transactions_committed_total`,
 `chron_commit_batches_total`, `chron_fsyncs_total`,
 `chron_fsync_seconds_total`). `chron status [--max-lag N]` is the
 one-screen check with an exit code. [docs/operations.md](docs/operations.md)
-holds the runbooks: promotion and failover, restoring a replica,
-retention, rotating tokens, upgrading, and reading the metrics.
+holds the runbooks: promotion and failover, a failover group, restoring
+a replica, retention, rotating tokens, upgrading, and reading the
+metrics.
 
 ## Replication
 
@@ -469,6 +478,72 @@ leader. A promoted directory refuses to become a replica until its
 leader retained up to its head starts at the leader's floor, where the
 record before it is gone; the leader accepts it without that check.
 
+### Automatic failover
+
+Three or more daemons started with each other as `--peer`s form a
+**failover group** that elects its own leader and replaces it when it
+dies, with no coordinator process. Such a node never starts as a
+leader: it starts as a **candidate** (writes refused), follows the first
+leader it hears, and campaigns when it has heard none for a lease.
+Peers are reached with the replication credentials (`--replicate-token`,
+`--replicate-ca` and friends); `--advertise` is the node's own address as
+the peers reach it (default `http(s)://<listen>`, so a wildcard or port
+0 listen needs it); `--replicate-from` is replaced by the peers.
+
+The leader keeps a **majority lease**: every third of `--lease-ttl`
+(10 s) it heartbeats the peers, and acknowledgments from a majority
+(itself included) let it accept writes for one ttl from the instant
+before the round. When the lease expires, because the majority is
+unreachable, writes are refused at once ("the leader's majority lease
+has expired") and the node steps down to candidate. A follower that
+hears no leader for a ttl, plus a random tenth to half of it, asks every
+peer for a vote under the next epoch; a vote is granted when the epoch
+is new, the voter has not voted for another node in it, the candidate is
+at least as up to date (epoch first, then every database's head) and no
+leader was heard within the last ttl. Any two majorities share a node,
+and that node's silence lasted a full ttl after it last acknowledged the
+old leader, so the old lease has expired before the new leader is
+elected; the votes are the new leader's first lease. Votes are kept in a
+`vote` marker, so a restart never votes twice in one epoch. A leader
+that hears a newer epoch, from a heartbeat answer or another leader's
+heartbeat, fences itself and then follows that leader; one that falls
+behind a majority's promises resolves it the same way, by a re-election
+at a higher epoch.
+
+A leader acknowledges a write once it is on its own disk, not once a
+peer has it, so writes acknowledged by a dead leader after the last
+transaction its successor had pulled are **lost**: the replication lag
+at the moment of death (`chron_replication_lag_events` on the followers
+measures the exposure; the most up-to-date follower is the one elected).
+A leader cut off rather than dead adds up to one lease of writes to
+that, plus one commit that passed the lease check an instant before it
+expired. Writes acknowledged by the leader that replaces it are never
+lost. An old leader that took such writes comes back as a replica
+whose history parts from the leader's: it finds the shared prefix by
+comparing stored record fingerprints (`Fingerprints`), writes the tail
+it is about to drop to `diverged-<epoch>-<from>-<head>.chronbak` in its
+database directory (restore it offline to read what was lost), cuts
+back to the prefix (`Db::truncate_to`) and pulls from there; its live
+subscriptions end with "cut back", since positions from the cut are
+rewritten. Without peers (`--replicate-from`) a diverged replica is
+still refused and left to the operator. `chron promote` on a group node is a *forced* campaign: the
+current leader fences itself and grants the vote, but only to a node
+whose heads match its own, so promote a lagging node and it is refused
+("not up to date"). `chrond --promote` with peers campaigns at start.
+
+Clients find the leader with `Discover`, which any node answers:
+`Client::connect_any(["http://a:4242", "http://b:4242"], config)` asks
+each seed in turn and connects to the leader it names; a commit refused
+as not-the-leader, or failing to reach it, looks for the leader again
+and is retried (`failover_retries`, 3). Reads are not redirected. The
+CLI takes the same list in `--addr`, and `chron discover` prints what a
+node knows. `chron info` and `chron status` show the leader, the lease
+left, the peers and the last vote; `status` is degraded on a candidate
+or an expired lease. The metrics are `chron_role{role="candidate"}`,
+`chron_lease_remaining_seconds`, `chron_leader_known`,
+`chron_voted_epoch`, `chron_peers`, `chron_elections_total`,
+`chron_leader_changes_total` and `chron_heartbeat_failures_total{peer}`.
+
 ## Known limitations
 
 - Forward pages (iterators, subscriptions, the daemon's streams) are
@@ -479,7 +554,15 @@ record before it is gone; the leader accepts it without that check.
   next open; the caller retries from the head the error reports.
 - Per-database options (fsync, record limit) are daemon-wide, and
   `default` cannot be dropped.
-- Automatic failover and more than one leader are not in this version.
+- A failover group loses the writes a dead leader acknowledged after the
+  last transaction its successor had pulled: acknowledgment does not
+  wait for a peer. The old leader keeps them in a `diverged-*.chronbak`
+  file when it rejoins. Synchronous replication (an acknowledgment only
+  once a majority holds the write) and more than one leader at a time
+  (sharding) are not in this version.
+- Failover relies on each node's monotonic clock advancing at the same
+  rate; a stalled process (a long pause, a suspended VM) past the lease
+  can accept one more write than the group has agreed to.
 
 ## Development
 

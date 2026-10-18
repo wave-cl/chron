@@ -137,6 +137,8 @@ pub fn subscribe(
     let (tx, rx) = mpsc::channel(PAGE);
     let cancel = dbn.cancel.clone();
     let mut role = node.watch_role();
+    let mut reset = dbn.reset.subscribe();
+    reset.mark_unchanged();
     tokio::spawn(async move {
         loop {
             let next = tokio::select! {
@@ -146,6 +148,20 @@ pub fn subscribe(
                 }
                 r = role_lost(&mut role, false) => {
                     let _ = tx.send(Err(ended(Some(r)))).await;
+                    return;
+                }
+                r = reset.changed() => {
+                    // The sender goes with the database: that is a drop.
+                    let status = match r {
+                        Ok(()) => {
+                            let to = reset.borrow_and_update().unwrap_or(0);
+                            Status::unavailable(format!(
+                                "the database was cut back to {to} to follow the leader; positions from there are being rewritten, subscribe again"
+                            ))
+                        }
+                        Err(_) => gone(&node),
+                    };
+                    let _ = tx.send(Err(status)).await;
                     return;
                 }
                 _ = tx.closed() => return,
@@ -189,10 +205,16 @@ pub async fn info(node: &Node, dbn: &DbNode) -> Result<pb::InfoResponse, Status>
         epoch: info.epoch,
         fsync: info.fsync == chron::Fsync::Always,
         role: role.wire() as i32,
-        replicating_from: node
-            .leader_addr()
-            .map(str::to_string)
-            .filter(|_| is_replica),
+        replicating_from: node.leader_addr().filter(|_| is_replica),
+        leader_addr: crate::cluster::discover(node).leader_addr,
+        lease_remaining_ms: (role == Role::Leader)
+            .then(|| node.lease_remaining().map(|d| d.as_millis() as u64))
+            .flatten(),
+        peers: node
+            .cluster
+            .as_ref()
+            .map_or_else(Vec::new, |c| c.peers.clone()),
+        voted_epoch: node.lease().voted.map(|(e, _)| e),
         replica_connected: is_replica && replica.connected,
         leader_head: replica.leader_head.filter(|_| is_replica),
         last_replication_error: replica

@@ -31,6 +31,7 @@ mod replicate;
 mod retain;
 mod segment;
 mod subscribe;
+mod truncate;
 mod txn;
 
 pub use backup::{BackupKind, BackupMeta, inspect_backup, restore_backup};
@@ -46,5 +47,6 @@ pub use rebuild::Rebuilt;
 pub use replicate::Chunk;
 pub use retain::Retained;
 pub use subscribe::Subscription;
+pub use truncate::Truncated;
 pub use txn::{AppendResult, Committed, Expected, Transaction};
 pub use uuid::Uuid;

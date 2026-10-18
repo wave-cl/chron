@@ -783,3 +783,115 @@ fn append_takes_several_payloads_in_one_transaction() {
         .stderr(predicate::str::contains("at least one payload"));
     d.chron().args(["append", A]).assert().code(2);
 }
+
+#[test]
+fn a_comma_list_of_addresses_finds_the_leader_and_discover_names_it() {
+    use chrond::testing::Cluster;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let ttl = Duration::from_secs(1);
+    let mut c = rt.block_on(Cluster::start(3, ttl));
+    let l = rt.block_on(c.wait_for_leader(Duration::from_secs(6)));
+    for i in (0..3).filter(|i| *i != l) {
+        rt.block_on(c.wait_following(i, l, Duration::from_secs(6)));
+    }
+    let f = (l + 1) % 3;
+    let list = format!("{},{}", c.addr(f), c.addr(l));
+    // A write through the list lands on the leader even though a
+    // follower is named first.
+    Command::cargo_bin("chron")
+        .unwrap()
+        .args(["--addr", &list, "append", "free", "-d", "via-list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("committed 0"));
+    // Discover on the follower names the leader; info shows the group.
+    Command::cargo_bin("chron")
+        .unwrap()
+        .args(["--addr", &c.addr(f), "discover"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains(format!("leader {}", c.addr(l)))
+                .and(predicate::str::contains("role replica")),
+        );
+    Command::cargo_bin("chron")
+        .unwrap()
+        .args(["--addr", &c.addr(l), "--json", "discover"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"role\":\"leader\"")
+                .and(predicate::str::contains("lease_remaining_ms")),
+        );
+    Command::cargo_bin("chron")
+        .unwrap()
+        .args(["--addr", &c.addr(l), "info"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("lease_remaining").and(predicate::str::contains("peers ")),
+        );
+    // status: a follower is healthy once its puller is connected.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = Command::cargo_bin("chron")
+            .unwrap()
+            .args(["--addr", &c.addr(f), "status"])
+            .assert()
+            .get_output()
+            .clone();
+        if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("status healthy") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the follower never became healthy: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // A single dead address first in the list still finds the leader.
+    let list = format!("http://127.0.0.1:1,{}", c.addr(f));
+    Command::cargo_bin("chron")
+        .unwrap()
+        .args(["--addr", &list, "head"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1"));
+    // Cut the group apart: a candidate is degraded, and the list finds
+    // no leader (exit 2).
+    rt.block_on(c.stop(l));
+    rt.block_on(c.stop(f));
+    let third = (0..3).find(|i| *i != l && *i != f).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = Command::cargo_bin("chron")
+            .unwrap()
+            .args(["--addr", &c.addr(third), "status"])
+            .assert()
+            .get_output()
+            .clone();
+        let err = String::from_utf8_lossy(&out.stderr);
+        if out.status.code() == Some(1)
+            && (err.contains("candidate") || err.contains("replica disconnected"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never degraded: {err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Command::cargo_bin("chron")
+        .unwrap()
+        .args([
+            "--addr",
+            &format!("{},{}", c.addr(third), c.addr(l)),
+            "head",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no leader"));
+    rt.block_on(c.stop_all());
+}

@@ -7,7 +7,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "chron-load", version)]
 struct Cli {
-    /// The leader's address.
+    /// The leader's address, or a comma list of a failover group's nodes.
     #[arg(long, env = "CHRON_ADDR", default_value = "http://127.0.0.1:4242")]
     addr: String,
     /// A replica to compare with the leader at the end.
@@ -47,9 +47,54 @@ struct Cli {
     retain_every: Option<u64>,
     #[arg(long, default_value_t = 1)]
     seed: u64,
+    /// Kill the leader (SIGKILL to the pid --pid gives for its address)
+    /// every this many seconds; something else must restart it.
+    #[arg(long, requires = "pid")]
+    kill_leader_every: Option<u64>,
+    /// ADDR=PID, or ADDR=FILE holding the pid (read at each kill, so a
+    /// restarted daemon's new pid is found), for each node of the group.
+    #[arg(long = "pid", value_name = "ADDR=PID|FILE")]
+    pid: Vec<String>,
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
+}
+
+/// A killer that sends SIGKILL to the pid given for an address (a
+/// number, or a file holding one, read at each kill).
+fn killer(pairs: &[String]) -> anyhow::Result<chron_load::Killer> {
+    let mut pids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for p in pairs {
+        let (addr, pid) = p
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--pid takes ADDR=PID or ADDR=FILE, not {p:?}"))?;
+        pids.insert(addr.trim().to_string(), pid.trim().to_string());
+    }
+    let pids = std::sync::Arc::new(pids);
+    Ok(std::sync::Arc::new(move |addr: String| {
+        let pids = pids.clone();
+        Box::pin(async move {
+            let Some(spec) = pids.get(&addr) else {
+                eprintln!("no pid known for the leader {addr}; not killed");
+                return;
+            };
+            let pid: Option<u32> = match spec.parse() {
+                Ok(n) => Some(n),
+                Err(_) => std::fs::read_to_string(spec)
+                    .ok()
+                    .and_then(|t| t.trim().parse().ok()),
+            };
+            match pid {
+                Some(pid) => {
+                    eprintln!("killing the leader {addr} (pid {pid})");
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &pid.to_string()])
+                        .status();
+                }
+                None => eprintln!("no pid in {spec} for the leader {addr}; not killed"),
+            }
+        })
+    }))
 }
 
 #[tokio::main]
@@ -71,13 +116,19 @@ async fn main() -> anyhow::Result<()> {
         backup_every: cli.backup_every.map(Duration::from_secs),
         retain_every: cli.retain_every.map(Duration::from_secs),
         seed: cli.seed,
+        kill_every: cli.kill_leader_every.map(Duration::from_secs),
+        killer: if cli.pid.is_empty() {
+            None
+        } else {
+            Some(killer(&cli.pid)?)
+        },
     })
     .await?;
     if cli.json {
         println!("{}", report.to_json());
     } else {
         println!(
-            "transactions {}  events {}  conflicts {}  errors {}\nreads {} ({} events)  subscribed {}  backups {}  retentions {}\ncommit p50 {:.2} ms  p99 {:.2} ms\nfinal head {}  replica head {:?}",
+            "transactions {}  events {}  conflicts {}  errors {}\nreads {} ({} events)  subscribed {}  backups {}  retentions {}\ncommit p50 {:.2} ms  p99 {:.2} ms\nfinal head {}  replica head {:?}\nkills {}  lost acks {}  failover errors {}",
             report.transactions,
             report.events,
             report.conflicts,
@@ -90,7 +141,10 @@ async fn main() -> anyhow::Result<()> {
             report.commit_p50_ms,
             report.commit_p99_ms,
             report.final_head,
-            report.replica_head
+            report.replica_head,
+            report.kills,
+            report.lost_acks,
+            report.failover_errors
         );
         for v in &report.violations {
             println!("VIOLATION: {v}");

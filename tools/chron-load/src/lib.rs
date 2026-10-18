@@ -4,6 +4,8 @@
 //! replica compared at the end.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -12,9 +14,16 @@ use chron_client::{Client, ClientConfig, ClientError, Event, Expected, NewEvent,
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 
+/// Kills the daemon at an address (a SIGKILL to its pid, or a test's
+/// shutdown of an in-process node). What restarts it is the caller's
+/// business.
+pub type Killer = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// What one run does.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
+    /// The leader, or a comma list of a failover group's nodes: each is
+    /// asked who leads.
     pub addr: String,
     pub replica: Option<String>,
     pub token: Option<String>,
@@ -32,6 +41,27 @@ pub struct Config {
     pub backup_every: Option<Duration>,
     pub retain_every: Option<Duration>,
     pub seed: u64,
+    /// Kill the leader this often (needs `killer`); the run then checks
+    /// that no write acknowledged by a surviving leader is lost, and
+    /// that writes lost with a killed leader were acknowledged before
+    /// the kill at positions past every other node's head then.
+    pub kill_every: Option<Duration>,
+    pub killer: Option<Killer>,
+}
+
+impl Config {
+    pub fn addrs(&self) -> Vec<String> {
+        self.addr
+            .split(',')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn kill_mode(&self) -> bool {
+        self.kill_every.is_some() && self.killer.is_some()
+    }
 }
 
 /// Counts and timings of a run.
@@ -50,6 +80,14 @@ pub struct Report {
     pub commit_p99_ms: f64,
     pub final_head: u64,
     pub replica_head: Option<u64>,
+    /// Leaders killed (kill mode).
+    pub kills: u64,
+    /// Acknowledged writes not in the log at the end (kill mode): each
+    /// one allowed only as a write to a killed leader.
+    pub lost_acks: u64,
+    /// Calls that failed while a leader was being replaced (kill mode):
+    /// expected, counted, not violations.
+    pub failover_errors: u64,
     /// Every invariant that failed, with where and what.
     pub violations: Vec<String>,
 }
@@ -66,7 +104,9 @@ impl Report {
             "subscribed_events": self.subscribed_events, "backups": self.backups,
             "retentions": self.retentions, "commit_p50_ms": self.commit_p50_ms,
             "commit_p99_ms": self.commit_p99_ms, "final_head": self.final_head,
-            "replica_head": self.replica_head, "violations": self.violations, "ok": self.ok(),
+            "replica_head": self.replica_head, "kills": self.kills, "lost_acks": self.lost_acks,
+            "failover_errors": self.failover_errors,
+            "violations": self.violations, "ok": self.ok(),
         })
     }
 }
@@ -107,6 +147,15 @@ struct Shared {
     floor: AtomicU64,
     latencies: Mutex<Vec<u64>>,
     violations: Mutex<Vec<String>>,
+    kill_mode: bool,
+    kills: AtomicU64,
+    failover_errors: AtomicU64,
+    /// Kill mode: every acknowledged write as (position, payload hash,
+    /// when).
+    acks: std::sync::Mutex<Vec<(u64, u64, Instant)>>,
+    /// Kill mode: each kill as (when the leader was down, the highest
+    /// head among the other nodes just before it was killed).
+    kill_log: std::sync::Mutex<Vec<(Instant, u64)>>,
 }
 
 impl Shared {
@@ -118,9 +167,65 @@ impl Shared {
         }
     }
 
+    /// Whether `e` is what a failover looks like from a client.
+    fn failover_error(e: &ClientError) -> bool {
+        matches!(
+            e,
+            ClientError::Fenced { .. }
+                | ClientError::Unavailable(_)
+                | ClientError::Transport(_)
+                | ClientError::NoLeader(_)
+                | ClientError::Status(_)
+        )
+    }
+
+    /// Records an error: in kill mode a failover-shaped one is counted,
+    /// not a violation.
     fn error(&self, what: &str, e: &ClientError) {
+        if self.kill_mode && Self::failover_error(e) {
+            self.failover_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         self.errors.fetch_add(1, Ordering::Relaxed);
         self.violation(format!("{what}: unexpected error: {e}"));
+    }
+
+    fn ack(&self, position: u64, payload: &[u8]) {
+        if self.kill_mode {
+            self.acks.lock().unwrap_or_else(|p| p.into_inner()).push((
+                position,
+                hash(payload),
+                Instant::now(),
+            ));
+        }
+    }
+
+    /// Whether a kill happened at or after `t`.
+    fn killed_since(&self, t: Instant) -> bool {
+        self.kill_log
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|(k, _)| *k >= t)
+    }
+}
+
+/// FNV-1a over a payload, for the ack log.
+fn hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Reconnects a client to the leader after a failover-shaped error, in
+/// kill mode; otherwise does nothing.
+async fn after_error(shared: &Shared, client: &Client, e: &ClientError) {
+    if shared.kill_mode && Shared::failover_error(e) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = client.rediscover().await;
     }
 }
 
@@ -174,40 +279,51 @@ fn check_event(shared: &Shared, where_: &str, ev: &Event, expect_position: Optio
     }
 }
 
+fn client_config(cfg: &Config) -> ClientConfig {
+    ClientConfig {
+        token: cfg.token.clone(),
+        admin_token: cfg.token.clone(),
+        database: cfg.database.clone(),
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Some(Duration::from_secs(30)),
+        ..ClientConfig::default()
+    }
+}
+
+/// A client for the leader: any of the addresses is asked who leads.
+async fn connect_leader(cfg: &Config) -> Result<Client, ClientError> {
+    Client::connect_any(cfg.addrs(), client_config(cfg)).await
+}
+
 async fn connect(cfg: &Config, addr: &str) -> Result<Client, ClientError> {
-    Client::connect(
-        addr,
-        ClientConfig {
-            token: cfg.token.clone(),
-            admin_token: cfg.token.clone(),
-            database: cfg.database.clone(),
-            ..ClientConfig::default()
-        },
-    )
-    .await
+    Client::connect(addr, client_config(cfg)).await
 }
 
 async fn writer(cfg: Config, client: Client, shared: Arc<Shared>, w: usize) {
     let mut rng = Rng::new(cfg.seed ^ ((w as u64 + 1) * 0x9E37));
-    let mut lens: HashMap<u64, u64> = HashMap::new();
+    // Per aggregate: the length last seen and when it was last acknowledged.
+    let mut lens: HashMap<u64, (u64, Instant)> = HashMap::new();
     let mut seq = 0u64;
     while !shared.stop.load(Ordering::Relaxed) {
         let agg = rng.below(cfg.aggregates);
         let id = aggregate(agg);
-        let len = match lens.get(&agg) {
+        let (len, acked_at) = match lens.get(&agg) {
             Some(l) => *l,
             None => match client.aggregate_len(id).await {
-                Ok(l) => l,
+                Ok(l) => (l, Instant::now()),
                 Err(e) => {
                     shared.error("writer len", &e);
+                    after_error(&shared, &client, &e).await;
                     continue;
                 }
             },
         };
-        let events: Vec<NewEvent> = (0..cfg.events_per_txn)
-            .map(|j| {
-                NewEvent::new(payload(w, seq, agg, len + j as u64, cfg.payload_bytes)).tag("load")
-            })
+        let payloads: Vec<Vec<u8>> = (0..cfg.events_per_txn)
+            .map(|j| payload(w, seq, agg, len + j as u64, cfg.payload_bytes))
+            .collect();
+        let events: Vec<NewEvent> = payloads
+            .iter()
+            .map(|p| NewEvent::new(p.clone()).tag("load"))
             .collect();
         let n = events.len() as u64;
         let start = Instant::now();
@@ -228,19 +344,27 @@ async fn writer(cfg: Config, client: Client, shared: Arc<Shared>, w: usize) {
                         c.appends[0].new_len
                     ));
                 }
-                lens.insert(agg, len + n);
+                for (j, p) in payloads.iter().enumerate() {
+                    shared.ack(c.first + j as u64, p);
+                }
+                lens.insert(agg, (len + n, Instant::now()));
                 seq += 1;
             }
             Err(ClientError::Conflict { actual, .. }) => {
                 shared.conflicts.fetch_add(1, Ordering::Relaxed);
-                if actual < len {
+                // Shrinking is what a killed leader's lost writes look
+                // like; anything else is a violation.
+                if actual < len && !shared.killed_since(acked_at) {
                     shared.violation(format!(
                         "writer {w}: aggregate {agg} shrank from {len} to {actual}"
                     ));
                 }
-                lens.insert(agg, actual);
+                lens.insert(agg, (actual, Instant::now()));
             }
-            Err(e) => shared.error("writer commit", &e),
+            Err(e) => {
+                shared.error("writer commit", &e);
+                after_error(&shared, &client, &e).await;
+            }
         }
     }
 }
@@ -252,6 +376,7 @@ async fn reader(client: Client, shared: Arc<Shared>, r: usize, seed: u64) {
             Ok(h) => h,
             Err(e) => {
                 shared.error("reader head", &e);
+                after_error(&shared, &client, &e).await;
                 continue;
             }
         };
@@ -290,40 +415,177 @@ async fn reader(client: Client, shared: Arc<Shared>, r: usize, seed: u64) {
                 // Retention moved the floor since we looked; remember it.
                 shared.floor.fetch_max(f, Ordering::Relaxed);
             }
-            Err(e) => shared.error("reader", &e),
+            Err(ClientError::PositionOutOfRange { .. }) if shared.kill_mode => {
+                // The head we read came from a leader since replaced.
+            }
+            Err(e) => {
+                shared.error("reader", &e);
+                after_error(&shared, &client, &e).await;
+            }
         }
     }
 }
 
 async fn subscriber(client: Client, shared: Arc<Shared>, s: usize) {
-    let from = shared.floor.load(Ordering::Relaxed);
-    let mut stream = match client.subscribe(from).await {
-        Ok(s) => s,
-        Err(e) => {
-            shared.error("subscribe", &e);
-            return;
-        }
-    };
-    let mut next = from;
-    while !shared.stop.load(Ordering::Relaxed) {
-        let item = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
-        match item {
-            Ok(Some(Ok(ev))) => {
-                check_event(&shared, &format!("subscriber {s}"), &ev, Some(next));
-                next = ev.position + 1;
-                shared.subscribed.fetch_add(1, Ordering::Relaxed);
+    let mut next = shared.floor.load(Ordering::Relaxed);
+    'outer: while !shared.stop.load(Ordering::Relaxed) {
+        let mut stream = match client.subscribe(next).await {
+            Ok(s) => s,
+            Err(ClientError::PositionOutOfRange { head, .. }) if shared.kill_mode => {
+                // Positions past the new leader's head were lost with
+                // the old one; they will be reused.
+                next = head;
+                continue;
             }
-            Ok(Some(Err(e))) => {
-                shared.error("subscriber", &e);
+            Err(e) => {
+                shared.error("subscribe", &e);
+                if shared.kill_mode && Shared::failover_error(&e) {
+                    after_error(&shared, &client, &e).await;
+                    continue;
+                }
                 return;
             }
-            Ok(None) => {
-                shared.violation(format!("subscriber {s}: the stream ended"));
-                return;
+        };
+        while !shared.stop.load(Ordering::Relaxed) {
+            let item = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+            match item {
+                Ok(Some(Ok(ev))) => {
+                    check_event(&shared, &format!("subscriber {s}"), &ev, Some(next));
+                    next = ev.position + 1;
+                    shared.subscribed.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(Some(Err(e))) => {
+                    shared.error("subscriber", &e);
+                    if shared.kill_mode && Shared::failover_error(&e) {
+                        after_error(&shared, &client, &e).await;
+                        continue 'outer;
+                    }
+                    return;
+                }
+                Ok(None) => {
+                    shared.violation(format!("subscriber {s}: the stream ended"));
+                    return;
+                }
+                Err(_) => {}
             }
-            Err(_) => {}
         }
     }
+}
+
+/// Kill mode: every `kill_every`, notes the highest head among the
+/// nodes that are not the leader, kills the leader, and records the
+/// moment it is down: anything it acknowledged before that moment at a
+/// position past that head may be lost.
+async fn killer(cfg: Config, client: Client, shared: Arc<Shared>) {
+    let (Some(every), Some(kill)) = (cfg.kill_every, cfg.killer.clone()) else {
+        return;
+    };
+    let mut last = Instant::now();
+    while !shared.stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if last.elapsed() < every {
+            continue;
+        }
+        last = Instant::now();
+        let leader = match client.discover().await {
+            Ok(d) => match d.leader_addr {
+                Some(a) => a,
+                None => continue,
+            },
+            Err(e) => {
+                after_error(&shared, &client, &e).await;
+                continue;
+            }
+        };
+        // The successor is the most up-to-date node that follows the
+        // leader; a node still cutting back a diverged tail of its own
+        // may be ahead and says nothing about what survives.
+        let mut bound = 0;
+        for addr in cfg.addrs().into_iter().filter(|a| *a != leader) {
+            if let Ok(c) = connect(&cfg, &addr).await
+                && let Ok(i) = c.info().await
+                && i.role == chron_client::Role::Replica
+                && i.replica_connected
+            {
+                bound = bound.max(i.head);
+            }
+        }
+        kill(leader).await;
+        shared
+            .kill_log
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((Instant::now(), bound));
+        shared.kills.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Kill mode, at the end: every acknowledged write is in the log, except
+/// ones acknowledged before a kill at positions past the other nodes'
+/// heads at that kill.
+async fn check_acks(shared: &Shared, leader: &Client) -> Result<u64, ClientError> {
+    let acks = shared
+        .acks
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let kills = shared
+        .kill_log
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let floor = leader.info().await?.floor;
+    let head = leader.head().await?;
+    let mut have: HashMap<u64, u64> = HashMap::with_capacity((head - floor) as usize);
+    let mut from = floor;
+    while from < head {
+        let page = leader.read_all(from, 4096).await?;
+        if page.is_empty() {
+            break;
+        }
+        for ev in &page {
+            have.insert(ev.position, hash(&ev.payload));
+        }
+        from = page.last().map_or(head, |e| e.position + 1);
+    }
+    // A writer stamps its acknowledgment after the call returns, so one
+    // acknowledged just before the leader died can carry a time just
+    // after the kill was stamped; half a second covers that, and no
+    // successor leads within half a second of a kill (an election waits
+    // a full lease).
+    const SLACK: Duration = Duration::from_millis(500);
+    let mut lost = 0;
+    for (position, h, at) in acks {
+        if position < floor {
+            continue;
+        }
+        if have.get(&position) == Some(&h) {
+            continue;
+        }
+        lost += 1;
+        let allowed = kills
+            .iter()
+            .any(|(k, bound)| at <= *k + SLACK && position >= *bound);
+        if !allowed {
+            let timeline: Vec<String> = kills
+                .iter()
+                .enumerate()
+                .map(|(i, (k, bound))| {
+                    let rel = if at <= *k {
+                        format!("-{:?}", k.duration_since(at))
+                    } else {
+                        format!("+{:?}", at.duration_since(*k))
+                    };
+                    format!("kill {i}: acked {rel} relative, bound {bound}")
+                })
+                .collect();
+            shared.violation(format!(
+                "acknowledged write at {position} is not in the log and no kill explains it ({})",
+                timeline.join("; ")
+            ));
+        }
+    }
+    Ok(lost)
 }
 
 /// Backups restored and checked offline, and retention, on their timers.
@@ -463,7 +725,7 @@ fn check_backup(shared: &Shared, archive: &std::path::Path, head: u64, lens: &[(
 
 /// Runs the configured load for its duration and reports.
 pub async fn run(cfg: Config) -> anyhow::Result<Report> {
-    let leader = connect(&cfg, &cfg.addr).await?;
+    let leader = connect_leader(&cfg).await?;
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
         transactions: AtomicU64::new(0),
@@ -478,6 +740,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         floor: AtomicU64::new(leader.info().await?.floor),
         latencies: Mutex::new(Vec::new()),
         violations: Mutex::new(Vec::new()),
+        kill_mode: cfg.kill_mode(),
+        kills: AtomicU64::new(0),
+        failover_errors: AtomicU64::new(0),
+        acks: std::sync::Mutex::new(Vec::new()),
+        kill_log: std::sync::Mutex::new(Vec::new()),
     });
     let mut tasks = Vec::new();
     for w in 0..cfg.writers {
@@ -504,12 +771,37 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         leader.clone(),
         shared.clone(),
     )));
+    if cfg.kill_mode() {
+        tasks.push(tokio::spawn(killer(
+            cfg.clone(),
+            leader.clone(),
+            shared.clone(),
+        )));
+    }
     tokio::time::sleep(cfg.duration).await;
     shared.stop.store(true, Ordering::Relaxed);
     for t in tasks {
         let _ = tokio::time::timeout(Duration::from_secs(30), t).await;
     }
 
+    if cfg.kill_mode() {
+        // The last kill may still be settling.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match leader.rediscover().await {
+                Ok(_) => break,
+                Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    let lost_acks = if cfg.kill_mode() {
+        check_acks(&shared, &leader).await?
+    } else {
+        0
+    };
     let final_head = leader.head().await?;
     let mut replica_head = None;
     if let Some(addr) = &cfg.replica {
@@ -587,6 +879,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         commit_p99_ms: pct(0.99),
         final_head,
         replica_head,
+        kills: shared.kills.load(Ordering::Relaxed),
+        lost_acks,
+        failover_errors: shared.failover_errors.load(Ordering::Relaxed),
         violations: shared.violations.lock().await.clone(),
     })
 }

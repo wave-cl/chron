@@ -116,6 +116,23 @@ struct Cli {
     /// this address; see /openapi.json there.
     #[arg(long, env = "CHROND_HTTP_LISTEN")]
     http_listen: Option<SocketAddr>,
+    /// Another node of a failover group (repeat, or a comma list). With
+    /// any, this node follows the leader it hears or is elected; see
+    /// --advertise and --lease-ttl.
+    #[arg(
+        long = "peer",
+        env = "CHROND_PEERS",
+        value_delimiter = ',',
+        conflicts_with = "replicate_from"
+    )]
+    peers: Vec<String>,
+    /// This node's address as its peers reach it (default
+    /// http(s)://<listen>; needed for 0.0.0.0 or port 0).
+    #[arg(long, env = "CHROND_ADVERTISE")]
+    advertise: Option<String>,
+    /// Seconds a majority's acknowledgment lets the leader accept writes.
+    #[arg(long, env = "CHROND_LEASE_TTL", default_value_t = 10.0)]
+    lease_ttl: f64,
     /// Log lines as human text or one JSON object per line.
     #[arg(long, env = "CHROND_LOG_FORMAT", value_enum, default_value_t = chrond::logging::LogFormat::Text)]
     log_format: chrond::logging::LogFormat,
@@ -183,6 +200,14 @@ async fn main() -> anyhow::Result<()> {
     opts.discover_interval = std::time::Duration::from_secs(cli.discover_interval.max(1));
     opts.metrics_listen = cli.metrics_listen;
     opts.http_listen = cli.http_listen;
+    opts.peers = cli
+        .peers
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    opts.advertise = cli.advertise;
+    opts.lease_ttl = std::time::Duration::from_secs_f64(cli.lease_ttl.max(0.0));
     opts.max_message_bytes = cli.max_message_bytes;
     opts.request_timeout = cli.request_timeout.map(std::time::Duration::from_secs);
     opts.concurrency_per_connection = cli.concurrency_per_connection;

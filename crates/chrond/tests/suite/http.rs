@@ -29,12 +29,23 @@ fn http(
         ));
     }
     req.push_str("\r\n");
-    s.write_all(req.as_bytes()).unwrap();
+    // The server may answer and close before an oversize body is fully
+    // sent: a write error then is the answer arriving early, and a read
+    // error after the response is the close.
+    let _ = s.write_all(req.as_bytes());
     if let Some(b) = body {
-        s.write_all(b.as_bytes()).unwrap();
+        let _ = s.write_all(b.as_bytes());
     }
-    let mut raw = String::new();
-    s.read_to_string(&mut raw).unwrap();
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    let raw = String::from_utf8_lossy(&bytes).into_owned();
     let code: u16 = raw
         .split_whitespace()
         .nth(1)

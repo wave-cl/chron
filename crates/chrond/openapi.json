@@ -220,6 +220,7 @@
               "leader",
               "replica",
               "fenced",
+              "candidate",
               "unknown"
             ]
           },
@@ -270,6 +271,32 @@
             ]
           },
           "fenced_by": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "leader_addr": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The leader's address as this node knows it (its own on a leader)."
+          },
+          "lease_remaining_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "On a leader with peers: milliseconds left of its majority lease."
+          },
+          "peers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "voted_epoch": {
             "type": [
               "integer",
               "null"

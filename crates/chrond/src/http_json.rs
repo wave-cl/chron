@@ -196,6 +196,7 @@ pub fn role_name(role: pb::Role) -> &'static str {
         pb::Role::Leader => "leader",
         pb::Role::Replica => "replica",
         pb::Role::Fenced => "fenced",
+        pb::Role::Candidate => "candidate",
         pb::Role::Unspecified => "unknown",
     }
 }
@@ -213,6 +214,8 @@ pub fn info_json(i: &pb::InfoResponse) -> Value {
         "replicating_from": i.replicating_from, "replica_connected": i.replica_connected,
         "leader_head": i.leader_head, "last_replication_error": i.last_replication_error,
         "fenced_by": i.fenced_by,
+        "leader_addr": i.leader_addr, "lease_remaining_ms": i.lease_remaining_ms,
+        "peers": i.peers, "voted_epoch": i.voted_epoch,
     })
 }
 

@@ -8,7 +8,8 @@ use crate::output::Usage;
 /// How to reach the daemon. Every flag is global.
 #[derive(Args, Debug, Clone)]
 pub struct Conn {
-    /// The daemon's address; `https://` enables TLS.
+    /// The daemon's address; `https://` enables TLS. A comma list names a
+    /// failover group: each is asked who leads and the leader is used.
     #[arg(
         long,
         global = true,
@@ -71,6 +72,16 @@ fn read(path: &PathBuf, what: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 impl Conn {
+    /// The addresses `--addr` names (one, or a comma list).
+    pub fn addrs(&self) -> Vec<String> {
+        self.addr
+            .split(',')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     pub fn config(&self) -> anyhow::Result<ClientConfig> {
         let tls = if self.addr.starts_with("https://") {
             Some(TlsConfig {
@@ -100,12 +111,15 @@ impl Conn {
 
 pub async fn connect(conn: &Conn) -> anyhow::Result<Client> {
     let config = conn.config()?;
-    Client::connect(conn.addr.clone(), config)
-        .await
-        .map_err(|source| {
-            anyhow::Error::new(Unreachable {
-                addr: conn.addr.clone(),
-                source,
-            })
+    let addrs = conn.addrs();
+    let r = match addrs.as_slice() {
+        [one] => Client::connect(one.clone(), config).await,
+        _ => Client::connect_any(addrs, config).await,
+    };
+    r.map_err(|source| {
+        anyhow::Error::new(Unreachable {
+            addr: conn.addr.clone(),
+            source,
         })
+    })
 }

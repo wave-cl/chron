@@ -29,8 +29,8 @@ pub use chron::{
     Options, Retained, Uuid,
 };
 pub use client::{
-    ChunkStream, Client, ClientConfig, DatabaseInfo, EventStream, Identity, Info, Promoted,
-    ReplicationChunk, Role, TlsConfig,
+    ChunkStream, Client, ClientConfig, DatabaseInfo, Discovered, EventStream, Identity, Info,
+    Promoted, ReplicationChunk, Role, TlsConfig,
 };
 pub use error::ClientError;
 pub use txn::{Append, Transaction};

@@ -73,6 +73,10 @@ pub enum ClientError {
     /// The daemon is fenced, stopping, or the connection failed.
     #[error("unavailable: {0}")]
     Unavailable(String),
+    /// No seed of [`Client::connect_any`](crate::Client::connect_any)
+    /// named a reachable leader.
+    #[error("no leader: {0}")]
+    NoLeader(String),
     /// A message or transaction above the daemon's limit.
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),

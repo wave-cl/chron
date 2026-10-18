@@ -26,12 +26,21 @@ pub enum CheckError {
     /// The leader answered and the two cannot be paired; retrying will
     /// not help until something changes.
     Refused(String),
+    /// The two histories part somewhere below this replica's head: it
+    /// took writes of its own. With peers the replica cuts itself back;
+    /// otherwise an operator restores it.
+    Diverged {
+        message: String,
+        leader_head: u64,
+        leader_floor: u64,
+    },
 }
 
 impl CheckError {
     pub fn message(&self) -> &str {
         match self {
             CheckError::Unreachable(m) | CheckError::Refused(m) => m,
+            CheckError::Diverged { message, .. } => message,
         }
     }
 }
@@ -81,11 +90,10 @@ async fn blocking<T: Send + 'static>(
 /// the leader has accepted the stream. Returns the open chunk stream.
 pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<ChunkStream, CheckError> {
     let up = node
-        .upstream
-        .as_ref()
+        .upstream()
         .ok_or_else(|| CheckError::Refused("no leader configured".into()))?;
     let addr = up.addr.as_str();
-    let client = connect(up).await?.database(&dbn.name);
+    let client = connect(&up).await?.database(&dbn.name);
     let info = match tokio::time::timeout(INFO_TIMEOUT, client.info()).await {
         Ok(Ok(i)) => i,
         Ok(Err(ClientError::NotFound(_))) => {
@@ -125,10 +133,14 @@ pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<ChunkSt
         )));
     }
     if head > info.head {
-        return Err(CheckError::Refused(format!(
-            "diverged: this replica is at head {head}, the leader at {}; reset it from a backup of the leader",
-            info.head
-        )));
+        return Err(CheckError::Diverged {
+            message: format!(
+                "diverged: this replica is at head {head}, the leader at {}; reset it from a backup of the leader",
+                info.head
+            ),
+            leader_head: info.head,
+            leader_floor: info.floor,
+        });
     }
     // The record before the head is gone when the head sits on the floor
     // (restored from a backup of a retained leader); the leader skips the
@@ -144,7 +156,16 @@ pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<ChunkSt
     let stream = client
         .replicate(head, last_fingerprint)
         .await
-        .map_err(|e| unreachable(addr, e))?;
+        .map_err(|e| match &e {
+            ClientError::Fenced { message, .. } if message.starts_with("diverged") => {
+                CheckError::Diverged {
+                    message: format!("{addr}: {message}"),
+                    leader_head: info.head,
+                    leader_floor: info.floor,
+                }
+            }
+            _ => unreachable(addr, e),
+        })?;
     if id != leader_id {
         let db = db.clone();
         blocking(move || db.adopt_id(leader_id))
@@ -159,6 +180,140 @@ pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<ChunkSt
             .map_err(CheckError::Refused)?;
     }
     Ok(stream)
+}
+
+/// A diverged copy cuts itself back to the history it shares with the
+/// leader: the shared prefix is found by comparing stored fingerprints
+/// (galloping back from the lower of the two heads, then bisecting),
+/// moved back to a transaction boundary, the dropped tail written to
+/// `diverged-<epoch>-<from>-<head>.chronbak` in the database directory,
+/// and the records cut. Returns the new head.
+async fn resync(
+    node: &Arc<Node>,
+    dbn: &Arc<DbNode>,
+    leader_head: u64,
+    leader_floor: u64,
+) -> Result<u64, String> {
+    let up = node.upstream().ok_or("no leader configured")?;
+    let client = connect(&up)
+        .await
+        .map_err(|e| e.to_string())?
+        .database(&dbn.name);
+    let db = dbn.db.clone();
+    let head = db.head();
+    let hi = head.min(leader_head);
+    let lo = db.floor().max(leader_floor);
+    if hi <= lo {
+        return Err(format!(
+            "no shared history above the floors ({lo}); restore this node from a backup of the leader"
+        ));
+    }
+    // Candidate positions, highest first: hi-1, hi-2, hi-4, ... and lo.
+    let mut probes = Vec::new();
+    let mut step = 1u64;
+    loop {
+        match hi.checked_sub(step) {
+            Some(p) if p > lo => probes.push(p),
+            _ => {
+                probes.push(lo);
+                break;
+            }
+        }
+        step = step.saturating_mul(2);
+    }
+    let matches =
+        |db: &chron::Db, positions: &[u64], theirs: &[Option<u32>]| -> Result<Vec<bool>, String> {
+            positions
+                .iter()
+                .zip(theirs)
+                .map(|(p, t)| {
+                    let mine = db.fingerprint(*p).map_err(|e| e.to_string())?;
+                    Ok(mine.is_some() && mine == *t)
+                })
+                .collect()
+        };
+    let theirs = client
+        .fingerprints(&probes)
+        .await
+        .map_err(|e| format!("Fingerprints on {}: {e}", up.addr))?;
+    let same = matches(&db, &probes, &theirs)?;
+    // The first probe (highest) that matches, and the lowest that did not.
+    let Some(k) = same.iter().position(|m| *m) else {
+        return Err(format!(
+            "no shared history between {lo} and {hi}; restore this node from a backup of the leader"
+        ));
+    };
+    let mut good = probes[k];
+    let mut bad = if k == 0 { hi } else { probes[k - 1] };
+    while bad - good > 1 {
+        let mid = good + (bad - good) / 2;
+        let t = client
+            .fingerprints(&[mid])
+            .await
+            .map_err(|e| format!("Fingerprints on {}: {e}", up.addr))?;
+        if matches(&db, &[mid], &t)?[0] {
+            good = mid;
+        } else {
+            bad = mid;
+        }
+    }
+    // Positions below `bad` are shared; cut at the transaction boundary
+    // at or below it.
+    let mut to = bad;
+    while to > lo {
+        let first = db
+            .read_all(to, 1)
+            .map_err(|e| e.to_string())?
+            .first()
+            .is_some_and(|e| e.is_first_in_txn());
+        if first {
+            break;
+        }
+        to -= 1;
+    }
+    if to >= head {
+        return Err(format!(
+            "the shared history reaches this node's head {head}, yet the leader refused it; restore this node from a backup of the leader"
+        ));
+    }
+    let archive = db
+        .path()
+        .join(format!("diverged-{}-{to}-{head}.chronbak", db.epoch()));
+    let db2 = db.clone();
+    let a2 = archive.clone();
+    blocking(move || db2.backup_since(&a2, to)).await?;
+    let db2 = db.clone();
+    let cut = blocking(move || db2.truncate_to(to)).await?;
+    tracing::warn!(database = %dbn.name, from = to, removed = cut.removed, archive = %archive.display(), "dropped a diverged tail");
+    dbn.reset.send_replace(Some(to));
+    Ok(to)
+}
+
+/// Stops the discoverer and every database's puller.
+pub async fn stop_all(node: &Arc<Node>) {
+    if let Some(d) = node.discoverer.lock().await.take() {
+        d.stop().await;
+    }
+    for dbn in node.databases() {
+        if let Some(p) = dbn.puller.lock().await.take() {
+            p.stop().await;
+        }
+    }
+}
+
+/// Starts a puller for every database (towards the current upstream)
+/// and the discoverer; ones already running are left alone.
+pub async fn start_all(node: &Arc<Node>) {
+    for dbn in node.databases() {
+        let mut puller = dbn.puller.lock().await;
+        if puller.is_none() {
+            *puller = Some(spawn(node.clone(), dbn.clone(), None));
+        }
+    }
+    let mut d = node.discoverer.lock().await;
+    if d.is_none() {
+        *d = Some(spawn_discoverer(node.clone()));
+    }
 }
 
 /// A pull or discovery loop's handle.
@@ -212,6 +367,24 @@ async fn pull(
                         backoff = BACKOFF_MIN;
                         node.discover_now.notify_one();
                         break s;
+                    }
+                    Err(CheckError::Diverged {
+                        message,
+                        leader_head,
+                        leader_floor,
+                    }) if node.cluster.is_some() => {
+                        record_error(node, dbn, message);
+                        let r = tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            r = resync(node, dbn, leader_head, leader_floor) => r,
+                        };
+                        match r {
+                            Ok(to) => {
+                                tracing::warn!(database = %dbn.name, head = to, "cut back to the history shared with the leader; the dropped tail is kept as a backup");
+                                backoff = BACKOFF_MIN;
+                            }
+                            Err(e) => record_error(node, dbn, e),
+                        }
                     }
                     Err(e) => record_error(node, dbn, e.message().to_string()),
                 }
@@ -330,8 +503,8 @@ pub fn spawn_discoverer(node: Arc<Node>) -> Puller {
 }
 
 async fn discover(node: &Arc<Node>) -> Result<(), String> {
-    let up = node.upstream.as_ref().ok_or("no leader configured")?;
-    let client = connect(up).await.map_err(|e| e.to_string())?;
+    let up = node.upstream().ok_or("no leader configured")?;
+    let client = connect(&up).await.map_err(|e| e.to_string())?;
     let listed = match tokio::time::timeout(INFO_TIMEOUT, client.list_databases()).await {
         Ok(r) => r.map_err(|e| format!("ListDatabases on {}: {e}", up.addr))?,
         Err(_) => return Err(format!("{} did not answer ListDatabases", up.addr)),

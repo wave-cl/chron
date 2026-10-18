@@ -55,6 +55,9 @@ enum Role {
   ROLE_LEADER = 1;
   ROLE_REPLICA = 2;
   ROLE_FENCED = 3;
+  // With peers: no leader is known and this node holds no lease; writes
+  // are refused until a leader is elected or heard.
+  ROLE_CANDIDATE = 4;
 }
 
 message AppendResult {
@@ -141,6 +144,82 @@ message InfoResponse {
   bool fsync = 15;
   // The database this call was addressed to (`chron-db`, or `default`).
   string database = 16;
+  // The leader's address as this node knows it: its own on a leader, the
+  // one it follows on a replica, the last one heard on a candidate.
+  optional string leader_addr = 17;
+  // On a leader with peers: how much of the majority lease is left (0
+  // once it expired, when writes are refused).
+  optional uint64 lease_remaining_ms = 18;
+  // The peers this node was started with (empty without --peer).
+  repeated string peers = 19;
+  // The epoch of the vote this node last gave, if any.
+  optional uint64 voted_epoch = 20;
+}
+
+// A leader with peers tells each of them, every third of the lease, that
+// it leads under `epoch`. An admin call.
+message HeartbeatRequest {
+  uint64 epoch = 1;
+  string leader_addr = 2;
+  uint64 head = 3;
+  uint64 lease_ttl_ms = 4;
+}
+
+// `ok` acknowledges the lease; `epoch` is the answering node's own, so a
+// leader learns of a newer one.
+message HeartbeatResponse {
+  bool ok = 1;
+  uint64 epoch = 2;
+  optional string leader_addr = 3;
+  uint64 head = 4;
+}
+
+message DatabaseHead {
+  string name = 1;
+  uint64 head = 2;
+}
+
+// A node asks a peer to vote for it as the leader under `epoch`.
+// `last_epoch` and `databases` say how up to date the candidate is;
+// `pre_vote` asks whether the vote would be granted without granting it;
+// `forced` (an operator's promote) ignores a leader heard recently, and
+// a leader that grants it fences itself first. An admin call.
+message RequestVoteRequest {
+  uint64 epoch = 1;
+  string candidate_addr = 2;
+  uint64 last_epoch = 3;
+  repeated DatabaseHead databases = 4;
+  bool forced = 5;
+  bool pre_vote = 6;
+}
+
+message RequestVoteResponse {
+  bool granted = 1;
+  // The answering node's own epoch.
+  uint64 epoch = 2;
+  // Why the vote was refused, for the log.
+  string reason = 3;
+}
+
+// The stored crc32 of the records at `positions`, so a copy of the
+// database can find where its history parts from this one. An admin call.
+message FingerprintsRequest { repeated uint64 positions = 1; }
+message FingerprintAt {
+  uint64 position = 1;
+  // Absent past the head or below the floor.
+  optional uint32 crc = 2;
+}
+message FingerprintsResponse { repeated FingerprintAt fingerprints = 1; }
+
+message DiscoverRequest {}
+
+// Who leads, as this node knows it. Open to any token.
+message DiscoverResponse {
+  optional string leader_addr = 1;
+  uint64 epoch = 2;
+  Role role = 3;
+  repeated string peers = 4;
+  optional uint64 lease_remaining_ms = 5;
 }
 
 // One of the daemon's databases.
@@ -263,4 +342,8 @@ service Chron {
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
   rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
   rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc Discover(DiscoverRequest) returns (DiscoverResponse);
+  rpc Fingerprints(FingerprintsRequest) returns (FingerprintsResponse);
 }

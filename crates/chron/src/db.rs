@@ -22,6 +22,7 @@ use crate::replicate::{self, Chunk};
 use crate::retain::{self, Retained};
 use crate::segment::{self, SegmentWriter};
 use crate::subscribe::Subscription;
+use crate::truncate::{self, Truncated};
 use crate::txn::{self, Committed, Mode, Transaction};
 
 pub(crate) struct Layout {
@@ -319,6 +320,20 @@ impl Db {
     /// or below the current one is a no-op.
     pub fn retain_from(&self, floor: u64) -> Result<Retained> {
         retain::retain(&self.inner, floor, true)
+    }
+
+    /// Drops every record at positions `to..head`: the way a copy of a
+    /// database that took writes of its own cuts back to the history it
+    /// shares with another copy, so it can follow that copy again. `to`
+    /// must start a transaction ([`Error::Inconsistent`] otherwise), be at
+    /// most the head ([`Error::PositionOutOfRange`]) and at least the
+    /// floor ([`Error::BelowFloor`]); the head itself is a no-op. Aggregate
+    /// lengths and tag indexes shrink with the records. Positions are
+    /// reused by what is committed next, so subscriptions past `to` must
+    /// be restarted; the daemon ends them. Takes the writer lock: commits
+    /// queued behind it land after the cut.
+    pub fn truncate_to(&self, to: u64) -> Result<Truncated> {
+        truncate::truncate(&self.inner, to)
     }
 
     /// Writes a full backup of everything committed so far to `archive`

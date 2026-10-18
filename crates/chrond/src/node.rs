@@ -2,7 +2,7 @@
 //! survive restarts, the write gate that keeps the role check and a write
 //! one critical section, and the named databases it serves.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -28,6 +28,9 @@ pub enum Role {
     Leader,
     Replica,
     Fenced,
+    /// With peers: no leader is known and no lease is held. Writes are
+    /// refused; a heartbeat makes it a replica, an election a leader.
+    Candidate,
 }
 
 impl Role {
@@ -36,6 +39,7 @@ impl Role {
             Role::Leader => pb::Role::Leader,
             Role::Replica => pb::Role::Replica,
             Role::Fenced => pb::Role::Fenced,
+            Role::Candidate => pb::Role::Candidate,
         }
     }
 }
@@ -55,6 +59,9 @@ pub const FENCED_MARKER: &str = "fenced";
 /// `leader ADDR`: this directory follows a leader; it must be started
 /// with `--replicate-from` or promoted.
 pub const REPLICA_MARKER: &str = "replica";
+/// `epoch N for ADDR`: the vote this node gave; it survives restarts so a
+/// node never votes twice in one epoch.
+pub const VOTE_MARKER: &str = "vote";
 
 /// A rendezvous for tests: the next guarded write signals `entered`
 /// after its role check, then waits for `proceed` before writing. Both
@@ -84,6 +91,53 @@ pub struct Upstream {
     pub max_message_bytes: usize,
 }
 
+/// The peers of a node started with `--peer`, and how to reach them.
+#[derive(Debug, Clone)]
+pub struct ClusterConfig {
+    /// The other nodes' addresses, as advertised.
+    pub peers: Vec<String>,
+    /// This node's own address as the peers reach it.
+    pub advertise: String,
+    pub token: Option<String>,
+    pub tls: Option<chron_client::TlsConfig>,
+    pub max_message_bytes: usize,
+    /// How long a majority acknowledgment lets a leader accept writes.
+    pub lease_ttl: Duration,
+}
+
+impl ClusterConfig {
+    /// Votes or acknowledgments that make a majority, this node included.
+    pub fn quorum(&self) -> usize {
+        self.peers.len().div_ceil(2) + 1
+    }
+
+    pub fn upstream(&self, addr: &str) -> Upstream {
+        Upstream {
+            addr: addr.to_string(),
+            token: self.token.clone(),
+            tls: self.tls.clone(),
+            max_message_bytes: self.max_message_bytes,
+        }
+    }
+}
+
+/// What a node knows about leadership in time: its own lease as a leader,
+/// the last leader it heard as a follower, and the vote it gave.
+#[derive(Debug, Clone, Default)]
+pub struct Lease {
+    /// A leader: until when a majority acknowledged it. Writes are refused
+    /// past it.
+    pub held_until: Option<Instant>,
+    /// A follower: the last heartbeat or vote it accepted (when, whose
+    /// address, which epoch).
+    pub heard: Option<(Instant, String, u64)>,
+    /// The vote given: epoch and candidate. Persisted in [`VOTE_MARKER`].
+    pub voted: Option<(u64, String)>,
+    /// The highest epoch a peer has answered with: a campaign starts
+    /// above it.
+    pub seen: u64,
+}
+
 /// One named database the daemon serves.
 pub struct DbNode {
     pub name: String,
@@ -93,6 +147,9 @@ pub struct DbNode {
     /// Cancelled when the database is dropped (or the daemon stops: it is
     /// a child of the daemon's token); its streams end then.
     pub cancel: CancellationToken,
+    /// The position the database was last cut back to (a diverged copy
+    /// resetting itself); live streams past it end when it changes.
+    pub reset: watch::Sender<Option<u64>>,
 }
 
 impl DbNode {
@@ -103,6 +160,7 @@ impl DbNode {
             replica: Mutex::new(ReplicaStatus::default()),
             puller: tokio::sync::Mutex::new(None),
             cancel: parent.child_token(),
+            reset: watch::Sender::new(None),
         })
     }
 
@@ -141,8 +199,25 @@ pub struct Node {
     role: watch::Sender<Role>,
     /// Readers check the role and epoch and write; writers flip the role.
     write_gate: RwLock<()>,
-    pub upstream: Option<Upstream>,
+    /// The leader this node follows; changes when a new leader is heard.
+    upstream: RwLock<Option<Upstream>>,
     pub max_message_bytes: usize,
+    /// Set when started with peers.
+    pub cluster: Option<ClusterConfig>,
+    lease: Mutex<Lease>,
+    /// This node's address as clients and peers reach it; set once the
+    /// listener is bound.
+    advertise: std::sync::OnceLock<String>,
+    /// Serialises role transitions driven by heartbeats and elections.
+    pub transitions: tokio::sync::Mutex<()>,
+    pub cluster_task: Mutex<Option<JoinHandle<()>>>,
+    /// Peers this node neither calls nor answers (a simulated partition).
+    #[cfg(feature = "test-util")]
+    pub partition: Mutex<HashSet<String>>,
+    /// Grant votes without the recency check (the control for the test
+    /// that a follower cut off from the leader cannot unseat it).
+    #[cfg(feature = "test-util")]
+    pub skip_recency_check: std::sync::atomic::AtomicBool,
     /// How every database is opened.
     pub db_opts: chron::Options,
     databases: RwLock<HashMap<String, Arc<DbNode>>>,
@@ -167,6 +242,7 @@ impl Node {
         backup_dir: Option<PathBuf>,
         admin_token: Option<&str>,
         upstream: Option<Upstream>,
+        cluster: Option<ClusterConfig>,
         max_message_bytes: usize,
         db_opts: chron::Options,
         discover_interval: Duration,
@@ -182,8 +258,17 @@ impl Node {
             write_pause: Mutex::new(None),
             role: watch::Sender::new(Role::Leader),
             write_gate: RwLock::new(()),
-            upstream,
+            upstream: RwLock::new(upstream),
             max_message_bytes,
+            cluster,
+            lease: Mutex::new(Lease::default()),
+            advertise: std::sync::OnceLock::new(),
+            transitions: tokio::sync::Mutex::new(()),
+            cluster_task: Mutex::new(None),
+            #[cfg(feature = "test-util")]
+            partition: Mutex::new(HashSet::new()),
+            #[cfg(feature = "test-util")]
+            skip_recency_check: std::sync::atomic::AtomicBool::new(false),
             db_opts,
             databases: RwLock::new(HashMap::new()),
             admin_ops: tokio::sync::Mutex::new(()),
@@ -211,8 +296,131 @@ impl Node {
         self.role.subscribe()
     }
 
-    pub fn leader_addr(&self) -> Option<&str> {
-        self.upstream.as_ref().map(|u| u.addr.as_str())
+    pub fn set_advertise(&self, addr: String) {
+        let _ = self.advertise.set(addr);
+    }
+
+    /// This node's own address (`?` before the listener is bound).
+    pub fn advertise(&self) -> String {
+        self.advertise.get().cloned().unwrap_or_else(|| "?".into())
+    }
+
+    /// The leader this node follows, if any.
+    pub fn upstream(&self) -> Option<Upstream> {
+        self.upstream
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub fn set_upstream(&self, up: Option<Upstream>) {
+        *self.upstream.write().unwrap_or_else(|p| p.into_inner()) = up;
+    }
+
+    /// The address of the leader this node follows.
+    pub fn leader_addr(&self) -> Option<String> {
+        self.upstream().map(|u| u.addr)
+    }
+
+    // ---- the lease
+
+    pub fn lease(&self) -> Lease {
+        self.lease.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub fn with_lease<T>(&self, f: impl FnOnce(&mut Lease) -> T) -> T {
+        f(&mut self.lease.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// How much of the lease is left: `None` without peers (a lone leader
+    /// needs none), zero once it expired.
+    pub fn lease_remaining(&self) -> Option<Duration> {
+        self.cluster.as_ref()?;
+        let now = Instant::now();
+        Some(
+            self.lease()
+                .held_until
+                .map(|u| u.saturating_duration_since(now))
+                .unwrap_or(Duration::ZERO),
+        )
+    }
+
+    /// Whether a leader holds its lease right now (always, without peers).
+    pub fn lease_held(&self) -> bool {
+        match self.lease_remaining() {
+            None => true,
+            Some(d) => d > Duration::ZERO,
+        }
+    }
+
+    /// The leader last heard, if it was heard within the lease ttl.
+    pub fn heard_leader(&self) -> Option<(String, u64)> {
+        let ttl = self.cluster.as_ref()?.lease_ttl;
+        let (at, addr, epoch) = self.lease().heard?;
+        (at.elapsed() < ttl).then_some((addr, epoch))
+    }
+
+    /// The epoch this node has promised itself to: the highest of its
+    /// data epoch, the vote it gave, the leader it heard, the epoch it was
+    /// fenced by and any epoch a peer answered with. Heartbeats below it
+    /// are refused, vote requests at or below it are stale, and a
+    /// campaign starts above it.
+    pub fn floor_epoch(&self) -> u64 {
+        let l = self.lease();
+        self.data_epoch()
+            .max(l.voted.map_or(0, |(e, _)| e))
+            .max(l.heard.map_or(0, |(_, _, e)| e))
+            .max(self.fenced_by().unwrap_or(0))
+            .max(l.seen)
+    }
+
+    /// Notes an epoch a peer answered with.
+    pub fn note_seen(&self, epoch: u64) {
+        self.with_lease(|l| l.seen = l.seen.max(epoch));
+    }
+
+    /// Records a heartbeat (or a vote given) from `addr` at `epoch`: the
+    /// follower's recency clock starts now.
+    pub fn record_heard(&self, addr: &str, epoch: u64) {
+        self.with_lease(|l| l.heard = Some((Instant::now(), addr.to_string(), epoch)));
+    }
+
+    /// Extends the lease to `until` (never shortens it).
+    pub fn extend_lease(&self, until: Instant) {
+        self.with_lease(|l| {
+            if l.held_until.is_none_or(|u| u < until) {
+                l.held_until = Some(until);
+            }
+        });
+    }
+
+    /// Reads `epoch N for ADDR` from the vote marker.
+    pub fn read_vote_marker(&self) -> Option<(u64, String)> {
+        parse_vote(&self.marker_text(VOTE_MARKER)?)
+    }
+
+    /// Persists the vote, then records it. Blocking.
+    pub fn record_vote(&self, epoch: u64, candidate: &str) -> Result<(), Status> {
+        self.write_marker_text(VOTE_MARKER, &format!("epoch {epoch} for {candidate}\n"))
+            .map_err(|e| Status::internal(format!("cannot write the vote marker: {e}")))?;
+        self.with_lease(|l| l.voted = Some((epoch, candidate.to_string())));
+        Ok(())
+    }
+
+    /// Whether this node refuses to talk to `addr` (feature `test-util`).
+    pub fn partitioned_from(&self, addr: &str) -> bool {
+        #[cfg(feature = "test-util")]
+        {
+            self.partition
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(addr)
+        }
+        #[cfg(not(feature = "test-util"))]
+        {
+            let _ = addr;
+            false
+        }
     }
 
     pub fn fenced_by(&self) -> Option<u64> {
@@ -437,18 +645,26 @@ impl Node {
         self.refuse_at(self.epoch(), message)
     }
 
-    /// Why this node refuses writes right now, if it does.
+    /// Why this node refuses writes right now, if it does. A leader with
+    /// peers refuses once its majority lease has expired, whether or not
+    /// the cluster task has noticed.
     pub fn write_refusal(&self) -> Option<Status> {
         match self.role() {
-            Role::Leader => None,
+            Role::Leader if self.lease_held() => None,
+            Role::Leader => Some(self.refuse(
+                "the leader's majority lease has expired; writes resume when a majority answers again or another node is elected",
+            )),
             Role::Replica => Some(self.refuse(format!(
                 "read-only replica of {}; send writes to the leader",
-                self.leader_addr().unwrap_or("?")
+                self.leader_addr().as_deref().unwrap_or("?")
             ))),
             Role::Fenced => Some(self.refuse(format!(
                 "fenced: a newer leader (epoch {}) exists; send writes there",
                 self.fenced_by().unwrap_or(0)
             ))),
+            Role::Candidate => Some(self.refuse(
+                "no leader: this node holds no lease and has heard none; retry on the node Discover names",
+            )),
         }
     }
 
@@ -531,10 +747,10 @@ impl Node {
             Role::Replica => {
                 return Err(self.refuse(format!(
                     "this node is a replica of {}",
-                    self.leader_addr().unwrap_or("?")
+                    self.leader_addr().as_deref().unwrap_or("?")
                 )));
             }
-            Role::Leader if by <= ours => {
+            Role::Leader | Role::Candidate if by <= ours => {
                 return Err(
                     self.refuse(format!("epoch {by} is not newer than this leader's {ours}"))
                 );
@@ -550,26 +766,87 @@ impl Node {
             .map_err(|e| Status::internal(format!("cannot write the fenced marker: {e}")))?;
         self.set_fenced_by(Some(by));
         self.set_role(Role::Fenced);
+        self.with_lease(|l| l.held_until = None);
         tracing::warn!(by, "fenced: a newer leader exists");
         Ok(())
     }
 
-    /// The replica becomes the leader under the next epoch, raised on
-    /// every database. Blocking; the caller stopped the pullers first. The
-    /// marker goes first: a crash between it and the epochs is repaired on
-    /// the next start, which raises every database to the marker's.
-    pub fn promote_locked(&self) -> Result<(u64, u64), Status> {
+    /// A leader whose lease expired becomes a candidate: writes were
+    /// already refused by the lease check; this makes it visible and lets
+    /// the node follow whoever is elected. Blocking.
+    pub fn step_down(&self) {
         let _gate = self.write_gate.write().unwrap_or_else(|p| p.into_inner());
-        if self.role() != Role::Replica {
-            return Err(self.refuse("not a replica"));
+        if self.role() != Role::Leader {
+            return;
         }
-        let epoch = self
-            .databases()
+        self.with_lease(|l| l.held_until = None);
+        self.set_role(Role::Candidate);
+        tracing::warn!("stepped down: the majority lease expired");
+    }
+
+    /// Follows the leader at `addr` from now on: the role becomes Replica,
+    /// the replica marker names it, the fenced marker goes. Blocking; the
+    /// caller starts the pullers. A leader must be fenced or stepped down
+    /// first.
+    pub fn become_replica_locked(&self, addr: &str) -> Result<(), Status> {
+        let _gate = self.write_gate.write().unwrap_or_else(|p| p.into_inner());
+        if self.role() == Role::Leader {
+            return Err(self.refuse("still the leader"));
+        }
+        let up = self
+            .cluster
+            .as_ref()
+            .map(|c| c.upstream(addr))
+            .ok_or_else(|| Status::failed_precondition("no peers configured"))?;
+        self.write_marker_text(REPLICA_MARKER, &format!("leader {addr}\n"))
+            .map_err(|e| Status::internal(format!("cannot write the replica marker: {e}")))?;
+        if let Err(e) = self.remove_marker(FENCED_MARKER) {
+            tracing::warn!(error = %e, "cannot remove the fenced marker");
+        }
+        self.set_upstream(Some(up));
+        self.set_fenced_by(None);
+        self.with_lease(|l| l.held_until = None);
+        self.set_role(Role::Replica);
+        tracing::info!(leader = %addr, "following the leader");
+        Ok(())
+    }
+
+    /// The highest epoch among the databases: the daemon's data epoch.
+    pub fn data_epoch(&self) -> u64 {
+        self.databases()
             .iter()
             .map(|d| d.db.epoch())
             .max()
             .unwrap_or(0)
-            + 1;
+    }
+
+    /// The replica (or candidate) becomes the leader under `elected` (an
+    /// election's epoch, which must be above the data epoch; the election
+    /// is stale otherwise) or, without one, the next epoch; every
+    /// database is raised to it. `lease_until` is the lease the
+    /// election's votes grant. Blocking; the caller stopped the pullers
+    /// first. The marker goes first: a crash between it and the epochs is
+    /// repaired on the next start, which raises every database to the
+    /// marker's.
+    pub fn promote_locked(
+        &self,
+        elected: Option<u64>,
+        lease_until: Option<Instant>,
+    ) -> Result<(u64, u64), Status> {
+        let _gate = self.write_gate.write().unwrap_or_else(|p| p.into_inner());
+        if !matches!(self.role(), Role::Replica | Role::Candidate) {
+            return Err(self.refuse("not a replica"));
+        }
+        let data = self.data_epoch();
+        let epoch = match elected {
+            Some(e) if e > data => e,
+            Some(e) => {
+                return Err(self.refuse(format!(
+                    "the election was for epoch {e} but this node is already at {data}"
+                )));
+            }
+            None => data + 1,
+        };
         self.write_marker(PROMOTED_MARKER, epoch)
             .map_err(|e| Status::internal(format!("cannot write the promoted marker: {e}")))?;
         if let Err(e) = self.raise_all_epochs(epoch) {
@@ -581,11 +858,106 @@ impl Node {
         if let Err(e) = self.remove_marker(REPLICA_MARKER) {
             tracing::warn!(error = %e, "cannot remove the replica marker");
         }
+        self.with_lease(|l| {
+            l.held_until = lease_until;
+            l.heard = None;
+        });
+        self.set_fenced_by(None);
+        self.set_upstream(None);
         self.set_role(Role::Leader);
         for d in self.databases() {
             d.record_replica(|r| r.connected = false);
         }
         tracing::info!(epoch, "promoted to leader");
         Ok((epoch, self.default_db().db.head()))
+    }
+}
+
+/// `epoch N for ADDR`.
+pub fn parse_vote(text: &str) -> Option<(u64, String)> {
+    let rest = text.trim().strip_prefix("epoch ")?;
+    let (epoch, addr) = rest.split_once(" for ")?;
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return None;
+    }
+    Some((epoch.parse().ok()?, addr.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_vote_marker_parses_and_rejects_junk() {
+        assert_eq!(
+            parse_vote("epoch 7 for http://a:1\n"),
+            Some((7, "http://a:1".to_string()))
+        );
+        assert_eq!(parse_vote("epoch 7\n"), None);
+        assert_eq!(parse_vote("epoch x for a"), None);
+        assert_eq!(parse_vote("epoch 7 for "), None);
+    }
+
+    /// The lease check inside `write_refusal` refuses on its own, before
+    /// the cluster task has noticed anything.
+    #[test]
+    fn a_leader_refuses_writes_the_instant_its_lease_has_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let cluster = ClusterConfig {
+            peers: vec!["http://127.0.0.1:1".into(), "http://127.0.0.1:2".into()],
+            advertise: "http://127.0.0.1:3".into(),
+            token: None,
+            tls: None,
+            max_message_bytes: 1 << 20,
+            lease_ttl: Duration::from_secs(1),
+        };
+        let make = |cluster: Option<ClusterConfig>| {
+            let cancel = CancellationToken::new();
+            let node = Node::new(
+                dir.path().to_path_buf(),
+                None,
+                None,
+                None,
+                cluster,
+                1 << 20,
+                chron::Options::new().fsync(chron::Fsync::Never),
+                Duration::from_secs(1),
+                Metrics::new(),
+                cancel.clone(),
+            );
+            let db = node.open_database("default").unwrap();
+            node.insert(DbNode::new("default".into(), db, &cancel));
+            node.set_role(Role::Leader);
+            node
+        };
+        let node = make(Some(cluster.clone()));
+        assert!(node.write_refusal().is_some(), "no lease yet");
+        node.with_lease(|l| l.held_until = Some(Instant::now() + Duration::from_secs(5)));
+        assert!(node.write_refusal().is_none(), "a live lease");
+        node.with_lease(|l| l.held_until = Some(Instant::now() - Duration::from_millis(1)));
+        let r = node.write_refusal().expect("an expired lease refuses");
+        assert!(r.message().contains("lease has expired"), "{r}");
+        assert_eq!(node.role(), Role::Leader, "the role alone did not change");
+        drop(node);
+        let lone = make(None);
+        assert!(lone.write_refusal().is_none(), "no peers, no lease needed");
+    }
+
+    #[test]
+    fn quorum_is_a_majority_of_peers_and_self() {
+        let c = |n: usize| ClusterConfig {
+            peers: (0..n).map(|i| format!("p{i}")).collect(),
+            advertise: "me".into(),
+            token: None,
+            tls: None,
+            max_message_bytes: 1,
+            lease_ttl: Duration::from_secs(1),
+        };
+        assert_eq!(c(0).quorum(), 1);
+        assert_eq!(c(1).quorum(), 2);
+        assert_eq!(c(2).quorum(), 2);
+        assert_eq!(c(3).quorum(), 3);
+        assert_eq!(c(4).quorum(), 3);
     }
 }

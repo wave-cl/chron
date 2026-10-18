@@ -8,7 +8,8 @@ use std::time::Instant;
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::MetricFamily;
 use prometheus::{
-    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 use crate::node::{Node, Role};
@@ -38,6 +39,10 @@ pub const METHODS: &[(&str, bool)] = &[
     ("/chron.v1.Chron/CreateDatabase", false),
     ("/chron.v1.Chron/ListDatabases", false),
     ("/chron.v1.Chron/DropDatabase", false),
+    ("/chron.v1.Chron/Heartbeat", false),
+    ("/chron.v1.Chron/RequestVote", false),
+    ("/chron.v1.Chron/Discover", false),
+    ("/chron.v1.Chron/Fingerprints", false),
     ("/grpc.health.v1.Health/Check", false),
     ("/grpc.health.v1.Health/Watch", true),
 ];
@@ -107,6 +112,13 @@ pub struct Metrics {
     pub replication_errors: IntCounterVec,
     pub chunks_applied: IntCounterVec,
     pub http_requests: IntCounterVec,
+    /// Campaigns this node started.
+    pub elections: IntCounter,
+    /// Times this node's role changed because of the cluster: elected,
+    /// fenced by a peer, stepped down.
+    pub leader_changes: IntCounter,
+    /// Heartbeats a peer did not answer, by peer.
+    pub heartbeat_failures: IntCounterVec,
     start_time: IntGauge,
 }
 
@@ -169,6 +181,21 @@ impl Metrics {
             "HTTP gateway requests by route and status",
             &["route", "status"],
         );
+        let elections = IntCounter::new(
+            "chron_elections_total",
+            "campaigns this node started (pre-vote included)",
+        )
+        .expect("valid metric");
+        let leader_changes = IntCounter::new(
+            "chron_leader_changes_total",
+            "role changes driven by the cluster: elected, fenced by a peer, stepped down",
+        )
+        .expect("valid metric");
+        let heartbeat_failures = counter(
+            "chron_heartbeat_failures_total",
+            "heartbeats a peer did not answer",
+            &["peer"],
+        );
         let build_info = gauge("chron_build_info", "chrond version", &["version"]);
         build_info
             .with_label_values(&[env!("CARGO_PKG_VERSION")])
@@ -193,6 +220,9 @@ impl Metrics {
             Box::new(replication_errors.clone()),
             Box::new(chunks_applied.clone()),
             Box::new(http_requests.clone()),
+            Box::new(elections.clone()),
+            Box::new(leader_changes.clone()),
+            Box::new(heartbeat_failures.clone()),
             Box::new(build_info),
             Box::new(start_time.clone()),
         ] {
@@ -208,6 +238,9 @@ impl Metrics {
             replication_errors,
             chunks_applied,
             http_requests,
+            elections,
+            leader_changes,
+            heartbeat_failures,
             start_time,
         })
     }
@@ -258,6 +291,10 @@ struct NodeCollector {
     replica_connected: IntGaugeVec,
     leader_head: IntGaugeVec,
     lag: IntGaugeVec,
+    lease_remaining: Gauge,
+    leader_known: IntGauge,
+    voted_epoch: IntGauge,
+    peers: IntGauge,
     events: IntCounterVec,
     transactions: IntCounterVec,
     batches: IntCounterVec,
@@ -309,6 +346,19 @@ impl NodeCollector {
                 "events the replica is behind its leader",
                 &["db"],
             ),
+            lease_remaining: Gauge::new(
+                "chron_lease_remaining_seconds",
+                "seconds left of the leader's majority lease (leaders with peers)",
+            )
+            .expect("valid metric"),
+            leader_known: IntGauge::new(
+                "chron_leader_known",
+                "1 when this node knows a live leader (itself included)",
+            )
+            .expect("valid metric"),
+            voted_epoch: IntGauge::new("chron_voted_epoch", "the epoch of the last vote given")
+                .expect("valid metric"),
+            peers: IntGauge::new("chron_peers", "peers configured").expect("valid metric"),
             events: counter(
                 "chron_events_committed_total",
                 "events landed, by the daemon or by replication",
@@ -351,6 +401,10 @@ impl NodeCollector {
             &self.replica_connected,
             &self.leader_head,
             &self.lag,
+            &self.lease_remaining,
+            &self.leader_known,
+            &self.voted_epoch,
+            &self.peers,
             &self.events,
             &self.transactions,
             &self.batches,
@@ -374,6 +428,19 @@ impl NodeCollector {
         ] {
             g.reset();
         }
+        self.lease_remaining
+            .set(node.lease_remaining().unwrap_or_default().as_secs_f64());
+        self.leader_known.set(
+            (match role {
+                Role::Leader => node.lease_held(),
+                Role::Replica => true,
+                Role::Candidate | Role::Fenced => node.heard_leader().is_some(),
+            }) as i64,
+        );
+        self.voted_epoch
+            .set(node.lease().voted.map_or(0, |(e, _)| e as i64));
+        self.peers
+            .set(node.cluster.as_ref().map_or(0, |c| c.peers.len() as i64));
         let mut last = self.last_stats.lock().unwrap_or_else(|p| p.into_inner());
         for dbn in node.databases() {
             let db = dbn.name.as_str();
@@ -399,6 +466,7 @@ impl NodeCollector {
                 (Role::Leader, "leader"),
                 (Role::Replica, "replica"),
                 (Role::Fenced, "fenced"),
+                (Role::Candidate, "candidate"),
             ] {
                 self.role
                     .with_label_values(&[db, name])

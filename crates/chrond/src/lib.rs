@@ -4,6 +4,7 @@
 //! signal handling.
 
 mod auth;
+mod cluster;
 mod codec;
 mod http;
 mod http_json;
@@ -36,7 +37,9 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 
-use crate::node::{DbNode, FENCED_MARKER, Node, PROMOTED_MARKER, REPLICA_MARKER, Role, Upstream};
+use crate::node::{
+    ClusterConfig, DbNode, FENCED_MARKER, Node, PROMOTED_MARKER, REPLICA_MARKER, Role, Upstream,
+};
 
 /// The health service name that is SERVING only while this node is the
 /// leader (`chron.v1.Chron` itself is SERVING in every role).
@@ -96,6 +99,22 @@ pub struct Options {
     /// Serve the HTTP/JSON gateway on this address, with the same tokens
     /// and TLS as `listen`. Off when `None`.
     pub http_listen: Option<SocketAddr>,
+    /// The other nodes of a failover group, by address. With any, this
+    /// node never starts as a leader: it follows the leader it hears or
+    /// is elected by a majority. `replicate_token` and `replicate_tls`
+    /// are used towards them.
+    pub peers: Vec<String>,
+    /// This node's address as its peers reach it; defaults to
+    /// `http(s)://<listen>`, which needs a concrete address and port.
+    pub advertise: Option<String>,
+    /// How long a majority's acknowledgment lets a leader accept writes;
+    /// heartbeats go out every third of it and an election starts after
+    /// one to one and a half of it without a leader.
+    pub lease_ttl: Duration,
+    /// Peers this node neither calls nor answers from the start (a
+    /// simulated partition for tests).
+    #[cfg(feature = "test-util")]
+    pub partition: Vec<String>,
 }
 
 /// PEM bytes for the server's certificate chain and key, and optionally
@@ -142,6 +161,11 @@ impl Options {
             discover_interval: Duration::from_secs(10),
             metrics_listen: None,
             http_listen: None,
+            peers: Vec::new(),
+            advertise: None,
+            lease_ttl: Duration::from_secs(10),
+            #[cfg(feature = "test-util")]
+            partition: Vec::new(),
         }
     }
 }
@@ -222,6 +246,40 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
     {
         anyhow::bail!("TLS towards the leader needs an https:// --replicate-from address");
     }
+    let scheme = if opts.tls.is_some() { "https" } else { "http" };
+    let advertise = match &opts.advertise {
+        Some(a) => a.clone(),
+        None => format!("{scheme}://{}", opts.listen),
+    };
+    let cluster = if opts.peers.is_empty() {
+        None
+    } else {
+        if opts.replicate_from.is_some() {
+            anyhow::bail!("--peer replaces --replicate-from: peers find their leader themselves");
+        }
+        if opts.advertise.is_none()
+            && (opts.listen.port() == 0 || opts.listen.ip().is_unspecified())
+        {
+            anyhow::bail!(
+                "--advertise is needed with --peer when --listen is {}: peers cannot reach that",
+                opts.listen
+            );
+        }
+        if opts.lease_ttl < Duration::from_millis(100) {
+            anyhow::bail!("--lease-ttl below 100 ms cannot carry a heartbeat round trip");
+        }
+        if opts.peers.contains(&advertise) {
+            anyhow::bail!("--peer lists this node's own address {advertise}");
+        }
+        Some(ClusterConfig {
+            peers: opts.peers.clone(),
+            advertise: advertise.clone(),
+            token: opts.replicate_token.clone(),
+            tls: opts.replicate_tls.clone(),
+            max_message_bytes: opts.max_message_bytes,
+            lease_ttl: opts.lease_ttl,
+        })
+    };
     let cancel = CancellationToken::new();
     let upstream = opts.replicate_from.clone().map(|addr| Upstream {
         addr,
@@ -235,6 +293,7 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         backup_dir,
         opts.admin_token.as_deref(),
         upstream,
+        cluster,
         opts.max_message_bytes,
         db_opts,
         opts.discover_interval,
@@ -242,6 +301,11 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         cancel.clone(),
     ));
     metrics.attach(&node);
+    #[cfg(feature = "test-util")]
+    {
+        *node.partition.lock().unwrap_or_else(|p| p.into_inner()) =
+            opts.partition.iter().cloned().collect();
+    }
     let dir = opts.data_dir.clone();
     tokio::task::spawn_blocking(move || migrate_layout(&dir))
         .await
@@ -255,6 +319,10 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         .await
         .with_context(|| format!("cannot listen on {}", opts.listen))?;
     let local_addr = listener.local_addr()?;
+    node.set_advertise(match &opts.advertise {
+        Some(a) => a.clone(),
+        None => format!("{scheme}://{local_addr}"),
+    });
     let n = opts.max_message_bytes;
     let bearer = auth::BearerAuth::new(
         &[opts.token.as_deref(), opts.admin_token.as_deref()]
@@ -335,8 +403,21 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
             .add_service(svc)
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown),
     );
+    if node.cluster.is_some() {
+        *node.cluster_task.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(cluster::spawn(node.clone()));
+        if opts.promote {
+            let n = node.clone();
+            tokio::spawn(async move {
+                match cluster::campaign(&n, true).await {
+                    Ok((epoch, head)) => tracing::info!(epoch, head, "promoted at start"),
+                    Err(s) => tracing::warn!(reason = s.message(), "--promote: not elected"),
+                }
+            });
+        }
+    }
     let names: Vec<String> = node.databases().iter().map(|d| d.name.clone()).collect();
-    tracing::info!(%local_addr, metrics = ?metrics_addr, http = ?http_addr, data_dir = %opts.data_dir.display(), databases = %names.join(","), head = db.head(), role = ?node.role(), epoch = db.epoch(), "listening");
+    tracing::info!(%local_addr, metrics = ?metrics_addr, http = ?http_addr, data_dir = %opts.data_dir.display(), databases = %names.join(","), head = db.head(), role = ?node.role(), epoch = db.epoch(), peers = %opts.peers.join(","), "listening");
     Ok(Running {
         local_addr,
         metrics_addr,
@@ -452,6 +533,32 @@ async fn open_all(node: &Arc<Node>) -> anyhow::Result<()> {
 /// a promoted replica, a fenced leader, or a leader.
 async fn settle_role(node: &Arc<Node>, opts: &Options) -> anyhow::Result<()> {
     let dir = opts.data_dir.display();
+    if node.cluster.is_some() {
+        if let Some(v) = node.read_vote_marker() {
+            node.with_lease(|l| l.voted = Some(v));
+        }
+        if let Some(e) = node.read_marker(PROMOTED_MARKER)
+            && e > node.epoch()
+        {
+            let n = node.clone();
+            tokio::task::spawn_blocking(move || n.raise_all_epochs(e))
+                .await
+                .context("epoch task")?
+                .context("raise the epoch to the promoted marker's")?;
+            tracing::warn!(epoch = e, "raised every epoch to the promoted marker's");
+        }
+        if let Some(by) = node.read_marker(FENCED_MARKER) {
+            node.set_fenced_by(Some(by));
+            node.set_role(Role::Fenced);
+            tracing::warn!(by, "starting fenced; the next leader heard is followed");
+        } else {
+            node.set_role(Role::Candidate);
+            tracing::info!(
+                "starting as a candidate: following the first leader heard, or electing one"
+            );
+        }
+        return Ok(());
+    }
     if opts.replicate_from.is_some() {
         if opts.promote {
             anyhow::bail!("--promote and --replicate-from exclude each other");
@@ -474,12 +581,15 @@ async fn settle_role(node: &Arc<Node>, opts: &Options) -> anyhow::Result<()> {
                 Err(replica::CheckError::Refused(e)) => {
                     anyhow::bail!("cannot replicate {}: {e}", dbn.name)
                 }
+                Err(e @ replica::CheckError::Diverged { .. }) => {
+                    anyhow::bail!("cannot replicate {}: {}", dbn.name, e.message())
+                }
             };
             streams.push((dbn, stream));
         }
         node.write_marker_text(
             REPLICA_MARKER,
-            &format!("leader {}\n", node.leader_addr().unwrap_or("?")),
+            &format!("leader {}\n", node.leader_addr().as_deref().unwrap_or("?")),
         )
         .context("write the replica marker")?;
         node.set_role(Role::Replica);
@@ -587,14 +697,16 @@ impl Running {
         self.health
             .set_service_status(LEADER_HEALTH_SERVICE, ServingStatus::NotServing)
             .await;
-        if let Some(d) = self.node.discoverer.lock().await.take() {
-            d.stop().await;
+        if let Some(c) = self
+            .node
+            .cluster_task
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            c.abort();
         }
-        for dbn in self.node.databases() {
-            if let Some(p) = dbn.puller.lock().await.take() {
-                p.stop().await;
-            }
-        }
+        replica::stop_all(&self.node).await;
         if let Some(f) = self
             .node
             .fencer

@@ -6,23 +6,67 @@ crates share one version.
 
 ## Unreleased
 
+The workspace version is bumped to 0.3.0 ahead of the release, so
+`cargo package` verifies the crates against each other rather than
+against the published 0.2.0.
+
+### chron-db
+
+- `Db::truncate_to(position)`: drops the records from a transaction
+  boundary to the head (`Truncated`), so a copy that took writes of its
+  own can cut back to the history it shares with another copy.
+
 ### chrond
 
 - An HTTP/JSON gateway on `--http-listen` (`CHROND_HTTP_LISTEN`): the
   CLI's JSON shapes over HTTP/1.1, `tail` as server-sent events,
   `/openapi.json`, the daemon's tokens and TLS, errors with the gRPC
   code's name and metadata, `chron_http_requests_total{route,status}`.
+- Automatic failover: daemons started with each other as `--peer`s elect
+  a leader by majority and replace it when it dies. The leader holds a
+  majority lease renewed by heartbeats (`--lease-ttl`, 10 s) and refuses
+  writes the instant it expires; followers campaign after a lease of
+  silence; votes persist in a `vote` marker; a node never starts as a
+  leader with peers (`ROLE_CANDIDATE`). `Heartbeat`, `RequestVote` and
+  `Discover` RPCs; `Info` gains `leader_addr`, `lease_remaining_ms`,
+  `peers`, `voted_epoch`; `Promote` with peers is a forced campaign that
+  refuses a lagging node; `--advertise`. Metrics
+  `chron_lease_remaining_seconds`, `chron_leader_known`,
+  `chron_voted_epoch`, `chron_peers`, `chron_elections_total`,
+  `chron_leader_changes_total`, `chron_heartbeat_failures_total{peer}`.
+  Writes acknowledged by a dead leader after the last transaction its
+  successor had pulled are lost; see the README.
+- A diverged replica with peers resets itself: it finds the shared
+  history through the new `Fingerprints` RPC, keeps the tail it drops as
+  `diverged-<epoch>-<from>-<head>.chronbak` in the database directory,
+  cuts back and follows. Subscriptions past the cut end with
+  `UNAVAILABLE` ("cut back").
+
+### chron-client
+
+- `Client::connect_any(seeds, config)` finds the leader of a failover
+  group from any seed; commits refused as not-the-leader or failing to
+  reach it look for the leader again (`ClientConfig::failover_retries`).
+  `Client::discover`, `Client::rediscover`, `Client::addr`,
+  `Client::fingerprints`, `Role::Candidate`, `Discovered`,
+  `ClientError::NoLeader`, the new `Info` fields.
 
 ### chron-cli
 
 - `chron append` takes several `-d` payloads (one event each, one
   transaction) and reads one event per line from `--stdin`.
+- `--addr` takes a comma list of a failover group's nodes; `chron
+  discover`; `info` and `status` show the leader, lease, peers and vote;
+  `status` is degraded on a candidate or an expired lease.
 
 ### tools
 
 - `chron-load` (not published): a load generator that checks invariants
   while it runs (dense positions, payload/record agreement, lengths,
   restored backups, retention floors, a replica compared at the end).
+  `--kill-leader-every` with `--pid ADDR=PID` kills the leader of a
+  group on a timer and checks that no write acknowledged by a surviving
+  leader is lost.
 
 ## 0.2.0 - 2026-10-18
 

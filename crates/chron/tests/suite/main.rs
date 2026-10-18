@@ -18,3 +18,4 @@ mod review;
 mod rotation;
 mod subscribe;
 mod transactions;
+mod truncate;

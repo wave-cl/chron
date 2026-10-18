@@ -15,8 +15,9 @@ use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
+use crate::cluster;
 use crate::codec;
-use crate::node::{DbNode, Node, Role};
+use crate::node::{DbNode, Node, Role, Upstream};
 use crate::ops::{self, PAGE, Read, blocking, ended, gone, role_lost};
 use crate::replica;
 
@@ -424,14 +425,23 @@ impl Chron for ChronService {
                     .node
                     .refuse("fenced; restart it with --replicate-from the new leader"));
             }
-            Role::Replica => {}
+            Role::Candidate if self.node.cluster.is_none() => {
+                return Err(self.node.refuse("not a replica"));
+            }
+            Role::Replica | Role::Candidate => {}
         }
         // Its own task: a client that gives up mid-way must not leave the
         // puller stopped and the role unchanged.
         let node = self.node.clone();
-        let (epoch, head) = tokio::spawn(async move { promote(node).await })
-            .await
-            .map_err(|e| codec::join("promote", e))??;
+        let (epoch, head) = tokio::spawn(async move {
+            if node.cluster.is_some() {
+                forced_campaign(node).await
+            } else {
+                promote(node).await
+            }
+        })
+        .await
+        .map_err(|e| codec::join("promote", e))??;
         Ok(Response::new(pb::PromoteResponse { epoch, head }))
     }
 
@@ -479,47 +489,116 @@ impl Chron for ChronService {
         ops::drop_database(self.node.clone(), req.into_inner().name).await?;
         Ok(Response::new(pb::DropDatabaseResponse {}))
     }
+
+    async fn heartbeat(
+        &self,
+        req: Request<pb::HeartbeatRequest>,
+    ) -> Result<Response<pb::HeartbeatResponse>, Status> {
+        self.node.require_admin(req.metadata())?;
+        let node = self.node.clone();
+        let r = req.into_inner();
+        // Its own task: a leader that gives up on the call must not leave
+        // a half-switched role behind.
+        let answer = tokio::spawn(async move { cluster::handle_heartbeat(&node, r).await })
+            .await
+            .map_err(|e| codec::join("heartbeat", e))??;
+        Ok(Response::new(answer))
+    }
+
+    async fn request_vote(
+        &self,
+        req: Request<pb::RequestVoteRequest>,
+    ) -> Result<Response<pb::RequestVoteResponse>, Status> {
+        self.node.require_admin(req.metadata())?;
+        let node = self.node.clone();
+        let r = req.into_inner();
+        let answer = tokio::spawn(async move { cluster::handle_vote(&node, r).await })
+            .await
+            .map_err(|e| codec::join("request_vote", e))??;
+        Ok(Response::new(answer))
+    }
+
+    async fn discover(
+        &self,
+        _req: Request<pb::DiscoverRequest>,
+    ) -> Result<Response<pb::DiscoverResponse>, Status> {
+        Ok(Response::new(cluster::discover(&self.node)))
+    }
+
+    async fn fingerprints(
+        &self,
+        req: Request<pb::FingerprintsRequest>,
+    ) -> Result<Response<pb::FingerprintsResponse>, Status> {
+        self.node.require_admin(req.metadata())?;
+        let dbn = self.db(&req)?;
+        let positions = req.into_inner().positions;
+        if positions.len() > 4096 {
+            return Err(Status::invalid_argument(
+                "at most 4096 positions per Fingerprints call",
+            ));
+        }
+        let fingerprints = blocking(&dbn.db, "fingerprints", move |db| {
+            positions
+                .iter()
+                .map(|p| {
+                    Ok(pb::FingerprintAt {
+                        position: *p,
+                        crc: db.fingerprint(*p)?,
+                    })
+                })
+                .collect::<chron::Result<Vec<_>>>()
+        })
+        .await?;
+        Ok(Response::new(pb::FingerprintsResponse { fingerprints }))
+    }
+}
+
+/// Promote with peers: a forced campaign, retried a few times while the
+/// leader says this node is still catching up.
+async fn forced_campaign(node: Arc<Node>) -> Result<(u64, u64), Status> {
+    let mut last = None;
+    for _ in 0..5 {
+        match cluster::campaign(&node, true).await {
+            Ok(r) => return Ok(r),
+            Err(s) if s.message().starts_with("not up to date") => {
+                last = Some(s);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(s) => return Err(s),
+        }
+    }
+    Err(last.expect("five attempts"))
 }
 
 /// Stops the discoverer and every puller, promotes, and on failure
 /// resumes pulling.
 async fn promote(node: Arc<Node>) -> Result<(u64, u64), Status> {
-    if let Some(d) = node.discoverer.lock().await.take() {
-        d.stop().await;
-    }
-    for dbn in node.databases() {
-        if let Some(p) = dbn.puller.lock().await.take() {
-            p.stop().await;
-        }
-    }
+    let old_leader = node.upstream();
+    replica::stop_all(&node).await;
     let n = node.clone();
-    let result = tokio::task::spawn_blocking(move || n.promote_locked())
+    let result = tokio::task::spawn_blocking(move || n.promote_locked(None, None))
         .await
         .map_err(|e| codec::join("promote", e))?;
     match result {
         Ok((epoch, head)) => {
-            spawn_fencer(node, epoch);
+            if let Some(up) = old_leader {
+                spawn_fencer(node, epoch, up);
+            }
             Ok((epoch, head))
         }
         Err(s) => {
             if node.role() == Role::Replica {
-                for dbn in node.databases() {
-                    *dbn.puller.lock().await =
-                        Some(replica::spawn(node.clone(), dbn.clone(), None));
-                }
-                *node.discoverer.lock().await = Some(replica::spawn_discoverer(node.clone()));
+                replica::start_all(&node).await;
             }
             Err(s)
         }
     }
 }
 
-/// Tells the old leader, with retries, that `epoch` exists. Best effort:
-/// the epoch on Commit is the guarantee, this call is the courtesy.
-fn spawn_fencer(node: Arc<Node>, epoch: u64) {
-    let Some(up) = node.upstream.clone() else {
-        return;
-    };
+/// Tells the old leader at `up`, with retries, that `epoch` exists. Best
+/// effort: the epoch on Commit is the guarantee, this call is the
+/// courtesy.
+pub fn spawn_fencer(node: Arc<Node>, epoch: u64, up: Upstream) {
     let cancel = node.cancel.clone();
     let handle = tokio::spawn(async move {
         let addr = up.addr.clone();

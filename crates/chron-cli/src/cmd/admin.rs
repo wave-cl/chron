@@ -49,6 +49,16 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
     if let Some(by) = i.fenced_by {
         human.push_str(&format!("\nfenced_by {by}"));
     }
+    if !i.peers.is_empty() {
+        human.push_str(&format!(
+            "\nleader {}  lease_remaining {}  voted_epoch {}\npeers {}",
+            i.leader_addr.as_deref().unwrap_or("none"),
+            i.lease_remaining
+                .map_or("-".to_string(), |d| format!("{} ms", d.as_millis())),
+            i.voted_epoch.map_or("-".to_string(), |e| e.to_string()),
+            i.peers.join(",")
+        ));
+    }
     print_value(
         format,
         human,
@@ -61,6 +71,33 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
             "replicating_from": i.replicating_from, "replica_connected": i.replica_connected,
             "leader_head": i.leader_head, "last_replication_error": i.last_replication_error,
             "fenced_by": i.fenced_by,
+            "leader_addr": i.leader_addr, "lease_remaining_ms": i.lease_remaining.map(|d| d.as_millis() as u64),
+            "peers": i.peers, "voted_epoch": i.voted_epoch,
+        }),
+    );
+    Ok(())
+}
+
+pub async fn discover(conn: &Conn, format: Format) -> anyhow::Result<()> {
+    let d = client::connect(conn).await?.discover().await?;
+    print_value(
+        format,
+        format!(
+            "leader {}\nrole {}  epoch {}  lease_remaining {}\npeers {}",
+            d.leader_addr.as_deref().unwrap_or("none"),
+            d.role,
+            d.epoch,
+            d.lease_remaining
+                .map_or("-".to_string(), |l| format!("{} ms", l.as_millis())),
+            if d.peers.is_empty() {
+                "none".to_string()
+            } else {
+                d.peers.join(",")
+            }
+        ),
+        json!({
+            "leader_addr": d.leader_addr, "role": d.role.to_string(), "epoch": d.epoch,
+            "lease_remaining_ms": d.lease_remaining.map(|l| l.as_millis() as u64), "peers": d.peers,
         }),
     );
     Ok(())
@@ -236,6 +273,19 @@ pub async fn status(conn: &Conn, format: Format, a: StatusArgs) -> anyhow::Resul
     if i.role == chron_client::Role::Fenced {
         reasons.push(format!("fenced by epoch {}", i.fenced_by.unwrap_or(0)));
     }
+    if i.role == chron_client::Role::Candidate {
+        reasons.push(format!(
+            "candidate: no leader{}",
+            i.leader_addr
+                .as_deref()
+                .map(|a| format!(" (last heard {a})"))
+                .unwrap_or_default()
+        ));
+    }
+    if i.role == chron_client::Role::Leader && i.lease_remaining == Some(std::time::Duration::ZERO)
+    {
+        reasons.push("the majority lease has expired; writes are refused".to_string());
+    }
     if let (Some(max), Some(lag)) = (a.max_lag, lag)
         && i.role == chron_client::Role::Replica
         && lag > max
@@ -271,6 +321,15 @@ pub async fn status(conn: &Conn, format: Format, a: StatusArgs) -> anyhow::Resul
     if let Some(by) = i.fenced_by {
         human.push_str(&format!("\nfenced_by {by}"));
     }
+    if !i.peers.is_empty() {
+        human.push_str(&format!(
+            "\nleader {}  lease_remaining {}  peers {}",
+            i.leader_addr.as_deref().unwrap_or("none"),
+            i.lease_remaining
+                .map_or("-".to_string(), |d| format!("{} ms", d.as_millis())),
+            i.peers.len()
+        ));
+    }
     human.push_str(&format!(
         "\nstatus {}",
         if healthy {
@@ -287,6 +346,8 @@ pub async fn status(conn: &Conn, format: Format, a: StatusArgs) -> anyhow::Resul
             "db_id": i.db_id.to_string(), "epoch": i.epoch, "head": i.head, "floor": i.floor,
             "leader_head": i.leader_head, "lag": lag, "replica_connected": i.replica_connected,
             "last_replication_error": i.last_replication_error, "fenced_by": i.fenced_by,
+            "leader_addr": i.leader_addr, "lease_remaining_ms": i.lease_remaining.map(|d| d.as_millis() as u64),
+            "peers": i.peers, "voted_epoch": i.voted_epoch,
             "healthy": healthy, "reasons": reasons,
         }),
     );

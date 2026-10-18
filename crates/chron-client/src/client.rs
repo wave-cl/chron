@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -63,6 +64,10 @@ pub struct ClientConfig {
     /// The database every call goes to (`chron-db` metadata); `None` is
     /// the daemon's `default`. [`Client::database`] rebinds a client.
     pub database: Option<String>,
+    /// For a client made by [`Client::connect_any`]: how many times a
+    /// commit refused as not-the-leader, or failing to reach the daemon,
+    /// looks for the leader again and retries.
+    pub failover_retries: u32,
 }
 
 impl Default for ClientConfig {
@@ -75,6 +80,7 @@ impl Default for ClientConfig {
             request_timeout: None,
             max_message_bytes: 64 * 1024 * 1024,
             database: None,
+            failover_retries: 3,
         }
     }
 }
@@ -88,6 +94,9 @@ pub enum Role {
     Replica,
     /// A newer leader exists; refuses writes until restarted as a replica.
     Fenced,
+    /// With peers: no leader known and no lease held; refuses writes until
+    /// one is heard or elected.
+    Candidate,
     /// A role this client does not know (a newer daemon).
     Unknown,
 }
@@ -98,9 +107,39 @@ impl std::fmt::Display for Role {
             Role::Leader => "leader",
             Role::Replica => "replica",
             Role::Fenced => "fenced",
+            Role::Candidate => "candidate",
             Role::Unknown => "unknown",
         })
     }
+}
+
+impl Role {
+    fn from_wire(r: pb::Role) -> Role {
+        match r {
+            pb::Role::Leader => Role::Leader,
+            pb::Role::Replica => Role::Replica,
+            pb::Role::Fenced => Role::Fenced,
+            pb::Role::Candidate => Role::Candidate,
+            pb::Role::Unspecified => Role::Unknown,
+        }
+    }
+}
+
+/// What a daemon answers to `discover`: who leads, as it knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Discovered {
+    /// The leader's address: the daemon's own when it leads with a live
+    /// lease, the one it follows, or the last one it heard.
+    pub leader_addr: Option<String>,
+    /// The daemon's epoch.
+    pub epoch: u64,
+    /// The daemon's role.
+    pub role: Role,
+    /// The daemon's peers (empty without failover).
+    pub peers: Vec<String>,
+    /// On a leader with peers: how much of its lease is left.
+    pub lease_remaining: Option<Duration>,
 }
 
 /// What a daemon reports about itself.
@@ -139,6 +178,15 @@ pub struct Info {
     pub last_replication_error: Option<String>,
     /// The epoch that fenced this node, for a fenced one.
     pub fenced_by: Option<u64>,
+    /// The leader's address as the daemon knows it (its own on a leader).
+    pub leader_addr: Option<String>,
+    /// On a leader with peers: how much of its majority lease is left
+    /// (zero once it expired and writes are refused).
+    pub lease_remaining: Option<Duration>,
+    /// The daemon's peers (empty without failover).
+    pub peers: Vec<String>,
+    /// The epoch of the vote the daemon last gave.
+    pub voted_epoch: Option<u64>,
 }
 
 /// What `promote` returns: the new leader's epoch and head.
@@ -210,26 +258,34 @@ pub struct ReplicationChunk {
 pub type ChunkStream =
     Pin<Box<dyn Stream<Item = Result<ReplicationChunk, ClientError>> + Send + 'static>>;
 
+/// The connection itself: swapped as one when the leader moves, so
+/// every clone of the client (every database binding) follows.
+struct Conn {
+    addr: String,
+    channel: Channel,
+}
+
 /// A connection to one daemon, bound to one of its databases. Cheap to
-/// clone; every method takes `&self`.
+/// clone; every method takes `&self`. Made by [`Client::connect_any`],
+/// it also knows the seeds to find the leader again.
 #[derive(Clone)]
 pub struct Client {
-    channel: Channel,
+    conn: Arc<RwLock<Conn>>,
+    config: ClientConfig,
+    seeds: Option<Arc<Vec<String>>>,
     token: Option<MetadataValue<Ascii>>,
     admin_token: Option<MetadataValue<Ascii>>,
-    max_message_bytes: usize,
+    db: Option<MetadataValue<Ascii>>,
     database: Option<String>,
-    inner: Inner,
-    admin: Inner,
-    health: HealthClient<Channel>,
 }
 
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Client({})",
-            self.database.as_deref().unwrap_or("default")
+            "Client({} at {})",
+            self.database.as_deref().unwrap_or("default"),
+            self.addr()
         )
     }
 }
@@ -269,6 +325,92 @@ fn build(
     .max_encoding_message_size(n)
 }
 
+/// Opens the channel to `addr` as `config` says.
+async fn open(addr: &str, config: &ClientConfig) -> Result<Channel, ClientError> {
+    let mut endpoint = Endpoint::from_shared(addr.to_string())
+        .map_err(|e| ClientError::InvalidArgument(format!("{addr}: {e}")))?
+        .connect_timeout(config.connect_timeout)
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .tcp_keepalive(Some(Duration::from_secs(30)));
+    if let Some(t) = config.request_timeout {
+        endpoint = endpoint.timeout(t);
+    }
+    if config.tls.is_some() && !addr.starts_with("https://") {
+        return Err(ClientError::InvalidArgument(format!(
+            "{addr} is not an https:// address, but TLS was configured"
+        )));
+    }
+    if addr.starts_with("https://") {
+        let tls = config.tls.clone().unwrap_or_default();
+        let mut cfg = ClientTlsConfig::new();
+        match &tls.ca_pem {
+            Some(ca) => cfg = cfg.ca_certificate(Certificate::from_pem(ca)),
+            None => cfg = cfg.with_native_roots(),
+        }
+        if let Some(id) = &tls.identity {
+            cfg = cfg.identity(tonic::transport::Identity::from_pem(
+                &id.cert_pem,
+                &id.key_pem,
+            ));
+        }
+        if let Some(d) = &tls.domain {
+            cfg = cfg.domain_name(d.clone());
+        }
+        endpoint = endpoint.tls_config(cfg)?;
+    }
+    Ok(endpoint.connect().await?)
+}
+
+/// Asks each seed in turn who leads and opens a connection to that
+/// leader; the first seed that names a reachable leader wins.
+async fn find_leader(seeds: &[String], config: &ClientConfig) -> Result<Conn, ClientError> {
+    let mut notes: Vec<String> = Vec::new();
+    let token = auth(config.token.as_deref())?;
+    for seed in seeds {
+        let channel = match open(seed, config).await {
+            Ok(c) => c,
+            Err(e) => {
+                notes.push(format!("{seed}: {e}"));
+                continue;
+            }
+        };
+        let mut probe = build(&channel, &token, &None, config.max_message_bytes);
+        let d = match probe.discover(pb::DiscoverRequest {}).await {
+            Ok(d) => d.into_inner(),
+            Err(s) => {
+                notes.push(format!("{seed}: {}", ClientError::from(s)));
+                continue;
+            }
+        };
+        let Some(leader) = d.leader_addr else {
+            notes.push(format!(
+                "{seed}: {} at epoch {}, knows no leader",
+                Role::from_wire(d.role()),
+                d.epoch
+            ));
+            continue;
+        };
+        if leader == *seed {
+            return Ok(Conn {
+                addr: leader,
+                channel,
+            });
+        }
+        match open(&leader, config).await {
+            Ok(channel) => {
+                return Ok(Conn {
+                    addr: leader,
+                    channel,
+                });
+            }
+            Err(e) => notes.push(format!("{seed} names {leader}, which is unreachable: {e}")),
+        }
+    }
+    Err(ClientError::NoLeader(notes.join("; ")))
+}
+
 /// One finite read: what, from where, how many, which way.
 enum Read {
     Aggregate(Uuid),
@@ -289,54 +431,96 @@ impl Client {
         config: ClientConfig,
     ) -> Result<Client, ClientError> {
         let addr = addr.into();
-        let mut endpoint = Endpoint::from_shared(addr.clone())
-            .map_err(|e| ClientError::InvalidArgument(format!("{addr}: {e}")))?
-            .connect_timeout(config.connect_timeout)
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .keep_alive_while_idle(true)
-            .tcp_keepalive(Some(Duration::from_secs(30)));
-        if let Some(t) = config.request_timeout {
-            endpoint = endpoint.timeout(t);
+        let channel = open(&addr, &config).await?;
+        Self::assemble(Conn { addr, channel }, config, None)
+    }
+
+    /// Connects to the leader of a failover group: each seed (any node
+    /// of the group) is asked who leads, in order, and the first that
+    /// names a reachable leader wins. [`ClientError::NoLeader`] when none
+    /// does. Commits refused because the node no longer leads, or that
+    /// cannot reach it, look for the leader again
+    /// (`config.failover_retries` times) and are retried there; reads
+    /// are not redirected.
+    pub async fn connect_any(
+        seeds: impl IntoIterator<Item = impl Into<String>>,
+        config: ClientConfig,
+    ) -> Result<Client, ClientError> {
+        let seeds: Vec<String> = seeds.into_iter().map(Into::into).collect();
+        if seeds.is_empty() {
+            return Err(ClientError::InvalidArgument("no addresses given".into()));
         }
-        if config.tls.is_some() && !addr.starts_with("https://") {
-            return Err(ClientError::InvalidArgument(format!(
-                "{addr} is not an https:// address, but TLS was configured"
-            )));
-        }
-        if addr.starts_with("https://") {
-            let tls = config.tls.clone().unwrap_or_default();
-            let mut cfg = ClientTlsConfig::new();
-            match &tls.ca_pem {
-                Some(ca) => cfg = cfg.ca_certificate(Certificate::from_pem(ca)),
-                None => cfg = cfg.with_native_roots(),
-            }
-            if let Some(id) = &tls.identity {
-                cfg = cfg.identity(tonic::transport::Identity::from_pem(
-                    &id.cert_pem,
-                    &id.key_pem,
-                ));
-            }
-            if let Some(d) = &tls.domain {
-                cfg = cfg.domain_name(d.clone());
-            }
-            endpoint = endpoint.tls_config(cfg)?;
-        }
-        let channel = endpoint.connect().await?;
-        let n = config.max_message_bytes;
+        let conn = find_leader(&seeds, &config).await?;
+        Self::assemble(conn, config, Some(Arc::new(seeds)))
+    }
+
+    fn assemble(
+        conn: Conn,
+        config: ClientConfig,
+        seeds: Option<Arc<Vec<String>>>,
+    ) -> Result<Client, ClientError> {
         let token = auth(config.token.as_deref())?;
         let admin_token = auth(config.admin_token.as_deref().or(config.token.as_deref()))?;
         let db = db_header(config.database.as_deref())?;
         Ok(Client {
-            inner: build(&channel, &token, &db, n),
-            admin: build(&channel, &admin_token, &db, n),
-            health: HealthClient::new(channel.clone()),
-            channel,
+            conn: Arc::new(RwLock::new(conn)),
+            database: config.database.clone(),
+            config,
+            seeds,
             token,
             admin_token,
-            max_message_bytes: n,
-            database: config.database,
+            db,
         })
+    }
+
+    /// The address this client currently talks to (the leader found last,
+    /// for one made by [`connect_any`](Client::connect_any)).
+    pub fn addr(&self) -> String {
+        self.conn
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .addr
+            .clone()
+    }
+
+    /// The seeds a [`connect_any`](Client::connect_any) client was given.
+    pub fn seeds(&self) -> &[String] {
+        self.seeds.as_deref().map_or(&[], |s| s.as_slice())
+    }
+
+    /// Looks for the leader again among the seeds and switches every
+    /// clone of this client to it. Only for a client made by
+    /// [`connect_any`](Client::connect_any); others fail with
+    /// [`ClientError::NoLeader`].
+    pub async fn rediscover(&self) -> Result<String, ClientError> {
+        let Some(seeds) = &self.seeds else {
+            return Err(ClientError::NoLeader(
+                "this client was not made by connect_any".into(),
+            ));
+        };
+        let conn = find_leader(seeds, &self.config).await?;
+        let addr = conn.addr.clone();
+        *self.conn.write().unwrap_or_else(|p| p.into_inner()) = conn;
+        Ok(addr)
+    }
+
+    fn channel(&self) -> Channel {
+        self.conn
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .channel
+            .clone()
+    }
+
+    /// Whether a failed commit is worth looking for the leader again.
+    fn worth_a_failover(&self, e: &ClientError) -> bool {
+        self.seeds.is_some()
+            && matches!(
+                e,
+                ClientError::Fenced { .. }
+                    | ClientError::Unavailable(_)
+                    | ClientError::Transport(_)
+            )
     }
 
     /// The same connection bound to the database `name`: every call of
@@ -349,15 +533,13 @@ impl Client {
             // Unrepresentable: send something the daemon will refuse.
             Some(MetadataValue::from_static("-invalid-"))
         });
-        let n = self.max_message_bytes;
         Client {
-            inner: build(&self.channel, &self.token, &db, n),
-            admin: build(&self.channel, &self.admin_token, &db, n),
-            health: self.health.clone(),
-            channel: self.channel.clone(),
+            conn: self.conn.clone(),
+            config: self.config.clone(),
+            seeds: self.seeds.clone(),
             token: self.token.clone(),
             admin_token: self.admin_token.clone(),
-            max_message_bytes: n,
+            db,
             database: Some(name),
         }
     }
@@ -369,11 +551,21 @@ impl Client {
     }
 
     fn rpc(&self) -> Inner {
-        self.inner.clone()
+        build(
+            &self.channel(),
+            &self.token,
+            &self.db,
+            self.config.max_message_bytes,
+        )
     }
 
     fn admin(&self) -> Inner {
-        self.admin.clone()
+        build(
+            &self.channel(),
+            &self.admin_token,
+            &self.db,
+            self.config.max_message_bytes,
+        )
     }
 
     /// Commits every append atomically. [`ClientError::Conflict`] when an
@@ -400,14 +592,37 @@ impl Client {
         let appends = txn.into_appends();
         let expectations: Vec<(Option<Uuid>, Expected)> =
             appends.iter().map(|a| (a.aggregate, a.expected)).collect();
-        let wire = appends
+        let wire: Vec<pb::Append> = appends
             .into_iter()
             .map(|a| convert::append_to_wire(a.aggregate, a.expected, a.events))
             .collect();
+        let mut attempt = 0;
+        loop {
+            match self.commit_once(&wire, epoch, &expectations).await {
+                Err(e) if attempt < self.config.failover_retries && self.worth_a_failover(&e) => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
+                    if let Err(again) = self.rediscover().await
+                        && attempt >= self.config.failover_retries
+                    {
+                        return Err(again);
+                    }
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn commit_once(
+        &self,
+        wire: &[pb::Append],
+        epoch: Option<u64>,
+        expectations: &[(Option<Uuid>, Expected)],
+    ) -> Result<Committed, ClientError> {
         let resp = self
             .rpc()
             .commit(pb::CommitRequest {
-                appends: wire,
+                appends: wire.to_vec(),
                 epoch,
             })
             .await
@@ -682,12 +897,7 @@ impl Client {
     /// What the daemon reports about itself.
     pub async fn info(&self) -> Result<Info, ClientError> {
         let i = self.rpc().info(pb::InfoRequest {}).await?.into_inner();
-        let role = match i.role() {
-            pb::Role::Leader => Role::Leader,
-            pb::Role::Replica => Role::Replica,
-            pb::Role::Fenced => Role::Fenced,
-            pb::Role::Unspecified => Role::Unknown,
-        };
+        let role = Role::from_wire(i.role());
         let db_id = Uuid::from_slice(&i.db_id)
             .map_err(|_| ClientError::Decode("Info carries no database identity".into()))?;
         Ok(Info {
@@ -707,7 +917,60 @@ impl Client {
             leader_head: i.leader_head,
             last_replication_error: i.last_replication_error,
             fenced_by: i.fenced_by,
+            leader_addr: i.leader_addr,
+            lease_remaining: i.lease_remaining_ms.map(Duration::from_millis),
+            peers: i.peers,
+            voted_epoch: i.voted_epoch,
         })
+    }
+
+    /// Who leads, as the daemon knows it. Open to any token.
+    pub async fn discover(&self) -> Result<Discovered, ClientError> {
+        let d = self
+            .rpc()
+            .discover(pb::DiscoverRequest {})
+            .await?
+            .into_inner();
+        let role = Role::from_wire(d.role());
+        Ok(Discovered {
+            leader_addr: d.leader_addr,
+            epoch: d.epoch,
+            role,
+            peers: d.peers,
+            lease_remaining: d.lease_remaining_ms.map(Duration::from_millis),
+        })
+    }
+
+    /// A leader's heartbeat to a peer (daemon to daemon). An admin call.
+    #[doc(hidden)]
+    pub async fn heartbeat(
+        &self,
+        req: pb::HeartbeatRequest,
+    ) -> Result<pb::HeartbeatResponse, ClientError> {
+        Ok(self.admin().heartbeat(req).await?.into_inner())
+    }
+
+    /// The daemon's stored crc32 of the records at `positions` (`None`
+    /// past the head or below the floor): how a copy finds where its
+    /// history parts from the daemon's. An admin call.
+    pub async fn fingerprints(&self, positions: &[u64]) -> Result<Vec<Option<u32>>, ClientError> {
+        let r = self
+            .admin()
+            .fingerprints(pb::FingerprintsRequest {
+                positions: positions.to_vec(),
+            })
+            .await?
+            .into_inner();
+        Ok(r.fingerprints.into_iter().map(|f| f.crc).collect())
+    }
+
+    /// A candidate's request for a vote (daemon to daemon). An admin call.
+    #[doc(hidden)]
+    pub async fn request_vote(
+        &self,
+        req: pb::RequestVoteRequest,
+    ) -> Result<pb::RequestVoteResponse, ClientError> {
+        Ok(self.admin().request_vote(req).await?.into_inner())
     }
 
     /// A backup written by the daemon as the bare file name `archive`
@@ -847,9 +1110,7 @@ impl Client {
     /// `"chron.v1.Chron"` for the service, `"chron.v1.Chron.leader"` only
     /// while the node leads. Needs no token.
     pub async fn health(&self, service: &str) -> Result<bool, ClientError> {
-        let r = self
-            .health
-            .clone()
+        let r = HealthClient::new(self.channel())
             .check(HealthCheckRequest {
                 service: service.to_string(),
             })

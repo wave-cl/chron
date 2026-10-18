@@ -45,8 +45,11 @@ enum Commands {
     Head,
     /// Path, head, floor, segments and options of the served database.
     Info,
+    /// Who leads, as the daemon at --addr knows it (any node of a group).
+    Discover,
     /// One screen of health; exit 1 when degraded (a replica disconnected,
-    /// a fenced node, lag above --max-lag), 2 when unreachable.
+    /// a fenced node, a candidate, an expired lease, lag above --max-lag),
+    /// 2 when unreachable.
     Status(cmd::admin::StatusArgs),
     /// Make everything committed so far durable.
     Flush,
@@ -140,6 +143,7 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Len { aggregate } => cmd::admin::len(conn, format, &aggregate).await,
         Commands::Head => cmd::admin::head(conn, format).await,
         Commands::Info => cmd::admin::info(conn, format).await,
+        Commands::Discover => cmd::admin::discover(conn, format).await,
         Commands::Status(a) => cmd::admin::status(conn, format, a).await,
         Commands::Flush => cmd::admin::flush(conn, format).await,
         Commands::Backup(a) => cmd::admin::backup(conn, format, a).await,
