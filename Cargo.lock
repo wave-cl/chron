@@ -164,6 +164,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bank"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chron",
+ "chron-client",
+ "chrond",
+ "clap",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,33 @@
+[package]
+name = "bank"
+description = "chron example: accounts as event-sourced aggregates, embedded or through a daemon"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bank"
+path = "src/main.rs"
+
+[dependencies]
+chron = { workspace = true, features = ["tokio"] }
+chron-client = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+[dev-dependencies]
+chrond = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"

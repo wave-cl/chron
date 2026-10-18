@@ -6,6 +6,7 @@ members = [
     "crates/chrond",
     "crates/chron-cli",
     "crates/chron-client",
+    "examples/bank",
 ]
 
 [workspace.package]
