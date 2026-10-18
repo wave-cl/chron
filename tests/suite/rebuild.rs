@@ -8,9 +8,7 @@ fn durable() -> Options {
     Options::new().fsync(Fsync::Always)
 }
 
-fn snapshot(
-    db: &Db,
-) -> (
+type Snapshot = (
     u64,
     Vec<chron::Event>,
     Vec<chron::Event>,
@@ -18,7 +16,9 @@ fn snapshot(
     Vec<chron::Event>,
     u64,
     u64,
-) {
+);
+
+fn snapshot(db: &Db) -> Snapshot {
     (
         db.head(),
         db.read_all(0, 10_000).unwrap(),
