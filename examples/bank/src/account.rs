@@ -39,15 +39,24 @@ impl AccountState {
         self.owner.is_some()
     }
 
+    /// Applies a recorded event; the version follows the event's index,
+    /// so a replay that skipped nothing ends at the aggregate's length.
     pub fn apply(&mut self, ev: &Event) -> Result<(), BankError> {
-        match AccountEvent::decode(ev)? {
-            AccountEvent::Opened { owner } => self.owner = Some(owner),
+        self.apply_event(&AccountEvent::decode(ev)?);
+        self.version = ev.index + 1;
+        Ok(())
+    }
+
+    /// Applies an event this process decided, right after it committed at
+    /// the version the state holds.
+    pub fn apply_event(&mut self, ev: &AccountEvent) {
+        match ev {
+            AccountEvent::Opened { owner } => self.owner = Some(owner.clone()),
             AccountEvent::Deposited { amount } => self.balance += amount,
             AccountEvent::Withdrawn { amount } => self.balance -= amount,
             AccountEvent::Closed => self.closed = true,
         }
         self.version += 1;
-        Ok(())
     }
 }
 
@@ -69,4 +78,6 @@ pub enum BankError {
     Store(#[from] crate::store::StoreError),
     #[error("bad event payload: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("cannot read or write the projection file: {0}")]
+    Checkpoint(std::io::Error),
 }

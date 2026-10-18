@@ -151,4 +151,23 @@ pub async fn balances_projection_equals_replayed_states<S: Store>(s: &S) {
             commands::load(s, id).await.unwrap().balance
         );
     }
+    // A closed account leaves the projection; the checkpoint still moves.
+    commands::close(s, ids[0]).await.unwrap();
+    caught.catch_up(s).await.unwrap();
+    assert!(!caught.balances.contains_key(&ids[0]));
+    assert_eq!(caught.checkpoint, s.head().await.unwrap());
+    // Saved and loaded, it resumes from its checkpoint rather than from 0.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("balances.json");
+    caught.save(&file).unwrap();
+    let mut resumed = Balances::load(&file).unwrap();
+    assert_eq!(resumed, caught);
+    commands::deposit(s, ids[1], 5).await.unwrap();
+    resumed.catch_up(s).await.unwrap();
+    assert_eq!(resumed.balances[&ids[1]], caught.balances[&ids[1]] + 5);
+    assert_eq!(resumed.checkpoint, s.head().await.unwrap());
+    assert_eq!(
+        Balances::load(&dir.path().join("none.json")).unwrap(),
+        Balances::default()
+    );
 }

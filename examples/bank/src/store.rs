@@ -40,8 +40,9 @@ impl From<ClientError> for StoreError {
     }
 }
 
-/// The five calls the bank needs. Both implementations are async; the
-/// embedded one runs the blocking library calls on the blocking pool.
+/// The five calls the bank needs. Both implementations are async: the
+/// embedded one runs its reads and commits on the blocking pool and waits
+/// for new events through the library's async subscription.
 pub trait Store: Clone + Send + Sync + 'static {
     fn commit(
         &self,

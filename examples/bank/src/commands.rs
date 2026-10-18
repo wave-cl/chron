@@ -35,13 +35,16 @@ pub async fn open<S: Store>(store: &S, owner: &str) -> Result<Uuid, BankError> {
 
 /// Loads, decides, appends with the length just seen; on a conflict,
 /// loads and decides once more (the second decision may now refuse: that
-/// is the guard), and gives up after a second conflict.
+/// is the guard), and gives up after a second conflict. The state
+/// returned is the one the command decided on, with its own event
+/// applied: no second read.
 async fn execute<S: Store>(
     store: &S,
     id: Uuid,
     decide: impl Fn(&AccountState) -> Result<AccountEvent, BankError>,
 ) -> Result<AccountState, BankError> {
-    for attempt in 0..2 {
+    let mut retried = false;
+    loop {
         let mut state = load(store, id).await?;
         if !state.exists() {
             return Err(BankError::NoSuchAccount);
@@ -51,19 +54,15 @@ async fn execute<S: Store>(
         txn.append_one(id, Expected::Exact(state.version), event.encode());
         match store.commit(txn).await {
             Ok(c) => {
-                let ev = store.read_aggregate(id, state.version, 1).await?;
-                if let Some(ev) = ev.first() {
-                    state.apply(ev)?;
-                }
+                state.apply_event(&event);
                 debug_assert_eq!(c.appends[0].new_len, state.version);
                 return Ok(state);
             }
-            Err(StoreError::Conflict { .. }) if attempt == 0 => continue,
+            Err(StoreError::Conflict { .. }) if !retried => retried = true,
             Err(StoreError::Conflict { .. }) => return Err(BankError::Contended),
             Err(e) => return Err(e.into()),
         }
     }
-    Err(BankError::Contended)
 }
 
 fn positive(amount: i64) -> Result<(), BankError> {
