@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
                     .transpose()
                     .ok()
                     .flatten(),
-                identity_pem: None,
+                identity: None,
                 domain: cli.tls_domain.clone(),
             });
             let config = ClientConfig {

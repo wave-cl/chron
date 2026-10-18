@@ -1,4 +1,6 @@
-use chron_client::{Client, ClientConfig, ClientError, Expected, NewEvent, TlsConfig};
+use std::time::Duration;
+
+use chron_client::{Client, ClientConfig, ClientError, Expected, Identity, NewEvent, TlsConfig};
 use chrond::testing::pki;
 
 use crate::common::*;
@@ -44,10 +46,10 @@ async fn tls_and_mtls_config() {
         ClientConfig {
             tls: Some(TlsConfig {
                 ca_pem: Some(p.ca_pem.clone().into_bytes()),
-                identity_pem: Some((
-                    p.client_cert_pem.clone().into_bytes(),
-                    p.client_key_pem.clone().into_bytes(),
-                )),
+                identity: Some(Identity {
+                    cert_pem: p.client_cert_pem.clone().into_bytes(),
+                    key_pem: p.client_key_pem.clone().into_bytes(),
+                }),
                 domain: Some("localhost".into()),
             }),
             ..ClientConfig::default()
@@ -60,7 +62,7 @@ async fn tls_and_mtls_config() {
         ClientConfig {
             tls: Some(TlsConfig {
                 ca_pem: Some(p.ca_pem.clone().into_bytes()),
-                identity_pem: None,
+                identity: None,
                 domain: Some("localhost".into()),
             }),
             ..ClientConfig::default()
@@ -78,5 +80,56 @@ async fn tls_and_mtls_config() {
         Ok(c) => c.head().await.is_err(),
     };
     assert!(refused);
+    f.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_config_on_a_plain_address_is_refused_before_connecting() {
+    let err = Client::connect(
+        "http://127.0.0.1:1",
+        ClientConfig {
+            tls: Some(TlsConfig::default()),
+            ..ClientConfig::default()
+        },
+    )
+    .await
+    .expect_err("refused");
+    assert!(matches!(err, ClientError::InvalidArgument(_)), "{err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_token_goes_on_admin_calls_only() {
+    let f = Fixture::start_with(
+        |o| {
+            o.token = Some("user".into());
+            o.admin_token = Some("admin".into());
+        },
+        ClientConfig {
+            token: Some("user".into()),
+            admin_token: Some("admin".into()),
+            request_timeout: Some(Duration::from_secs(30)),
+            ..ClientConfig::default()
+        },
+    )
+    .await;
+    f.client
+        .append(agg(1), Expected::New, vec![NewEvent::new("ok")])
+        .await
+        .unwrap();
+    f.client.retain(0).await.unwrap();
+    let user_only = Client::connect(
+        format!("http://{}", f.addr()),
+        ClientConfig {
+            token: Some("user".into()),
+            ..ClientConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(user_only.head().await.unwrap(), 1);
+    assert!(matches!(
+        user_only.retain(0).await,
+        Err(ClientError::PermissionDenied(_))
+    ));
     f.stop().await;
 }

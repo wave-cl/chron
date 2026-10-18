@@ -12,21 +12,25 @@
 //! let mut txn = Transaction::new();
 //! txn.append_one(order, Expected::New, NewEvent::new("placed").tag("orders"));
 //! let committed = client.commit(txn).await?;
-//! let events = client.read_aggregate(order, 0, 0, false).await?;
+//! let events = client.read_aggregate(order, 0, 0).await?;
 //! assert_eq!(events.len(), 1);
 //! assert_eq!(committed.first, events[0].position);
 //! # Ok(()) }
 //! ```
+
+#![deny(missing_docs)]
 
 mod client;
 mod error;
 mod txn;
 
 pub use chron::{
-    AppendResult, BackupMeta, Committed, Event, Expected, NewEvent, Options, Retained, Uuid,
+    AppendResult, BackupKind, BackupMeta, Bytes, Committed, Event, Expected, Fsync, NewEvent,
+    Options, Retained, Uuid,
 };
 pub use client::{
-    ChunkStream, Client, ClientConfig, EventStream, Info, ReplicationChunk, Role, TlsConfig,
+    ChunkStream, Client, ClientConfig, EventStream, Identity, Info, Promoted, ReplicationChunk,
+    Role, TlsConfig,
 };
 pub use error::ClientError;
 pub use txn::{Append, Transaction};

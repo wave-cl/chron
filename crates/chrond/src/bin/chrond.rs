@@ -138,10 +138,11 @@ async fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .map(|p| read(p, "leader CA"))
                 .transpose()?,
-            identity_pem: match (&cli.replicate_cert, &cli.replicate_key) {
-                (Some(c), Some(k)) => {
-                    Some((read(c, "client certificate")?, read(k, "client key")?))
-                }
+            identity: match (&cli.replicate_cert, &cli.replicate_key) {
+                (Some(c), Some(k)) => Some(chron_client::Identity {
+                    cert_pem: read(c, "client certificate")?,
+                    key_pem: read(k, "client key")?,
+                }),
                 _ => None,
             },
             domain: cli.replicate_domain,

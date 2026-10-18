@@ -99,11 +99,7 @@ pub async fn connect_and_check(node: &Arc<Node>) -> Result<ChunkStream, CheckErr
             info.role
         )));
     }
-    let Some(leader_id) = info.db_id else {
-        return Err(CheckError::Refused(format!(
-            "{addr} reports no database identity"
-        )));
-    };
+    let leader_id = info.db_id;
     let db = node.db.clone();
     let (head, floor, id, epoch) = (db.head(), db.floor(), db.id(), db.epoch());
     let empty = head == 0 && floor == 0;

@@ -3,8 +3,11 @@ use chron::{Expected, NewEvent, Uuid};
 /// One append of a transaction. `aggregate` `None` is a free append.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Append {
+    /// The aggregate, or `None` for events that belong to none.
     pub aggregate: Option<Uuid>,
+    /// What the append asserts about the aggregate's length.
     pub expected: Expected,
+    /// The events, in order.
     pub events: Vec<NewEvent>,
 }
 
@@ -17,10 +20,13 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// An empty transaction (which the daemon refuses to commit).
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Appends `events` to `aggregate`, asserting `expected` about its
+    /// length before them.
     pub fn append(
         &mut self,
         aggregate: Uuid,
@@ -35,6 +41,7 @@ impl Transaction {
         self
     }
 
+    /// [`append`](Transaction::append) with one event.
     pub fn append_one(
         &mut self,
         aggregate: Uuid,
@@ -54,14 +61,17 @@ impl Transaction {
         self
     }
 
+    /// Whether nothing has been appended, free appends included.
     pub fn is_empty(&self) -> bool {
         self.appends.is_empty()
     }
 
+    /// The appends in order.
     pub fn appends(&self) -> &[Append] {
         &self.appends
     }
 
+    /// The appends, consuming the transaction.
     pub fn into_appends(self) -> Vec<Append> {
         self.appends
     }

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use chron_client::{Client, ClientConfig, ClientError, TlsConfig};
+use chron_client::{Client, ClientConfig, ClientError, Identity, TlsConfig};
 use clap::Args;
 
 /// How to reach the daemon. Every flag is global.
@@ -56,10 +56,11 @@ impl Conn {
         let tls = if self.addr.starts_with("https://") {
             Some(TlsConfig {
                 ca_pem: self.tls_ca.as_ref().map(|p| read(p, "CA")).transpose()?,
-                identity_pem: match (&self.tls_cert, &self.tls_key) {
-                    (Some(c), Some(k)) => {
-                        Some((read(c, "client certificate")?, read(k, "client key")?))
-                    }
+                identity: match (&self.tls_cert, &self.tls_key) {
+                    (Some(c), Some(k)) => Some(Identity {
+                        cert_pem: read(c, "client certificate")?,
+                        key_pem: read(k, "client key")?,
+                    }),
                     _ => None,
                 },
                 domain: self.tls_domain.clone(),

@@ -25,7 +25,7 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
     let mut human = format!(
         "path {}\ndb_id {}\nrole {}\nepoch {}\nhead {}\nfloor {}\nsegments {} ({} bytes)\nfsync {}  verify_all_segments {}  segment_max_bytes {}  max_record_bytes {}",
         i.path,
-        i.db_id.map_or("?".to_string(), |u| u.to_string()),
+        i.db_id,
         i.role,
         i.epoch,
         i.head,
@@ -52,7 +52,7 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
         format,
         human,
         json!({
-            "path": i.path, "db_id": i.db_id.map(|u| u.to_string()), "role": i.role.to_string(), "epoch": i.epoch,
+            "path": i.path, "db_id": i.db_id.to_string(), "role": i.role.to_string(), "epoch": i.epoch,
             "head": i.head, "floor": i.floor, "segments": i.segments, "bytes": i.bytes,
             "options": { "fsync": o.fsync == chron::Fsync::Always, "verify_all_segments": o.verify_all_segments,
                          "segment_max_bytes": o.segment_max_bytes, "max_record_bytes": o.max_record_bytes },
@@ -150,11 +150,11 @@ pub async fn health(conn: &Conn, format: Format, service: &str) -> anyhow::Resul
 }
 
 pub async fn promote(conn: &Conn, format: Format) -> anyhow::Result<()> {
-    let (epoch, head) = client::connect(conn).await?.promote().await?;
+    let p = client::connect(conn).await?.promote().await?;
     print_value(
         format,
-        format!("promoted; epoch {epoch} head {head}"),
-        json!({ "epoch": epoch, "head": head }),
+        format!("promoted; epoch {} head {}", p.epoch, p.head),
+        json!({ "epoch": p.epoch, "head": p.head }),
     );
     Ok(())
 }

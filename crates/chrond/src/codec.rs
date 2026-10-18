@@ -44,6 +44,12 @@ pub fn retained(r: Retained) -> pb::RetainResponse {
     }
 }
 
+fn insert(s: &mut Status, key: &'static str, value: u64) {
+    if let Ok(v) = value.to_string().parse() {
+        s.metadata_mut().insert(key, v);
+    }
+}
+
 /// The status a library error becomes.
 pub fn status(e: Error) -> Status {
     match &e {
@@ -65,8 +71,17 @@ pub fn status(e: Error) -> Status {
         | Error::EmptyAppend { .. }
         | Error::RecordTooLarge { .. }
         | Error::InvalidTag(_) => Status::invalid_argument(e.to_string()),
-        Error::PositionOutOfRange { .. } | Error::BelowFloor { .. } => {
-            Status::out_of_range(e.to_string())
+        Error::PositionOutOfRange { position, head } => {
+            let mut s = Status::out_of_range(e.to_string());
+            insert(&mut s, chron_proto::POSITION_HEADER, *position);
+            insert(&mut s, chron_proto::HEAD_HEADER, *head);
+            s
+        }
+        Error::BelowFloor { position, floor } => {
+            let mut s = Status::out_of_range(e.to_string());
+            insert(&mut s, chron_proto::POSITION_HEADER, *position);
+            insert(&mut s, chron_proto::FLOOR_HEADER, *floor);
+            s
         }
         Error::Locked { .. }
         | Error::WrongBaseHead { .. }

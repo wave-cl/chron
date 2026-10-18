@@ -17,3 +17,9 @@ pub const CONFLICT_AGGREGATE_HEADER: &str = "chron-aggregate";
 /// On a `FAILED_PRECONDITION` for a write the node's role or epoch
 /// refused: the node's epoch, as decimal text.
 pub const EPOCH_HEADER: &str = "chron-epoch";
+/// On an `OUT_OF_RANGE`: the position asked for, as decimal text.
+pub const POSITION_HEADER: &str = "chron-position";
+/// On an `OUT_OF_RANGE` for a position below the floor: the floor.
+pub const FLOOR_HEADER: &str = "chron-floor";
+/// On an `OUT_OF_RANGE` for a position past the head: the head.
+pub const HEAD_HEADER: &str = "chron-head";

@@ -29,8 +29,14 @@ async fn commit_is_typed_and_a_conflict_is_a_conflict() {
         .unwrap_err();
     match err {
         ClientError::Conflict {
-            aggregate, actual, ..
-        } => assert_eq!((aggregate, actual), (agg(1), 2)),
+            aggregate,
+            actual,
+            expected,
+            ..
+        } => assert_eq!(
+            (aggregate, actual, expected),
+            (agg(1), 2, Some(Expected::Exact(7)))
+        ),
         other => panic!("unexpected {other:?}"),
     }
     assert_eq!(f.client.head().await.unwrap(), 4);
@@ -39,8 +45,11 @@ async fn commit_is_typed_and_a_conflict_is_a_conflict() {
         Err(ClientError::InvalidArgument(_))
     ));
     assert!(matches!(
-        f.client.read_all(99, 1, false).await,
-        Err(ClientError::OutOfRange(_))
+        f.client.read_all(99, 1).await,
+        Err(ClientError::PositionOutOfRange {
+            position: 99,
+            head: 4
+        })
     ));
     f.stop().await;
 }
@@ -59,17 +68,32 @@ async fn reads_both_ways_across_pages() {
             .await
             .unwrap();
     }
-    let all = f.client.read_aggregate(agg(1), 0, 0, false).await.unwrap();
+    let all = f.client.read_aggregate(agg(1), 0, 0).await.unwrap();
     assert_eq!(all.len(), 600);
     assert_eq!(all[599].index, 599);
     assert!(all[0].is_first_in_txn() && all[0].is_last_in_txn());
-    let back = f.client.read_all(u64::MAX, 3, true).await.unwrap();
+    let back = f.client.read_all_backward(u64::MAX, 3).await.unwrap();
     assert_eq!(
         back.iter().map(|e| e.position).collect::<Vec<_>>(),
         [599, 598, 597]
     );
-    let even = f.client.read_tag("even", 590, 0, false).await.unwrap();
+    let back = f
+        .client
+        .read_aggregate_backward(agg(1), 1, 5)
+        .await
+        .unwrap();
+    assert_eq!(back.iter().map(|e| e.index).collect::<Vec<_>>(), [1, 0]);
+    let even = f.client.read_tag("even", 590, 0).await.unwrap();
     assert_eq!(payloads(&even), ["e590", "e592", "e594", "e596", "e598"]);
+    let even_back = f.client.read_tag_backward("even", 5, 0).await.unwrap();
+    assert_eq!(payloads(&even_back), ["e4", "e2", "e0"]);
+    let mut streamed = f.client.read_all_stream(0, 0).await.unwrap();
+    let mut n = 0;
+    while let Some(e) = streamed.next().await {
+        assert_eq!(e.unwrap().position, n);
+        n += 1;
+    }
+    assert_eq!(n, 600);
     assert_eq!(f.client.aggregate_len(agg(1)).await.unwrap(), 600);
     assert_eq!(f.client.head().await.unwrap(), 600);
     f.stop().await;
@@ -82,7 +106,7 @@ async fn subscribe_rebuilds_library_events() {
     txn.append_one(agg(1), Expected::New, NewEvent::new("a").tag("t"));
     txn.append_free(vec![NewEvent::new("f")]);
     f.client.commit(txn).await.unwrap();
-    let mut stream = f.client.subscribe(0, None).await.unwrap();
+    let mut stream = f.client.subscribe(0).await.unwrap();
     let a = tokio::time::timeout(Duration::from_secs(10), stream.next())
         .await
         .unwrap()
@@ -110,7 +134,7 @@ async fn subscribe_rebuilds_library_events() {
         .unwrap()
         .unwrap();
     assert_eq!((live.position, live.index), (2, 1));
-    let mut tagged = f.client.subscribe(0, Some("t".into())).await.unwrap();
+    let mut tagged = f.client.subscribe_tag("t", 0).await.unwrap();
     assert_eq!(tagged.next().await.unwrap().unwrap().position, 0);
     f.stop().await;
 }
@@ -132,11 +156,14 @@ async fn info_flush_backup_apply_retain_promote_fence_typed() {
         (info.head, info.floor, info.segments, info.role, info.epoch),
         (1, 0, 1, Role::Leader, 0)
     );
-    assert!(info.db_id.is_some());
+    assert!(!info.fsync, "the fixture runs without fsync");
     assert!(!info.options.verify_all_segments);
     let meta = f.client.backup("full.chronbak", None).await.unwrap();
     assert!(f.dir.path().join("backups/full.chronbak").exists());
-    assert_eq!((meta.head, meta.format, meta.db_id), (1, 1, info.db_id));
+    assert_eq!(
+        (meta.head, meta.format, meta.db_id),
+        (1, 1, Some(info.db_id))
+    );
     f.client
         .append(agg(1), Expected::Exact(1), vec![NewEvent::new("two")])
         .await

@@ -148,11 +148,11 @@ impl Store for Client {
         from: u64,
         limit: u64,
     ) -> Result<Vec<Event>, StoreError> {
-        Ok(Client::read_aggregate(self, id, from, limit, false).await?)
+        Ok(Client::read_aggregate(self, id, from, limit as usize).await?)
     }
 
     async fn read_tag(&self, tag: &str, from: u64, limit: u64) -> Result<Vec<Event>, StoreError> {
-        Ok(Client::read_tag(self, tag.to_string(), from, limit, false).await?)
+        Ok(Client::read_tag(self, tag.to_string(), from, limit as usize).await?)
     }
 
     async fn head(&self) -> Result<u64, StoreError> {
@@ -161,7 +161,7 @@ impl Store for Client {
 
     async fn subscribe_tag(&self, tag: &str, from: u64) -> Result<EventStream, StoreError> {
         use futures::StreamExt;
-        let stream = Client::subscribe(self, from, Some(tag.to_string().into())).await?;
+        let stream = Client::subscribe_tag(self, tag.to_string(), from).await?;
         Ok(Box::pin(stream.map(|r| r.map_err(StoreError::from))))
     }
 }

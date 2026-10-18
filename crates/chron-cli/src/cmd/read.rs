@@ -50,33 +50,42 @@ pub struct TagArgs {
 pub async fn aggregate(conn: &Conn, format: Format, a: AggregateArgs) -> anyhow::Result<()> {
     let id = aggregate_id(&a.aggregate)?;
     let c = client::connect(conn).await?;
-    for e in c
-        .read_aggregate(id, a.range.from(), a.range.limit, a.range.backward)
-        .await?
-    {
-        print_event(format, &e);
-    }
-    Ok(())
+    let limit = a.range.limit as usize;
+    let stream = if a.range.backward {
+        c.read_aggregate_backward_stream(id, a.range.from(), limit)
+            .await?
+    } else {
+        c.read_aggregate_stream(id, a.range.from(), limit).await?
+    };
+    print_stream(format, stream).await
 }
 
 pub async fn all(conn: &Conn, format: Format, a: AllArgs) -> anyhow::Result<()> {
     let c = client::connect(conn).await?;
-    for e in c
-        .read_all(a.range.from(), a.range.limit, a.range.backward)
-        .await?
-    {
-        print_event(format, &e);
-    }
-    Ok(())
+    let limit = a.range.limit as usize;
+    let stream = if a.range.backward {
+        c.read_all_backward_stream(a.range.from(), limit).await?
+    } else {
+        c.read_all_stream(a.range.from(), limit).await?
+    };
+    print_stream(format, stream).await
 }
 
 pub async fn tag(conn: &Conn, format: Format, a: TagArgs) -> anyhow::Result<()> {
     let c = client::connect(conn).await?;
-    for e in c
-        .read_tag(a.tag, a.range.from(), a.range.limit, a.range.backward)
-        .await?
-    {
-        print_event(format, &e);
+    let limit = a.range.limit as usize;
+    let stream = if a.range.backward {
+        c.read_tag_backward_stream(a.tag, a.range.from(), limit)
+            .await?
+    } else {
+        c.read_tag_stream(a.tag, a.range.from(), limit).await?
+    };
+    print_stream(format, stream).await
+}
+
+async fn print_stream(format: Format, mut stream: EventStream) -> anyhow::Result<()> {
+    while let Some(item) = stream.next().await {
+        print_event(format, &item?);
     }
     Ok(())
 }
@@ -101,9 +110,9 @@ pub async fn tail(conn: &Conn, format: Format, a: TailArgs) -> anyhow::Result<()
     } else {
         a.from.unwrap_or(0)
     };
-    let mut stream: EventStream = c.subscribe(from, a.tag.map(bytes::Bytes::from)).await?;
-    while let Some(item) = stream.next().await {
-        print_event(format, &item?);
-    }
-    Ok(())
+    let stream = match a.tag {
+        Some(tag) => c.subscribe_tag(tag, from).await?,
+        None => c.subscribe(from).await?,
+    };
+    print_stream(format, stream).await
 }
