@@ -161,6 +161,11 @@ impl Db {
         self.inner.layout.root()
     }
 
+    /// The options the database was opened with.
+    pub fn options(&self) -> &Options {
+        &self.inner.opts
+    }
+
     /// The next global position: one past the last committed event.
     pub fn head(&self) -> u64 {
         self.inner.head.load(Ordering::Acquire)

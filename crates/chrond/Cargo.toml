@@ -1,0 +1,37 @@
+[package]
+name = "chrond"
+description = "chron: the gRPC daemon serving one database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "chrond"
+path = "src/bin/chrond.rs"
+
+[dependencies]
+chron = { workspace = true, features = ["tokio"] }
+chron-proto = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"
