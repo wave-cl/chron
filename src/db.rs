@@ -15,6 +15,7 @@ use crate::index::{self, Index, Location};
 use crate::options::{Fsync, Options};
 use crate::recover;
 use crate::segment::{self, SegmentWriter};
+use crate::subscribe::Subscription;
 use crate::txn::{self, Committed, Mode, Transaction};
 
 pub(crate) struct Layout {
@@ -296,6 +297,19 @@ impl Db {
             out.push(ev);
         }
         Ok(out)
+    }
+
+    /// Committed events in global order from `from`, then new ones as they
+    /// are committed. `from` may be past the head: the subscription then
+    /// waits for that position.
+    pub fn subscribe(&self, from: u64) -> Subscription {
+        Subscription::all(self.clone(), from)
+    }
+
+    /// The events carrying `tag`, in global order from `from`, then new
+    /// ones as they are committed.
+    pub fn subscribe_tag(&self, tag: impl Into<bytes::Bytes>, from: u64) -> Subscription {
+        Subscription::tag(self.clone(), tag.into(), from)
     }
 
     /// Starts a transaction. Nothing happens until `commit`.

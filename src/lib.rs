@@ -7,7 +7,8 @@
 //! carries any number of **tags**; reading a tag yields its events in global
 //! order. An event may also belong to no aggregate at all (a **free**
 //! event, appended with [`Transaction::append_free`]); it still takes a
-//! global position and tags.
+//! global position and tags. A [`Subscription`] follows the global order,
+//! or one tag's slice of it, live.
 //!
 //! On disk, event bytes go to append-only segment files and every index to
 //! one redb file. **The redb commit is the commit point**: the segment bytes
@@ -23,6 +24,7 @@ mod index;
 mod options;
 mod recover;
 mod segment;
+mod subscribe;
 mod txn;
 
 pub use db::Db;
@@ -32,5 +34,6 @@ pub use event::{
     NewEvent,
 };
 pub use options::{Fsync, Options};
+pub use subscribe::Subscription;
 pub use txn::{AppendResult, Committed, Expected, Transaction};
 pub use uuid::Uuid;

@@ -7,4 +7,5 @@ mod reads;
 mod recovery;
 mod reopen;
 mod rotation;
+mod subscribe;
 mod transactions;
