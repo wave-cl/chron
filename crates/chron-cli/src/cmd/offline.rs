@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use chron::{BackupKind, Db, Options};
+use chron::{Db, Options};
 use serde_json::json;
 
+use crate::cmd::admin::{meta_human, meta_json};
 use crate::output::{Format, print_value};
 
 pub fn rebuild_index(format: Format, path: &Path) -> anyhow::Result<()> {
@@ -32,14 +33,6 @@ pub fn verify(format: Format, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn meta_json(m: &chron::BackupMeta) -> serde_json::Value {
-    json!({
-        "kind": if m.kind == BackupKind::Incremental { "incremental" } else { "full" },
-        "base_head": m.base_head, "head": m.head, "floor": m.floor,
-        "created_at_unix_nanos": m.created_at_unix_nanos, "files": m.files, "bytes": m.bytes,
-    })
-}
-
 pub fn restore(format: Format, archive: &Path, dir: &Path) -> anyhow::Result<()> {
     let m = chron::restore_backup(archive, dir, &Options::new())?;
     print_value(
@@ -57,13 +50,6 @@ pub fn restore(format: Format, archive: &Path, dir: &Path) -> anyhow::Result<()>
 
 pub fn inspect(format: Format, archive: &Path) -> anyhow::Result<()> {
     let m = chron::inspect_backup(archive)?;
-    let human = match m.base_head {
-        Some(b) => format!("incremental backup {}..{} ({} bytes)", b, m.head, m.bytes),
-        None => format!(
-            "full backup to head {} floor {} ({} files, {} bytes)",
-            m.head, m.floor, m.files, m.bytes
-        ),
-    };
-    print_value(format, human, meta_json(&m));
+    print_value(format, meta_human(&m), meta_json(&m));
     Ok(())
 }

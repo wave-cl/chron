@@ -16,14 +16,8 @@ use crate::output::Format;
     about = "Client for a chrond daemon and offline maintenance"
 )]
 struct Cli {
-    /// The daemon's address.
-    #[arg(
-        long,
-        global = true,
-        env = "CHRON_ADDR",
-        default_value = "http://127.0.0.1:4242"
-    )]
-    addr: String,
+    #[command(flatten)]
+    conn: client::Conn,
     /// One JSON object per line instead of human lines.
     #[arg(long, global = true)]
     json: bool,
@@ -59,6 +53,15 @@ enum Commands {
     Apply { archive: String },
     /// Drop segments wholly below a position.
     Retain { floor: u64 },
+    /// Whether the daemon reports SERVING (exit 0) or not (exit 1).
+    Health {
+        #[arg(long, default_value = "chron.v1.Chron")]
+        service: String,
+    },
+    /// Make a replica the leader under a new epoch.
+    Promote,
+    /// Tell a leader that a newer epoch exists; it refuses writes from then on.
+    Fence { epoch: u64 },
     /// Offline: rebuild a database's index from its segment files.
     RebuildIndex { path: std::path::PathBuf },
     /// Offline: open a database checking every segment and the index.
@@ -91,20 +94,24 @@ async fn main() {
 }
 
 async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
+    let conn = &cli.conn;
     match cli.command {
-        Commands::Append(a) => cmd::write::append(&cli.addr, format, a).await,
-        Commands::Commit(a) => cmd::write::commit(&cli.addr, format, a).await,
-        Commands::Read(a) => cmd::read::aggregate(&cli.addr, format, a).await,
-        Commands::All(a) => cmd::read::all(&cli.addr, format, a).await,
-        Commands::Tag(a) => cmd::read::tag(&cli.addr, format, a).await,
-        Commands::Tail(a) => cmd::read::tail(&cli.addr, format, a).await,
-        Commands::Len { aggregate } => cmd::admin::len(&cli.addr, format, &aggregate).await,
-        Commands::Head => cmd::admin::head(&cli.addr, format).await,
-        Commands::Info => cmd::admin::info(&cli.addr, format).await,
-        Commands::Flush => cmd::admin::flush(&cli.addr, format).await,
-        Commands::Backup(a) => cmd::admin::backup(&cli.addr, format, a).await,
-        Commands::Apply { archive } => cmd::admin::apply(&cli.addr, format, archive).await,
-        Commands::Retain { floor } => cmd::admin::retain(&cli.addr, format, floor).await,
+        Commands::Append(a) => cmd::write::append(conn, format, a).await,
+        Commands::Commit(a) => cmd::write::commit(conn, format, a).await,
+        Commands::Read(a) => cmd::read::aggregate(conn, format, a).await,
+        Commands::All(a) => cmd::read::all(conn, format, a).await,
+        Commands::Tag(a) => cmd::read::tag(conn, format, a).await,
+        Commands::Tail(a) => cmd::read::tail(conn, format, a).await,
+        Commands::Len { aggregate } => cmd::admin::len(conn, format, &aggregate).await,
+        Commands::Head => cmd::admin::head(conn, format).await,
+        Commands::Info => cmd::admin::info(conn, format).await,
+        Commands::Flush => cmd::admin::flush(conn, format).await,
+        Commands::Backup(a) => cmd::admin::backup(conn, format, a).await,
+        Commands::Apply { archive } => cmd::admin::apply(conn, format, archive).await,
+        Commands::Retain { floor } => cmd::admin::retain(conn, format, floor).await,
+        Commands::Health { service } => cmd::admin::health(conn, format, &service).await,
+        Commands::Promote => cmd::admin::promote(conn, format).await,
+        Commands::Fence { epoch } => cmd::admin::fence(conn, format, epoch).await,
         Commands::RebuildIndex { path } => cmd::offline::rebuild_index(format, &path),
         Commands::Verify { path } => cmd::offline::verify(format, &path),
         Commands::Restore { archive, dir } => cmd::offline::restore(format, &archive, &dir),

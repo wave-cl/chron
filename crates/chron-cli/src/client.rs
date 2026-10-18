@@ -1,14 +1,42 @@
-use std::time::Duration;
+use std::path::PathBuf;
 
 use anyhow::Context;
-use chron_proto::v1::chron_client::ChronClient;
-use tonic::transport::{Channel, Endpoint};
+use chron_client::{Client, ClientConfig, ClientError, TlsConfig};
+use clap::Args;
+
+/// How to reach the daemon. Every flag is global.
+#[derive(Args, Debug, Clone)]
+pub struct Conn {
+    /// The daemon's address; `https://` enables TLS.
+    #[arg(
+        long,
+        global = true,
+        env = "CHRON_ADDR",
+        default_value = "http://127.0.0.1:4242"
+    )]
+    pub addr: String,
+    /// PEM of a private CA to verify the daemon with (system roots otherwise).
+    #[arg(long, global = true, env = "CHRON_TLS_CA")]
+    pub tls_ca: Option<PathBuf>,
+    /// PEM client certificate (mTLS); requires --tls-key.
+    #[arg(long, global = true, env = "CHRON_TLS_CERT", requires = "tls_key")]
+    pub tls_cert: Option<PathBuf>,
+    /// PEM client key.
+    #[arg(long, global = true, env = "CHRON_TLS_KEY", requires = "tls_cert")]
+    pub tls_key: Option<PathBuf>,
+    /// The name to verify the daemon's certificate against.
+    #[arg(long, global = true, env = "CHRON_TLS_DOMAIN")]
+    pub tls_domain: Option<String>,
+    /// Bearer token the daemon requires.
+    #[arg(long, global = true, env = "CHRON_TOKEN", hide_env_values = true)]
+    pub token: Option<String>,
+}
 
 /// The daemon could not be reached at all (exit code 2).
 #[derive(Debug)]
 pub struct Unreachable {
     pub addr: String,
-    pub source: tonic::transport::Error,
+    pub source: ClientError,
 }
 
 impl std::fmt::Display for Unreachable {
@@ -19,15 +47,42 @@ impl std::fmt::Display for Unreachable {
 
 impl std::error::Error for Unreachable {}
 
-pub async fn connect(addr: &str) -> anyhow::Result<ChronClient<Channel>> {
-    let endpoint = Endpoint::from_shared(addr.to_string())
-        .with_context(|| format!("{addr} is not a valid address"))?
-        .connect_timeout(Duration::from_secs(3));
-    let channel = endpoint.connect().await.map_err(|source| {
-        anyhow::Error::new(Unreachable {
-            addr: addr.to_string(),
-            source,
+fn read(path: &PathBuf, what: &str) -> anyhow::Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("cannot read the {what} at {}", path.display()))
+}
+
+impl Conn {
+    pub fn config(&self) -> anyhow::Result<ClientConfig> {
+        let tls = if self.addr.starts_with("https://") {
+            Some(TlsConfig {
+                ca_pem: self.tls_ca.as_ref().map(|p| read(p, "CA")).transpose()?,
+                identity_pem: match (&self.tls_cert, &self.tls_key) {
+                    (Some(c), Some(k)) => {
+                        Some((read(c, "client certificate")?, read(k, "client key")?))
+                    }
+                    _ => None,
+                },
+                domain: self.tls_domain.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(ClientConfig {
+            tls,
+            token: self.token.clone(),
+            ..ClientConfig::default()
         })
-    })?;
-    Ok(ChronClient::new(channel))
+    }
+}
+
+pub async fn connect(conn: &Conn) -> anyhow::Result<Client> {
+    let config = conn.config()?;
+    Client::connect(conn.addr.clone(), config)
+        .await
+        .map_err(|source| {
+            anyhow::Error::new(Unreachable {
+                addr: conn.addr.clone(),
+                source,
+            })
+        })
 }

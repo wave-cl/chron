@@ -16,19 +16,32 @@ struct Daemon {
 
 impl Daemon {
     fn start() -> Daemon {
+        Self::start_with(|_| {})
+    }
+
+    fn start_with(f: impl FnOnce(&mut chrond::Options)) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut opts =
             chrond::Options::new(dir.path().join("data"), "127.0.0.1:0".parse().unwrap());
         opts.fsync = false;
+        f(&mut opts);
+        let tls = opts.tls.is_some();
         let running = rt.block_on(chrond::start(opts)).expect("the daemon starts");
-        let url = format!("http://{}", running.local_addr);
+        let scheme = if tls { "https" } else { "http" };
+        let url = format!("{scheme}://{}", running.local_addr);
         Daemon {
             dir,
             rt,
             running: Some(running),
             url,
         }
+    }
+
+    /// A replica of `leader` in its own directory and runtime.
+    fn start_replica_of(leader: &Daemon) -> Daemon {
+        let url = leader.url.clone();
+        Self::start_with(move |o| o.replicate_from = Some(url))
     }
 
     fn chron(&self) -> Command {
@@ -205,6 +218,180 @@ fn tail_streams_live_until_killed() {
         assert!(line.contains(&format!("live{i}")), "{line}");
         assert!(!line.contains("untagged"));
     }
+}
+
+#[test]
+fn health_exits_0_when_serving_and_2_when_unreachable() {
+    let d = Daemon::start();
+    d.chron()
+        .args(["health"])
+        .assert()
+        .success()
+        .stdout("SERVING\n");
+    d.chron()
+        .args(["--json", "health", "--service", ""])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"serving\":true"));
+    Command::cargo_bin("chron")
+        .unwrap()
+        .args(["--addr", "http://127.0.0.1:1", "health"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn token_required_exits_1_with_a_hint_and_the_env_token_works() {
+    let d = Daemon::start_with(|o| o.token = Some("s3cret".into()));
+    d.chron().args(["head"]).assert().code(1).stderr(
+        predicate::str::contains("Unauthenticated").and(predicate::str::contains("CHRON_TOKEN")),
+    );
+    d.chron()
+        .env("CHRON_TOKEN", "s3cret")
+        .args(["head"])
+        .assert()
+        .success()
+        .stdout("0\n");
+    d.chron()
+        .args(["--token", "s3cret", "health"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn tls_and_mtls_flags() {
+    let p = chrond::testing::pki();
+    let tls = chrond::Tls {
+        cert_pem: p.server_cert_pem.clone().into_bytes(),
+        key_pem: p.server_key_pem.clone().into_bytes(),
+        client_ca_pem: None,
+    };
+    let d = Daemon::start_with(move |o| o.tls = Some(tls));
+    let paths = p.write_to(d.dir.path());
+    d.chron()
+        .args(["--tls-ca"])
+        .arg(&paths.ca)
+        .args(["--tls-domain", "localhost", "head"])
+        .assert()
+        .success()
+        .stdout("0\n");
+    d.chron().args(["head"]).assert().code(2);
+
+    let p2 = chrond::testing::pki();
+    let tls = chrond::Tls {
+        cert_pem: p2.server_cert_pem.clone().into_bytes(),
+        key_pem: p2.server_key_pem.clone().into_bytes(),
+        client_ca_pem: Some(p2.ca_pem.clone().into_bytes()),
+    };
+    let m = Daemon::start_with(move |o| o.tls = Some(tls));
+    let paths = p2.write_to(m.dir.path());
+    m.chron()
+        .args(["--tls-ca"])
+        .arg(&paths.ca)
+        .args(["--tls-domain", "localhost", "head"])
+        .assert()
+        .code(2);
+    m.chron()
+        .args(["--tls-ca"])
+        .arg(&paths.ca)
+        .args(["--tls-cert"])
+        .arg(&paths.client_cert)
+        .args(["--tls-key"])
+        .arg(&paths.client_key)
+        .args(["--tls-domain", "localhost", "head"])
+        .assert()
+        .success()
+        .stdout("0\n");
+}
+
+#[test]
+fn promote_fence_and_epoch_flags() {
+    let leader = Daemon::start();
+    leader
+        .chron()
+        .args(["append", A, "-d", "one"])
+        .assert()
+        .success();
+    let replica = Daemon::start_replica_of(&leader);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = replica
+            .chron()
+            .args(["head"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        if String::from_utf8(out).unwrap().trim() == "1" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replica never caught up"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    replica.chron().args(["info"]).assert().success().stdout(
+        predicate::str::contains("role replica").and(predicate::str::contains("replicating_from")),
+    );
+    replica
+        .chron()
+        .args(["append", A, "-d", "nope"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("read-only replica"));
+    replica
+        .chron()
+        .args(["promote"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("promoted; epoch 1 head 1"));
+    replica
+        .chron()
+        .args(["append", A, "--epoch", "0", "-d", "stale"])
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::contains("stale epoch")
+                .and(predicate::str::contains("(daemon epoch 1)")),
+        );
+    replica
+        .chron()
+        .args(["append", A, "--epoch", "1", "-d", "fresh"])
+        .assert()
+        .success();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = leader
+            .chron()
+            .args(["info"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        if String::from_utf8(out).unwrap().contains("role fenced") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old leader was never fenced"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    leader
+        .chron()
+        .args(["fence", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fenced; epoch 0"));
+    leader
+        .chron()
+        .args(["append", A, "-d", "late"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("fenced"));
 }
 
 #[test]

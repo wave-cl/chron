@@ -1,9 +1,9 @@
-use chron_proto::v1 as pb;
+use chron_client::EventStream;
 use clap::Args;
 use tokio_stream::StreamExt;
 
-use crate::client;
-use crate::cmd::aggregate_bytes;
+use crate::client::{self, Conn};
+use crate::cmd::aggregate_id;
 use crate::output::{Format, print_event};
 
 #[derive(Args, Debug)]
@@ -47,56 +47,38 @@ pub struct TagArgs {
     range: Range,
 }
 
-async fn print_stream(
-    format: Format,
-    mut stream: tonic::Streaming<pb::Event>,
-) -> anyhow::Result<()> {
-    while let Some(item) = stream.next().await {
-        print_event(format, &item?);
+pub async fn aggregate(conn: &Conn, format: Format, a: AggregateArgs) -> anyhow::Result<()> {
+    let id = aggregate_id(&a.aggregate)?;
+    let c = client::connect(conn).await?;
+    for e in c
+        .read_aggregate(id, a.range.from(), a.range.limit, a.range.backward)
+        .await?
+    {
+        print_event(format, &e);
     }
     Ok(())
 }
 
-pub async fn aggregate(addr: &str, format: Format, a: AggregateArgs) -> anyhow::Result<()> {
-    let aggregate = aggregate_bytes(&a.aggregate)?;
-    let mut c = client::connect(addr).await?;
-    let stream = c
-        .read_aggregate(pb::ReadAggregateRequest {
-            aggregate,
-            from_index: a.range.from(),
-            limit: a.range.limit,
-            backward: a.range.backward,
-        })
+pub async fn all(conn: &Conn, format: Format, a: AllArgs) -> anyhow::Result<()> {
+    let c = client::connect(conn).await?;
+    for e in c
+        .read_all(a.range.from(), a.range.limit, a.range.backward)
         .await?
-        .into_inner();
-    print_stream(format, stream).await
+    {
+        print_event(format, &e);
+    }
+    Ok(())
 }
 
-pub async fn all(addr: &str, format: Format, a: AllArgs) -> anyhow::Result<()> {
-    let mut c = client::connect(addr).await?;
-    let stream = c
-        .read_all(pb::ReadAllRequest {
-            from: a.range.from(),
-            limit: a.range.limit,
-            backward: a.range.backward,
-        })
+pub async fn tag(conn: &Conn, format: Format, a: TagArgs) -> anyhow::Result<()> {
+    let c = client::connect(conn).await?;
+    for e in c
+        .read_tag(a.tag, a.range.from(), a.range.limit, a.range.backward)
         .await?
-        .into_inner();
-    print_stream(format, stream).await
-}
-
-pub async fn tag(addr: &str, format: Format, a: TagArgs) -> anyhow::Result<()> {
-    let mut c = client::connect(addr).await?;
-    let stream = c
-        .read_tag(pb::ReadTagRequest {
-            tag: a.tag.into_bytes(),
-            from: a.range.from(),
-            limit: a.range.limit,
-            backward: a.range.backward,
-        })
-        .await?
-        .into_inner();
-    print_stream(format, stream).await
+    {
+        print_event(format, &e);
+    }
+    Ok(())
 }
 
 #[derive(Args, Debug)]
@@ -112,19 +94,16 @@ pub struct TailArgs {
     tag: Option<String>,
 }
 
-pub async fn tail(addr: &str, format: Format, a: TailArgs) -> anyhow::Result<()> {
-    let mut c = client::connect(addr).await?;
+pub async fn tail(conn: &Conn, format: Format, a: TailArgs) -> anyhow::Result<()> {
+    let c = client::connect(conn).await?;
     let from = if a.from_head {
-        c.head(pb::HeadRequest {}).await?.into_inner().head
+        c.head().await?
     } else {
         a.from.unwrap_or(0)
     };
-    let stream = c
-        .subscribe(pb::SubscribeRequest {
-            from,
-            tag: a.tag.map(String::into_bytes),
-        })
-        .await?
-        .into_inner();
-    print_stream(format, stream).await
+    let mut stream: EventStream = c.subscribe(from, a.tag.map(bytes::Bytes::from)).await?;
+    while let Some(item) = stream.next().await {
+        print_event(format, &item?);
+    }
+    Ok(())
 }

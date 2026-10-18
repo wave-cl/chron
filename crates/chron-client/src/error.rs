@@ -1,3 +1,5 @@
+use std::error::Error as _;
+
 use chron::Uuid;
 use tonic::{Code, Status};
 
@@ -67,6 +69,15 @@ impl From<Status> for ClientError {
             Code::OutOfRange => ClientError::OutOfRange(s.message().to_string()),
             Code::Unauthenticated => ClientError::Unauthenticated(s.message().to_string()),
             Code::Unavailable => ClientError::Unavailable(s.message().to_string()),
+            // A connection-level failure (a TLS handshake refused after the
+            // connect, a reset) reaches the caller as this status.
+            Code::Unknown if s.message() == "transport error" => {
+                let detail = s
+                    .source()
+                    .map(|e| format!("transport error: {e}"))
+                    .unwrap_or_else(|| "transport error".to_string());
+                ClientError::Unavailable(detail)
+            }
             _ => ClientError::Status(s),
         }
     }

@@ -2,11 +2,12 @@ use std::io::Read;
 
 use anyhow::Context;
 use base64::Engine;
-use chron_proto::v1 as pb;
+use chron::{Expected, NewEvent};
+use chron_client::Transaction;
 use clap::Args;
 use serde::Deserialize;
 
-use crate::client;
+use crate::client::{self, Conn};
 use crate::cmd::{parse_aggregate, parse_expect};
 use crate::output::{Format, Usage, print_commit};
 
@@ -29,12 +30,30 @@ pub struct AppendArgs {
     /// Read the payload from stdin.
     #[arg(long)]
     stdin: bool,
+    /// The epoch the daemon must be at (a fencing token).
+    #[arg(long)]
+    epoch: Option<u64>,
 }
 
-pub async fn append(addr: &str, format: Format, a: AppendArgs) -> anyhow::Result<()> {
+async fn send(
+    conn: &Conn,
+    format: Format,
+    txn: Transaction,
+    epoch: Option<u64>,
+) -> anyhow::Result<()> {
+    let c = client::connect(conn).await?;
+    let committed = match epoch {
+        Some(e) => c.commit_with_epoch(txn, e).await?,
+        None => c.commit(txn).await?,
+    };
+    print_commit(format, &committed);
+    Ok(())
+}
+
+pub async fn append(conn: &Conn, format: Format, a: AppendArgs) -> anyhow::Result<()> {
     let aggregate = parse_aggregate(&a.aggregate)?;
     let expected = parse_expect(&a.expect)?;
-    if aggregate.is_none() && !matches!(expected.kind, Some(pb::expected::Kind::Any(_))) {
+    if aggregate.is_none() && expected != Expected::Any {
         return Err(Usage("free events have no length to expect; use --expect any".into()).into());
     }
     let payload = match (a.data, a.stdin) {
@@ -48,26 +67,16 @@ pub async fn append(addr: &str, format: Format, a: AppendArgs) -> anyhow::Result
         }
         (None, false) => return Err(Usage("give the payload with -d or --stdin".into()).into()),
     };
-    let event = pb::NewEvent {
-        tags: a.tags.into_iter().map(String::into_bytes).collect(),
-        metadata: a.meta.map(String::into_bytes).unwrap_or_default(),
-        payload,
+    let mut event = NewEvent::new(payload).tags(a.tags);
+    if let Some(m) = a.meta {
+        event = event.metadata(m);
+    }
+    let mut txn = Transaction::new();
+    match aggregate {
+        Some(id) => txn.append_one(id, expected, event),
+        None => txn.append_free(vec![event]),
     };
-    let append = pb::Append {
-        aggregate: aggregate.map(|u| u.as_bytes().to_vec()),
-        expected: Some(expected),
-        events: vec![event],
-    };
-    let mut c = client::connect(addr).await?;
-    let resp = c
-        .commit(pb::CommitRequest {
-            appends: vec![append],
-            epoch: None,
-        })
-        .await?
-        .into_inner();
-    print_commit(format, &resp);
-    Ok(())
+    send(conn, format, txn, a.epoch).await
 }
 
 #[derive(Args, Debug)]
@@ -80,6 +89,9 @@ pub struct CommitArgs {
     /// Read the JSON from stdin.
     #[arg(long)]
     stdin: bool,
+    /// The epoch the daemon must be at (a fencing token).
+    #[arg(long)]
+    epoch: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -128,7 +140,7 @@ fn bytes(text: Option<String>, b64: Option<String>, what: &str) -> anyhow::Resul
     }
 }
 
-pub async fn commit(addr: &str, format: Format, a: CommitArgs) -> anyhow::Result<()> {
+pub async fn commit(conn: &Conn, format: Format, a: CommitArgs) -> anyhow::Result<()> {
     let text = match (a.file, a.stdin) {
         (Some(f), _) => {
             std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?
@@ -142,41 +154,31 @@ pub async fn commit(addr: &str, format: Format, a: CommitArgs) -> anyhow::Result
         }
         (None, false) => return Err(Usage("give the transaction with -f or --stdin".into()).into()),
     };
-    let txn: TxnJson =
+    let parsed: TxnJson =
         serde_json::from_str(&text).map_err(|e| Usage(format!("bad transaction JSON: {e}")))?;
-    let mut appends = Vec::with_capacity(txn.appends.len());
-    for a in txn.appends {
+    let mut txn = Transaction::new();
+    for a in parsed.appends {
         let aggregate = match a.aggregate {
             Some(s) => parse_aggregate(&s)?,
             None => None,
         };
         let expected = match a.expect {
-            None => None,
-            Some(ExpectJson::Word(w)) => Some(parse_expect(&w)?),
-            Some(ExpectJson::Exact(n)) => Some(parse_expect(&n.to_string())?),
+            None => Expected::Any,
+            Some(ExpectJson::Word(w)) => parse_expect(&w)?,
+            Some(ExpectJson::Exact(n)) => Expected::Exact(n),
         };
         let mut events = Vec::with_capacity(a.events.len());
         for e in a.events {
-            events.push(pb::NewEvent {
-                tags: e.tags.into_iter().map(String::into_bytes).collect(),
-                metadata: bytes(e.metadata, e.metadata_base64, "metadata")?,
-                payload: bytes(e.payload, e.payload_base64, "payload")?,
+            events.push(NewEvent {
+                tags: e.tags.into_iter().map(bytes::Bytes::from).collect(),
+                metadata: bytes(e.metadata, e.metadata_base64, "metadata")?.into(),
+                payload: bytes(e.payload, e.payload_base64, "payload")?.into(),
             });
         }
-        appends.push(pb::Append {
-            aggregate: aggregate.map(|u| u.as_bytes().to_vec()),
-            expected,
-            events,
-        });
+        match aggregate {
+            Some(id) => txn.append(id, expected, events),
+            None => txn.append_free(events),
+        };
     }
-    let mut c = client::connect(addr).await?;
-    let resp = c
-        .commit(pb::CommitRequest {
-            appends,
-            epoch: None,
-        })
-        .await?
-        .into_inner();
-    print_commit(format, &resp);
-    Ok(())
+    send(conn, format, txn, a.epoch).await
 }

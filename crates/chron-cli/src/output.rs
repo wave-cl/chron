@@ -1,7 +1,7 @@
 use base64::Engine;
-use chron_proto::v1 as pb;
+use chron::{Committed, Event};
+use chron_client::ClientError;
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -21,13 +21,6 @@ impl std::fmt::Display for Usage {
 
 impl std::error::Error for Usage {}
 
-pub fn aggregate_text(bytes: Option<&[u8]>) -> String {
-    match bytes.and_then(|b| <[u8; 16]>::try_from(b).ok()) {
-        Some(arr) => Uuid::from_bytes(arr).to_string(),
-        None => "free".to_string(),
-    }
-}
-
 fn text_or_base64(
     obj: &mut serde_json::Map<String, Value>,
     key: &str,
@@ -46,23 +39,20 @@ fn text_or_base64(
     }
 }
 
-pub fn event_json(e: &pb::Event) -> Value {
+pub fn event_json(e: &Event) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("position".into(), json!(e.position));
     obj.insert(
         "aggregate".into(),
-        match &e.aggregate {
-            Some(_) => Value::String(aggregate_text(e.aggregate.as_deref())),
+        match e.aggregate {
+            Some(a) => Value::String(a.to_string()),
             None => Value::Null,
         },
     );
     obj.insert("index".into(), json!(e.index));
-    obj.insert(
-        "recorded_at_unix_nanos".into(),
-        json!(e.recorded_at_unix_nanos),
-    );
-    obj.insert("first_in_txn".into(), json!(e.first_in_txn));
-    obj.insert("last_in_txn".into(), json!(e.last_in_txn));
+    obj.insert("recorded_at_unix_nanos".into(), json!(e.recorded_at));
+    obj.insert("first_in_txn".into(), json!(e.is_first_in_txn()));
+    obj.insert("last_in_txn".into(), json!(e.is_last_in_txn()));
     obj.insert(
         "tags".into(),
         Value::Array(
@@ -77,12 +67,12 @@ pub fn event_json(e: &pb::Event) -> Value {
     Value::Object(obj)
 }
 
-pub fn print_event(format: Format, e: &pb::Event) {
+pub fn print_event(format: Format, e: &Event) {
     match format {
         Format::Json => println!("{}", event_json(e)),
         Format::Human => {
-            let who = match &e.aggregate {
-                Some(a) => format!("{}#{}", aggregate_text(Some(a)), e.index),
+            let who = match e.aggregate {
+                Some(a) => format!("{a}#{}", e.index),
                 None => "free".to_string(),
             };
             let tags: Vec<String> = e
@@ -105,7 +95,7 @@ pub fn print_event(format: Format, e: &pb::Event) {
     }
 }
 
-pub fn print_commit(format: Format, c: &pb::CommitResponse) {
+pub fn print_commit(format: Format, c: &Committed) {
     match format {
         Format::Json => {
             let appends: Vec<Value> = c
@@ -113,7 +103,7 @@ pub fn print_commit(format: Format, c: &pb::CommitResponse) {
                 .iter()
                 .map(|a| {
                     json!({
-                        "aggregate": a.aggregate.as_ref().map(|b| aggregate_text(Some(b))),
+                        "aggregate": a.aggregate.map(|u| u.to_string()),
                         "first_position": a.first_position,
                         "first_index": a.first_index,
                         "count": a.count,
@@ -131,7 +121,7 @@ pub fn print_commit(format: Format, c: &pb::CommitResponse) {
             for a in &c.appends {
                 println!(
                     "  {}  first {}  index {}  count {}  len {}",
-                    aggregate_text(a.aggregate.as_deref()),
+                    a.aggregate.map_or("free".to_string(), |u| u.to_string()),
                     a.first_position,
                     a.first_index,
                     a.count,
@@ -150,16 +140,25 @@ pub fn print_value(format: Format, human: String, value: Value) {
 }
 
 pub fn render_error(e: &anyhow::Error) -> String {
-    if let Some(status) = e.downcast_ref::<tonic::Status>() {
-        let mut s = format!("{:?}: {}", status.code(), status.message());
-        if let Some(actual) = status
-            .metadata()
-            .get(chron_proto::CONFLICT_ACTUAL_LENGTH_HEADER)
-            .and_then(|v| v.to_str().ok())
-        {
-            s.push_str(&format!(" (actual length {actual})"));
-        }
-        return s;
+    if let Some(c) = e.downcast_ref::<ClientError>() {
+        return match c {
+            ClientError::Conflict {
+                message, actual, ..
+            } => {
+                format!("FailedPrecondition: {message} (actual length {actual})")
+            }
+            ClientError::Fenced { message, epoch } => {
+                format!("FailedPrecondition: {message} (daemon epoch {epoch})")
+            }
+            ClientError::Unauthenticated(m) => {
+                format!("Unauthenticated: {m}; set --token or CHRON_TOKEN")
+            }
+            ClientError::InvalidArgument(m) => format!("InvalidArgument: {m}"),
+            ClientError::OutOfRange(m) => format!("OutOfRange: {m}"),
+            ClientError::FailedPrecondition(m) => format!("FailedPrecondition: {m}"),
+            ClientError::Status(s) => format!("{:?}: {}", s.code(), s.message()),
+            other => other.to_string(),
+        };
     }
     if let Some(chron::Error::Locked { path }) = e.downcast_ref::<chron::Error>() {
         return format!(
@@ -176,9 +175,8 @@ pub fn exit_code(e: &anyhow::Error) -> i32 {
     {
         return 2;
     }
-    if let Some(status) = e.downcast_ref::<tonic::Status>()
-        && status.code() == tonic::Code::Unavailable
-        && status.message().contains("connect")
+    if let Some(ClientError::Unavailable(_) | ClientError::Transport(_)) =
+        e.downcast_ref::<ClientError>()
     {
         return 2;
     }
