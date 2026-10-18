@@ -6,8 +6,10 @@ An event-sourcing database: a Rust library, a gRPC daemon and a CLI.
 |---|---|
 | `chron` | the embeddable library (this README's first half) |
 | `chron-proto` | the `chron.v1` gRPC contract and generated code |
-| `chrond` | the daemon: one database behind that service |
+| `chrond` | the daemon: one database behind that service, as a leader or a replica |
 | `chron-cli` | the `chron` binary: client and offline maintenance |
+| `chron-client` | a typed async client in the library's vocabulary |
+| `examples/bank` | accounts as aggregates, embedded or through a daemon |
 
 Events live in append-only logs called **aggregates**, each keyed by a
 binary UUID. A **transaction** appends to any number of aggregates at once
@@ -147,20 +149,63 @@ default.
 ```
 cargo run -p chrond -- --data-dir ./orders.chron            # 127.0.0.1:4242
 chrond --data-dir DIR --listen 0.0.0.0:4242 [--no-fsync] [--verify-all-segments]
+       [--tls-cert server.pem --tls-key server.key [--tls-client-ca ca.pem]]
+       [--token SECRET | --token-file FILE]
+       [--max-message-bytes N] [--request-timeout SECS] [--concurrency-per-connection N]
+       [--replicate-from http://leader:4242 [--replicate-token SECRET]]
 ```
 
-Flags fall back to `CHRON_DATA_DIR` and `CHRON_LISTEN`; logging follows
-`CHROND_LOG` (an `EnvFilter`, default `info`) on stderr. Ctrl-C or SIGTERM
-stops it: every stream ends, the server drains, the database is flushed.
+Flags fall back to `CHRON_DATA_DIR`, `CHRON_LISTEN`, `CHROND_TLS_*`,
+`CHRON_TOKEN`, `CHRON_TOKEN_FILE`, `CHRON_REPLICATE_FROM`; logging follows
+`CHROND_LOG` (an `EnvFilter`, default `info`) on stderr, one line per call
+with its method, gRPC status and duration. Ctrl-C or SIGTERM stops it:
+every stream ends, the server drains, the database is flushed.
+
 The service is `chron.v1.Chron` in
 `crates/chron-proto/proto/chron/v1/chron.proto`: commit, the six reads
 (server-streamed, `limit` 0 for everything), subscribe (never ends), head,
-aggregate length, info, flush, backup, apply and retain. A failed
-expectation is `FAILED_PRECONDITION` with the metadata
-`chron-actual-length` and `chron-aggregate`; bad requests are
+aggregate length, info, flush, backup, apply, retain, replicate, promote
+and fence. A failed expectation is `FAILED_PRECONDITION` with the metadata
+`chron-actual-length` and `chron-aggregate`; a write refused by the node's
+role or epoch is `FAILED_PRECONDITION` with `chron-epoch`; bad requests are
 `INVALID_ARGUMENT`; positions past the head or below the floor are
-`OUT_OF_RANGE`. There is no TLS or authentication: bind it to a loopback
-or private address.
+`OUT_OF_RANGE`.
+
+Plaintext and open by default; off a loopback address, enable TLS and a
+token. With `--tls-client-ca` only clients presenting a certificate from
+that CA are accepted. With a token, every `chron.v1.Chron` call must
+carry `authorization: Bearer <token>` (compared in constant time);
+`grpc.health.v1.Health` stays open and reports SERVING for `""` and
+`chron.v1.Chron` until shutdown, so `grpc_health_probe -addr host:4242`
+works as is. Messages above `--max-message-bytes` (64 MiB) are refused;
+the limit must cover the database's `max_record_bytes`. HTTP/2 keepalives
+run every 30 s.
+
+## Replication
+
+A daemon started with `--replicate-from` is a **replica**: it checks that
+it is a copy of the leader (same identity, a head no further than the
+leader's, the same record before its head; an empty database adopts the
+leader's identity), then pulls whole transactions and applies them
+through the normal commit path, reconnecting with backoff when the
+leader goes away. A replica serves reads, subscriptions, backups and
+retention; it refuses writes with "read-only replica". `chron info` on
+either side shows the role, the epoch, the identity, and on a replica
+whether it is connected, the leader's head and the last error.
+
+Promotion is manual: `chron --addr <replica> promote` stops the pull,
+raises the **epoch** by one, records a `promoted` marker in the data
+directory and asks the old leader to fence itself. A fenced leader
+refuses writes ("a newer leader exists") and keeps a `fenced` marker
+across restarts. Writers that want the guarantee send the epoch they
+last saw: `chron append --epoch N` (or `Client::commit_with_epoch`); a
+stale epoch is refused, and an epoch newer than the daemon's fences it
+on the spot. To bring the old leader back, restart it with
+`--replicate-from` the new leader: if its history still matches it
+becomes a replica and the marker goes; if it took writes of its own it
+is refused as diverged and must be restored from a backup of the
+leader. A promoted directory refuses to become a replica until its
+`promoted` marker is removed.
 
 ## The CLI
 
@@ -174,11 +219,39 @@ chron backup <ARCHIVE> [--since N] | apply <ARCHIVE> | retain <FLOOR>     # path
 chron rebuild-index <DIR> | verify <DIR> | restore <ARCHIVE> <DIR> | inspect <ARCHIVE>   # offline, no daemon
 ```
 
+```
+chron health [--service NAME]            # exit 0 when SERVING, 1 otherwise
+chron promote | fence <EPOCH>             # replication
+chron append --epoch N … | commit --epoch N …
+```
+
 `--addr` (or `CHRON_ADDR`, default `http://127.0.0.1:4242`) names the
-daemon; `--json` prints one JSON object per line, with `payload` and
-`metadata` as strings when they are UTF-8 and as `payload_base64` /
+daemon; `https://` enables TLS with `--tls-ca`, `--tls-cert`/`--tls-key`
+and `--tls-domain` (`CHRON_TLS_*`); `--token` (`CHRON_TOKEN`) sends the
+bearer token. `--json` prints one JSON object per line, with `payload`
+and `metadata` as strings when they are UTF-8 and as `payload_base64` /
 `metadata_base64` otherwise. Exit codes: 0 ok, 1 the daemon refused or
 an offline command failed, 2 usage or an unreachable daemon.
+
+## The client crate
+
+```rust
+use chron_client::{Client, ClientConfig, Expected, NewEvent, Transaction, Uuid};
+
+let client = Client::connect("http://127.0.0.1:4242", ClientConfig::default()).await?;
+let order = Uuid::new_v4();
+let mut txn = Transaction::new();
+txn.append_one(order, Expected::New, NewEvent::new("placed").tag("orders"));
+let committed = client.commit(txn).await?;            // Err(ClientError::Conflict { actual, .. }) on a failed expectation
+let events = client.read_aggregate(order, 0, 0, false).await?;
+let mut live = client.subscribe(committed.next, Some("orders".into())).await?;
+```
+
+`chron-client` speaks the library's types, so code written against an
+embedded `chron::Db` moves to a daemon by swapping the handle;
+`examples/bank` does exactly that behind a small `Store` trait
+(`cargo run -p bank -- open alice`, `deposit <id> 50`, `withdraw`,
+`balances [--follow]`, `history <id>`; `--addr` switches to a daemon).
 
 ## Limits
 
@@ -189,7 +262,7 @@ split across segments.
 
 ## Not in this version
 
-A crates.io release, TLS or authentication on the daemon, replication.
+A crates.io release, automatic failover, more than one leader.
 
 ## Development
 
@@ -205,5 +278,6 @@ cargo bench -p chron   # criterion: append in both fsync modes, the three reads
 ```
 
 CI runs the first four on every push and pull request. The suite
-includes property tests against a model of the semantics and a crash
-test that kills a child process mid-commit and reopens.
+includes property tests against a model of the semantics, a crash test
+that kills a child process mid-commit and reopens, TLS and token tests
+against generated certificates, and replication tests with two daemons.
