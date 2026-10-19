@@ -98,7 +98,9 @@ crates share one version.
   replaces `failover_retries`; a commit is resent after a connection
   failure only when every append has an exact or `new` expectation
   (never with an epoch token), and `commit` documents the rule;
-  transport errors show their cause.
+  transport errors show their cause; a daemon killed under an open call
+  (an `Unknown` status with the h2 body error) is `Unavailable` like a
+  daemon shut down under one.
 
 ### chron-cli
 
@@ -124,8 +126,6 @@ crates share one version.
   and timed-out calls as failover errors, keeps every violation, counts
   errors as failures, and checks acknowledgments against the log without
   holding the whole log in memory.
-
-Nothing yet.
 
 ## 0.3.0 - 2026-10-18
 

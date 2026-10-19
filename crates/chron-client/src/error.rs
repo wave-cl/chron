@@ -170,9 +170,10 @@ impl From<Status> for ClientError {
             Code::Unavailable => ClientError::Unavailable(s.message().to_string()),
             Code::ResourceExhausted => ClientError::ResourceExhausted(s.message().to_string()),
             // The daemon going away mid-call: the HTTP/2 GOAWAY of a
-            // shutdown, or a connection dropped under a call, arrives as an
-            // Internal "h2 protocol error".
-            Code::Internal if s.message().starts_with("h2 protocol error") => {
+            // shutdown arrives as an Internal "h2 protocol error", a
+            // process killed under an open call (the body read failing on
+            // a reset) as the same message under Unknown.
+            Code::Internal | Code::Unknown if s.message().starts_with("h2 protocol error") => {
                 ClientError::Unavailable(s.message().to_string())
             }
             // A connection-level failure (a TLS handshake refused after the
@@ -192,5 +193,28 @@ impl From<Status> for ClientError {
 impl From<chron_proto::convert::ConvertError> for ClientError {
     fn from(e: chron_proto::convert::ConvertError) -> Self {
         ClientError::Decode(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A daemon killed under an open call: tonic reports the body read
+    /// failing as `Unknown` with the h2 message (a shutdown's GOAWAY is
+    /// the same message under `Internal`). Both are the connection
+    /// going, so both are `Unavailable`.
+    #[test]
+    fn a_connection_lost_under_a_call_is_unavailable_whatever_the_code() {
+        for code in [Code::Unknown, Code::Internal] {
+            let s = Status::new(
+                code,
+                "h2 protocol error: error reading a body from connection",
+            );
+            let e = ClientError::from(s);
+            assert!(matches!(e, ClientError::Unavailable(_)), "{code:?}: {e}");
+        }
+        let plain = ClientError::from(Status::new(Code::Unknown, "something else"));
+        assert!(matches!(plain, ClientError::Status(_)), "{plain}");
     }
 }
