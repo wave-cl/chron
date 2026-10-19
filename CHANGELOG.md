@@ -36,11 +36,35 @@ crates share one version.
 
 ### chron-proto
 
+- `Members`, `GetMembers`, `ChangeMembers`; `members` on
+  `HeartbeatRequest`/`Response` and `RequestVoteRequest`/`Response`;
+  `InfoResponse` 24–27 (`members_version`, `members_epoch`,
+  `members_committed`, `member`), `DiscoverResponse` 6–7,
+  `ROLE_REMOVED`.
 - `CommitRequest.commit_id` (4), `CommitResponse.duplicate` (5),
   `Event.commit_id` (10).
 
 ### chrond
 
+- Dynamic membership: the failover group's membership lives in
+  `<data_dir>/members` on every node (generations `(epoch, version)`
+  with the full set of addresses) and changes at runtime through the
+  leader (`ChangeMembers`, `chron members add|remove`, `POST
+  /v1/members`), one address at a time, committed once a majority of
+  the new membership has persisted it and holds everything the leader
+  had when the change was made. Memberships ride on heartbeats and vote
+  requests: a node behind adopts, one ahead refuses; a heartbeat or vote
+  request from an address outside the membership is refused (an admin
+  token alone no longer lets a stranger campaign); a new leader
+  republishes the membership under its epoch before taking changes. A
+  node outside the membership runs **removed** (reads only, follows the
+  leader it finds through its seeds, never campaigns). `--peer` seeds a
+  new group and is ignored, with a warning, once the file exists; a
+  directory holding one refuses to start without `--peer`. `GetMembers`
+  (open), `GET /v1/members`, `members_version` on `/v1/status`; metrics
+  `chron_members`, `chron_members_version`, `chron_members_epoch`,
+  `chron_members_committed`, `chron_member`,
+  `chron_member_changes_total`; `chron_peers` counts the other members.
 - `--group-commit-max-txns`, `--group-commit-max-bytes`,
   `--index-checkpoint-batches` (env `CHROND_…`); the `chron_fsync_seconds`
   histogram and `chron_index_checkpoints_total`; commit and sync-wait
@@ -52,6 +76,10 @@ crates share one version.
 
 ### chron-client
 
+- `Role::Removed`, `Members`, `MembersStatus`, `Client::members`,
+  `add_member`, `remove_member`; `Info` and `Discovered` carry the
+  membership generation; `connect_any` also asks the members a seed
+  names.
 - Every commit carries a random commit id (`ClientConfig::commit_ids`,
   default on; `CommitOptions::commit_id` to choose it) and is therefore
   resent after `Unavailable`, `Transport`, `Fenced`, `Unconfirmed` and a
@@ -61,6 +89,9 @@ crates share one version.
 
 ### chron-cli
 
+- `chron members [list | add ADDR [--force] | remove ADDR]`; `status`
+  is degraded on a removed node and shows the membership; `info` and
+  `discover` show its version.
 - `append --commit-id`, `commit --commit-id` (or `"commit_id"` in the
   file); a resend prints `already committed` (`"duplicate"` in JSON);
   events show their `commit_id`.

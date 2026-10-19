@@ -335,7 +335,7 @@ async fn a_database_created_later_is_followed_with_acknowledgments() {
     c.wait("the new database attached", SOON, || {
         c.node(l)
             .get("orders")
-            .is_some_and(|d| d.sync.snapshot().len() == 2)
+            .is_some_and(|d| d.sync.snapshot(&c.node(l).members()).len() == 2)
     })
     .await;
     let committed = orders.commit(free("first order")).await.unwrap();

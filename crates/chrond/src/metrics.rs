@@ -43,6 +43,8 @@ pub const METHODS: &[(&str, bool)] = &[
     ("/chron.v1.Chron/Replicate", true),
     ("/chron.v1.Chron/Promote", false),
     ("/chron.v1.Chron/Fence", false),
+    ("/chron.v1.Chron/GetMembers", false),
+    ("/chron.v1.Chron/ChangeMembers", false),
     ("/chron.v1.Chron/CreateDatabase", false),
     ("/chron.v1.Chron/ListDatabases", false),
     ("/chron.v1.Chron/DropDatabase", false),
@@ -143,6 +145,8 @@ pub struct Metrics {
     pub backup_fetches: IntCounterVec,
     /// Databases this daemon replaced with a copy fetched from the leader.
     pub restores: IntCounterVec,
+    /// Membership generations this node committed as the leader.
+    pub member_changes: IntCounter,
     start_time: IntGauge,
 }
 
@@ -226,6 +230,11 @@ impl Metrics {
             "campaigns this node started (pre-vote included)",
         )
         .expect("valid metric");
+        let member_changes = IntCounter::new(
+            "chron_member_changes_total",
+            "membership generations this node committed as the leader (its own republish included)",
+        )
+        .expect("valid metric");
         let leader_changes = IntCounter::new(
             "chron_leader_changes_total",
             "role changes driven by the cluster: elected, fenced by a peer, stepped down",
@@ -271,6 +280,7 @@ impl Metrics {
             Box::new(chunks_applied.clone()),
             Box::new(http_requests.clone()),
             Box::new(elections.clone()),
+            Box::new(member_changes.clone()),
             Box::new(leader_changes.clone()),
             Box::new(heartbeat_failures.clone()),
             Box::new(sync_wait.clone()),
@@ -293,6 +303,7 @@ impl Metrics {
             chunks_applied,
             http_requests,
             elections,
+            member_changes,
             leader_changes,
             heartbeat_failures,
             sync_wait,
@@ -353,6 +364,11 @@ struct NodeCollector {
     leader_known: IntGauge,
     voted_epoch: IntGauge,
     peers: IntGauge,
+    members: IntGauge,
+    members_version: IntGauge,
+    members_epoch: IntGauge,
+    members_committed: IntGauge,
+    member: IntGauge,
     sync_commit: IntGauge,
     majority_applied: IntGaugeVec,
     follower_applied: IntGaugeVec,
@@ -424,7 +440,27 @@ impl NodeCollector {
             .expect("valid metric"),
             voted_epoch: IntGauge::new("chron_voted_epoch", "the epoch of the last vote given")
                 .expect("valid metric"),
-            peers: IntGauge::new("chron_peers", "peers configured").expect("valid metric"),
+            peers: IntGauge::new("chron_peers", "the other members of the membership")
+                .expect("valid metric"),
+            members: IntGauge::new("chron_members", "members in the membership this node holds")
+                .expect("valid metric"),
+            members_version: IntGauge::new(
+                "chron_members_version",
+                "the membership generation's version",
+            )
+            .expect("valid metric"),
+            members_epoch: IntGauge::new(
+                "chron_members_epoch",
+                "the epoch the membership generation was published under",
+            )
+            .expect("valid metric"),
+            members_committed: IntGauge::new(
+                "chron_members_committed",
+                "1 when the membership generation is committed (as this node knows; a leader tracks a pending change)",
+            )
+            .expect("valid metric"),
+            member: IntGauge::new("chron_member", "1 when this node is in the membership")
+                .expect("valid metric"),
             sync_commit: IntGauge::new(
                 "chron_sync_commit",
                 "1 when commits wait for a majority by default",
@@ -539,6 +575,11 @@ impl NodeCollector {
             &self.leader_known,
             &self.voted_epoch,
             &self.peers,
+            &self.members,
+            &self.members_version,
+            &self.members_epoch,
+            &self.members_committed,
+            &self.member,
             &self.sync_commit,
             &self.majority_applied,
             &self.follower_applied,
@@ -577,13 +618,28 @@ impl NodeCollector {
             (match role {
                 Role::Leader => node.lease_held(),
                 Role::Replica => true,
-                Role::Candidate | Role::Fenced => node.heard_leader().is_some(),
+                Role::Candidate | Role::Fenced | Role::Removed => node.heard_leader().is_some(),
             }) as i64,
         );
         self.voted_epoch
             .set(node.lease().voted.map_or(0, |(e, _)| e as i64));
-        self.peers
-            .set(node.cluster.as_ref().map_or(0, |c| c.peers.len() as i64));
+        let st = node.members_state();
+        if node.cluster.is_some() {
+            self.peers
+                .set(st.current.addrs.len().saturating_sub(1) as i64);
+            self.members.set(st.current.addrs.len() as i64);
+            self.members_version.set(st.current.version as i64);
+            self.members_epoch.set(st.current.epoch as i64);
+            self.members_committed.set(st.committed as i64);
+            self.member.set(node.is_member() as i64);
+        } else {
+            self.peers.set(0);
+            self.members.set(0);
+            self.members_version.set(0);
+            self.members_epoch.set(0);
+            self.members_committed.set(0);
+            self.member.set(1);
+        }
         let mut last = self.last_stats.lock().unwrap_or_else(|p| p.into_inner());
         for dbn in node.databases() {
             let db = dbn.name.as_str();
@@ -624,7 +680,7 @@ impl NodeCollector {
                 self.majority_applied
                     .with_label_values(&[db])
                     .set(dbn.sync.majority() as i64);
-                for f in dbn.sync.snapshot() {
+                for f in dbn.sync.snapshot(&st.current) {
                     self.follower_applied
                         .with_label_values(&[db, &f.peer])
                         .set(f.applied as i64);

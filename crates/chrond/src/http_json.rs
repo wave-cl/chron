@@ -222,8 +222,17 @@ pub fn role_name(role: pb::Role) -> &'static str {
         pb::Role::Replica => "replica",
         pb::Role::Fenced => "fenced",
         pb::Role::Candidate => "candidate",
+        pb::Role::Removed => "removed",
         pb::Role::Unspecified => "unknown",
     }
+}
+
+pub fn members_json(m: &pb::GetMembersResponse) -> Value {
+    let members = m.members.clone().unwrap_or_default();
+    json!({
+        "members": { "epoch": members.epoch, "version": members.version, "addrs": members.addrs },
+        "committed": m.committed, "member": m.member, "leader_addr": m.leader_addr,
+    })
 }
 
 pub fn info_json(i: &pb::InfoResponse) -> Value {
@@ -245,6 +254,8 @@ pub fn info_json(i: &pb::InfoResponse) -> Value {
         "followers": i.followers.iter().map(|f| json!({
             "peer": f.peer, "applied": f.applied, "durable": f.durable, "counted": f.counted,
         })).collect::<Vec<_>>(),
+        "members_version": i.members_version, "members_epoch": i.members_epoch,
+        "members_committed": i.members_committed, "member": i.member,
     })
 }
 

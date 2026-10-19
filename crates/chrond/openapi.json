@@ -357,6 +357,18 @@
           },
           "sync_commit": {
             "type": "boolean"
+          },
+          "members_version": {
+            "type": "integer"
+          },
+          "members_epoch": {
+            "type": "integer"
+          },
+          "members_committed": {
+            "type": "boolean"
+          },
+          "member": {
+            "type": "boolean"
           }
         }
       },
@@ -420,6 +432,12 @@
           },
           "databases": {
             "type": "integer"
+          },
+          "members_version": {
+            "type": "integer"
+          },
+          "member": {
+            "type": "boolean"
           }
         }
       },
@@ -470,6 +488,43 @@
           "committed_next": {
             "type": "integer",
             "description": "On a 504: the head after that transaction."
+          }
+        }
+      },
+      "Members": {
+        "type": "object",
+        "description": "the failover group's membership as this node holds it: the full set of advertised addresses, stamped with the epoch of the leader that published it and a version that rises by one per change",
+        "properties": {
+          "members": {
+            "type": "object",
+            "properties": {
+              "epoch": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              },
+              "addrs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "committed": {
+            "type": "boolean",
+            "description": "on a leader: whether the generation is committed (a majority of it holds it and everything confirmed before it was made)"
+          },
+          "member": {
+            "type": "boolean",
+            "description": "whether this node is in the membership"
+          },
+          "leader_addr": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       }
@@ -1177,6 +1232,111 @@
           }
         ],
         "description": "Needs the admin token when the daemon has one."
+      }
+    },
+    "/v1/members": {
+      "get": {
+        "summary": "The group's membership as this node holds it",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Members"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Add or remove one member (on the leader)",
+        "description": "Needs the admin token when the daemon has one. One address per call, from a committed membership: the next generation is persisted on the leader and pushed with its heartbeats, and is committed once a majority of the new membership has persisted it and durably holds everything the leader held when it was made. An added node must be following the leader unless ?force=true. Not committed in time is not an error (committed: false; GET /v1/members says when it is); a second change while one is pending is 409.",
+        "parameters": [
+          {
+            "name": "force",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "add a node that is not following yet"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "add": {
+                    "type": "string"
+                  },
+                  "remove": {
+                    "type": "string"
+                  }
+                },
+                "description": "exactly one of add or remove: an advertised address (http://host:port or https://host:port)"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "members": {
+                      "type": "object",
+                      "properties": {
+                        "epoch": {
+                          "type": "integer"
+                        },
+                        "version": {
+                          "type": "integer"
+                        },
+                        "addrs": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "committed": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/v1/status": {

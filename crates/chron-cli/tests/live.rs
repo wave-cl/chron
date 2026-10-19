@@ -1039,3 +1039,33 @@ fn append_with_a_commit_id_twice_prints_already_committed() {
         ));
     assert_eq!(d.db().head(), 2);
 }
+
+#[test]
+fn members_lists_and_a_change_needs_a_group() {
+    let d = Daemon::start();
+    d.chron()
+        .args(["members"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("version 0 (epoch 0)"))
+        .stdout(predicate::str::contains("member yes"));
+    d.chron()
+        .args(["--json", "members", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"committed\":true"));
+    d.chron()
+        .args(["members", "add", "http://127.0.0.1:1"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("no peers"));
+    d.chron()
+        .args(["members", "remove", "http://127.0.0.1:1"])
+        .assert()
+        .code(1);
+    d.chron()
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("status healthy"));
+}

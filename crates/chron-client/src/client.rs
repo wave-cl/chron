@@ -129,6 +129,10 @@ pub enum Role {
     /// With peers: no leader known and no lease held; refuses writes until
     /// one is heard or elected.
     Candidate,
+    /// With peers: not in the group's membership (removed, or not yet
+    /// added). Serves reads, follows the leader without voting, refuses
+    /// writes.
+    Removed,
     /// A role this client does not know (a newer daemon).
     Unknown,
 }
@@ -140,6 +144,7 @@ impl std::fmt::Display for Role {
             Role::Replica => "replica",
             Role::Fenced => "fenced",
             Role::Candidate => "candidate",
+            Role::Removed => "removed",
             Role::Unknown => "unknown",
         })
     }
@@ -152,9 +157,52 @@ impl Role {
             pb::Role::Replica => Role::Replica,
             pb::Role::Fenced => Role::Fenced,
             pb::Role::Candidate => Role::Candidate,
+            pb::Role::Removed => Role::Removed,
             pb::Role::Unspecified => Role::Unknown,
         }
     }
+}
+
+/// The failover group's membership as a daemon holds it: every member's
+/// advertised address, stamped with the epoch of the leader that
+/// published it and a version that rises by one per change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Members {
+    /// The epoch of the leader that published this generation.
+    pub epoch: u64,
+    /// Rises by one per change; generations order by `(epoch, version)`.
+    pub version: u64,
+    /// Sorted, the daemon's own address included when it is a member.
+    pub addrs: Vec<String>,
+}
+
+impl Members {
+    fn from_wire(m: Option<pb::Members>) -> Members {
+        let m = m.unwrap_or_default();
+        let mut addrs = m.addrs;
+        addrs.sort();
+        Members {
+            epoch: m.epoch,
+            version: m.version,
+            addrs,
+        }
+    }
+}
+
+/// What a daemon answers to `members`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MembersStatus {
+    /// The membership the daemon holds.
+    pub members: Members,
+    /// On a leader: whether the generation is committed (a majority of
+    /// it holds it and everything confirmed before it was made).
+    pub committed: bool,
+    /// Whether the daemon is in the membership.
+    pub member: bool,
+    /// The leader as the daemon knows it.
+    pub leader_addr: Option<String>,
 }
 
 /// What a daemon answers to `discover`: who leads, as it knows it.
@@ -168,10 +216,15 @@ pub struct Discovered {
     pub epoch: u64,
     /// The daemon's role.
     pub role: Role,
-    /// The daemon's peers (empty without failover).
+    /// The other members of the daemon's membership (empty without
+    /// failover).
     pub peers: Vec<String>,
     /// On a leader with peers: how much of its lease is left.
     pub lease_remaining: Option<Duration>,
+    /// The membership generation the daemon holds (`(epoch, version)`).
+    pub members_version: u64,
+    /// The epoch half of that generation.
+    pub members_epoch: u64,
 }
 
 /// What a daemon reports about itself.
@@ -227,6 +280,14 @@ pub struct Info {
     pub followers: Vec<FollowerStatus>,
     /// Whether the daemon waits for a majority by default.
     pub sync_commit: bool,
+    /// The membership generation the daemon holds (`(epoch, version)`).
+    pub members_version: u64,
+    /// The epoch half of that generation.
+    pub members_epoch: u64,
+    /// On a leader: whether that generation is committed.
+    pub members_committed: bool,
+    /// Whether the daemon is in the membership.
+    pub member: bool,
 }
 
 /// One follower as the leader sees it.
@@ -487,22 +548,34 @@ async fn probe(
 /// Asks each seed in turn who leads: a seed that leads itself (with a
 /// live lease) is used directly, whatever address it advertises; a
 /// seed naming another node is believed only once that node confirms
-/// it leads. Each address is asked at most once per search.
+/// it leads. The members a seed names are asked after the seeds, so a
+/// seed list need not be current. Each address is asked at most once
+/// per search, at most 32 in all.
 async fn find_leader(seeds: &[String], config: &ClientConfig) -> Result<Conn, ClientError> {
     let mut notes: Vec<String> = Vec::new();
     let mut asked: std::collections::HashSet<String> = std::collections::HashSet::new();
     let token = auth(config.token.as_deref())?;
-    for seed in seeds {
+    let mut queue: std::collections::VecDeque<String> = seeds.iter().cloned().collect();
+    while let Some(seed) = queue.pop_front() {
+        if asked.len() >= 32 {
+            notes.push("32 addresses asked; giving up".into());
+            break;
+        }
         if !asked.insert(seed.clone()) {
             continue;
         }
-        let (channel, d) = match probe(seed, config, &token).await {
+        let (channel, d) = match probe(&seed, config, &token).await {
             Ok(x) => x,
             Err(e) => {
                 notes.push(format!("{seed}: {}", why(&e)));
                 continue;
             }
         };
+        for p in &d.peers {
+            if !asked.contains(p) && !queue.contains(p) {
+                queue.push_back(p.clone());
+            }
+        }
         let role = Role::from_wire(d.role());
         let Some(leader) = d.leader_addr else {
             notes.push(format!(
@@ -1181,6 +1254,10 @@ impl Client {
                 })
                 .collect(),
             sync_commit: i.sync_commit,
+            members_version: i.members_version,
+            members_epoch: i.members_epoch,
+            members_committed: i.members_committed,
+            member: i.member,
         })
     }
 
@@ -1278,7 +1355,68 @@ impl Client {
             role,
             peers: d.peers,
             lease_remaining: d.lease_remaining_ms.map(Duration::from_millis),
+            members_version: d.members_version,
+            members_epoch: d.members_epoch,
         })
+    }
+
+    /// The group's membership as the daemon holds it. Open to any token.
+    pub async fn members(&self) -> Result<MembersStatus, ClientError> {
+        let m = self
+            .rpc()
+            .get_members(pb::GetMembersRequest {})
+            .await?
+            .into_inner();
+        Ok(MembersStatus {
+            members: Members::from_wire(m.members),
+            committed: m.committed,
+            member: m.member,
+            leader_addr: m.leader_addr,
+        })
+    }
+
+    /// Adds `addr` to the group's membership, on the leader; `force`
+    /// adds a node that is not following the leader yet. Returns the new
+    /// membership and whether it is committed already (a majority of it
+    /// holds it); when not, [`members`](Client::members) says when it
+    /// is. An admin call.
+    pub async fn add_member(
+        &self,
+        addr: &str,
+        force: bool,
+    ) -> Result<(Members, bool), ClientError> {
+        self.change_members(
+            pb::change_members_request::Change::Add(addr.to_string()),
+            force,
+        )
+        .await
+    }
+
+    /// Removes `addr` from the group's membership, on the leader (the
+    /// leader itself included: it steps down once the change commits).
+    /// An admin call.
+    pub async fn remove_member(&self, addr: &str) -> Result<(Members, bool), ClientError> {
+        self.change_members(
+            pb::change_members_request::Change::Remove(addr.to_string()),
+            false,
+        )
+        .await
+    }
+
+    async fn change_members(
+        &self,
+        change: pb::change_members_request::Change,
+        force: bool,
+    ) -> Result<(Members, bool), ClientError> {
+        let r = self
+            .admin()
+            .change_members(pb::ChangeMembersRequest {
+                change: Some(change),
+                force,
+            })
+            .await?
+            .into_inner();
+        Ok((Members::from_wire(r.members), r.committed))
     }
 
     /// A leader's heartbeat to a peer (daemon to daemon). An admin call.

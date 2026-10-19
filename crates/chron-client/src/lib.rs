@@ -30,8 +30,8 @@ pub use chron::{
 };
 pub use client::{
     ByteStream, ChunkStream, Client, ClientConfig, CommitOptions, DatabaseInfo, Discovered,
-    EventStream, FollowAcks, FollowerStatus, Identity, Info, Promoted, ReplicationChunk, Role,
-    TlsConfig,
+    EventStream, FollowAcks, FollowerStatus, Identity, Info, Members, MembersStatus, Promoted,
+    ReplicationChunk, Role, TlsConfig,
 };
 pub use error::ClientError;
 pub use txn::{Append, Transaction};

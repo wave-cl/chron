@@ -432,6 +432,7 @@ chron backup --fetch FILE                            # a full backup downloaded 
 chron retain <FLOOR>
 chron health [--service NAME]                        # exit 0 SERVING, 1 NOT_SERVING, 2 unreachable
 chron promote | fence <EPOCH>                        # replication
+chron members [list | add ADDR [--force] | remove ADDR]   # the failover group's membership; changes go to the leader
 chron discover                                       # who leads, as the node at --addr knows it
 chron db create <NAME> | db list | db drop <NAME>    # databases; --db NAME (CHRON_DB) addresses one
 chron append --epoch N … | commit --epoch N …        # fencing token
@@ -580,6 +581,39 @@ that falls behind a majority's promises resolves it the same way, by a
 re-election at a higher epoch. With peers a writer's epoch token cannot
 fence the leader: an epoch above the leader's is refused like any wrong
 one.
+
+The `--peer` list only seeds a new group. The group's **membership**
+lives in `<data_dir>/members` on every node (`epoch N`, `version N`, one
+`member ADDR` line each, this node included) and changes at runtime
+through the leader: `chron --addr $LEADER members add http://d:4242` or
+`members remove ADDR`, one address at a time, from a committed
+membership. A change is committed once a majority of the *new*
+membership has persisted it and durably holds everything the leader had
+when the change was made, so any two memberships whose majorities can
+act overlap and every confirmed write stays on a majority of whatever
+membership elects next; a second change is refused while one is
+pending (`chron members` says when it is committed). Memberships are
+generations `(epoch, version)` that ride on heartbeats and vote
+requests: a node behind adopts the sender's (persisting it first), a
+node ahead refuses and answers with its own, and a heartbeat or vote
+request from an address outside the membership is refused, so holding
+the admin token no longer lets a stranger campaign. A newly elected
+leader republishes the membership under its own epoch and commits that
+before taking changes. A node that is not in the membership, removed
+or not yet added, runs as **removed**: it finds the leader through its
+seeds, follows it for reads, refuses writes, never campaigns or votes,
+and becomes a replica the moment a membership holding it arrives. A
+removed node restarted with its old `--peer` flags stays removed (the
+file wins; differing flags are logged and ignored), and a directory
+holding a `members` file refuses to start without `--peer`; to run such
+a directory alone or seed a new group from it, stop it and delete the
+file, on one node only. `chron members` lists the membership and
+whether it is committed; `chron status` is degraded on a removed node;
+the metrics are `chron_members`, `chron_members_version`,
+`chron_members_epoch`, `chron_members_committed`, `chron_member` and
+`chron_member_changes_total`, and `chron_peers` now counts the other
+members. A client's `connect_any` also asks the members a seed names,
+so its seed list need not be current.
 
 #### Synchronous replication
 

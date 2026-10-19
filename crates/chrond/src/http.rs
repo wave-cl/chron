@@ -29,10 +29,12 @@ use tower::ServiceExt;
 use crate::auth::BearerAuth;
 use crate::http_json::{
     ApiError, TxnJson, appends_from_json, commit_id_from_json, committed_json, database_json,
-    error_json, event_json, info_json, retained_json, role_name,
+    error_json, event_json, info_json, members_json, retained_json, role_name,
 };
 use crate::metrics::Metrics;
 use crate::node::{DbNode, Node};
+use chron_proto::v1 as pb;
+
 use crate::ops::{self, PAGE, Read};
 
 /// Every route the gateway serves; `openapi.json` must list exactly these
@@ -52,6 +54,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/databases"),
     ("POST", "/v1/databases"),
     ("DELETE", "/v1/databases/{name}"),
+    ("GET", "/v1/members"),
+    ("POST", "/v1/members"),
     ("GET", "/v1/status"),
     ("GET", "/openapi.json"),
     ("GET", "/"),
@@ -101,6 +105,7 @@ pub fn router(
         .route("/db/{db}/retain", post(retain))
         .route("/databases", get(list_databases).post(create_database))
         .route("/databases/{name}", delete(drop_database))
+        .route("/members", get(members).post(change_members))
         .route("/status", get(status))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
@@ -421,7 +426,59 @@ async fn status(State(st): State<HttpState>) -> Json<Value> {
         "fenced_by": node.fenced_by(),
         "replicating_from": node.leader_addr(),
         "databases": node.databases().len(),
+        "members_version": node.members().version,
+        "member": node.is_member(),
     }))
+}
+
+async fn members(State(st): State<HttpState>) -> Json<Value> {
+    Json(members_json(&ops::members(&st.node)))
+}
+
+/// `{"add": ADDR}` or `{"remove": ADDR}`, `?force=true` to add a node
+/// that is not following yet.
+#[derive(Deserialize)]
+struct ChangeJson {
+    #[serde(default)]
+    add: Option<String>,
+    #[serde(default)]
+    remove: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ChangeQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn change_members(
+    State(st): State<HttpState>,
+    headers: HeaderMap,
+    q: std::result::Result<Query<ChangeQuery>, axum::extract::rejection::QueryRejection>,
+    body: std::result::Result<Json<ChangeJson>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Value>> {
+    admin(&st, &headers)?;
+    let Query(q) = q.map_err(bad)?;
+    let Json(c) = body.map_err(json_rejection)?;
+    let change = match (c.add, c.remove) {
+        (Some(a), None) => pb::change_members_request::Change::Add(a),
+        (None, Some(r)) => pb::change_members_request::Change::Remove(r),
+        _ => return Err(bad("give exactly one of add or remove")),
+    };
+    let node = st.node.clone();
+    let (members, committed) =
+        tokio::spawn(async move { crate::cluster::change_members(&node, change, q.force).await })
+            .await
+            .map_err(|e| ApiError(crate::codec::join("change_members", e)))??;
+    Ok(Json(json!({
+        "members": members_json(&pb::GetMembersResponse {
+            members: Some(members.to_wire()),
+            committed,
+            member: st.node.is_member(),
+            leader_addr: None,
+        })["members"],
+        "committed": committed,
+    })))
 }
 
 async fn openapi() -> Response {

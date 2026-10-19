@@ -7,6 +7,7 @@ mod failover;
 mod fetch;
 mod http;
 mod lifecycle;
+mod members;
 mod metrics;
 mod reads;
 mod replication;

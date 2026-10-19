@@ -2,7 +2,7 @@
 //! survive restarts, the write gate that keeps the role check and a write
 //! one critical section, and the named databases it serves.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -31,6 +31,11 @@ pub enum Role {
     /// With peers: no leader is known and no lease is held. Writes are
     /// refused; a heartbeat makes it a replica, an election a leader.
     Candidate,
+    /// With peers: this node is not in the group's membership (removed,
+    /// or not yet added). It serves reads, follows the leader it hears
+    /// without voting or counting, never campaigns, refuses writes, and
+    /// becomes a replica the moment a membership holding it arrives.
+    Removed,
 }
 
 impl Role {
@@ -40,8 +45,132 @@ impl Role {
             Role::Replica => pb::Role::Replica,
             Role::Fenced => pb::Role::Fenced,
             Role::Candidate => pb::Role::Candidate,
+            Role::Removed => pb::Role::Removed,
         }
     }
+
+    /// Whether the node follows a leader in this role (pullers run).
+    pub fn follows(self) -> bool {
+        matches!(self, Role::Replica | Role::Removed)
+    }
+}
+
+/// `epoch N / version N / member ADDR...`: the group's membership this
+/// node holds; replaces the `--peer` flags once written.
+pub const MEMBERS_FILE: &str = "members";
+
+/// The failover group's membership: every member's advertised address,
+/// this node's included, stamped with the epoch of the leader that
+/// published it and a version that rises by one per change. Generations
+/// order by `(epoch, version)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Members {
+    pub epoch: u64,
+    pub version: u64,
+    pub addrs: BTreeSet<String>,
+}
+
+impl Members {
+    pub fn generation(&self) -> (u64, u64) {
+        (self.epoch, self.version)
+    }
+
+    /// Votes or acknowledgments that make a majority of the membership.
+    pub fn quorum(&self) -> usize {
+        self.addrs.len() / 2 + 1
+    }
+
+    pub fn contains(&self, addr: &str) -> bool {
+        self.addrs.contains(addr)
+    }
+
+    /// Every member but `me`.
+    pub fn others(&self, me: &str) -> Vec<String> {
+        self.addrs.iter().filter(|a| *a != me).cloned().collect()
+    }
+
+    pub fn to_wire(&self) -> pb::Members {
+        pb::Members {
+            epoch: self.epoch,
+            version: self.version,
+            addrs: self.addrs.iter().cloned().collect(),
+        }
+    }
+
+    /// `None` for an empty or malformed set (an address with whitespace,
+    /// or none at all).
+    pub fn from_wire(m: &pb::Members) -> Option<Members> {
+        let addrs: BTreeSet<String> = m.addrs.iter().map(|a| a.trim().to_string()).collect();
+        if addrs.is_empty()
+            || addrs
+                .iter()
+                .any(|a| a.is_empty() || a.chars().any(char::is_whitespace))
+        {
+            return None;
+        }
+        Some(Members {
+            epoch: m.epoch,
+            version: m.version,
+            addrs,
+        })
+    }
+
+    /// The file's text.
+    pub fn text(&self) -> String {
+        let mut s = format!("epoch {}\nversion {}\n", self.epoch, self.version);
+        for a in &self.addrs {
+            s.push_str("member ");
+            s.push_str(a);
+            s.push('\n');
+        }
+        s
+    }
+
+    /// Parses [`text`](Members::text); `None` for anything else.
+    pub fn parse(text: &str) -> Option<Members> {
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+        let epoch = lines.next()?.strip_prefix("epoch ")?.parse().ok()?;
+        let version = lines.next()?.strip_prefix("version ")?.parse().ok()?;
+        let mut addrs = BTreeSet::new();
+        for l in lines {
+            let a = l.strip_prefix("member ")?.trim();
+            if a.is_empty() || a.chars().any(char::is_whitespace) || !addrs.insert(a.to_string()) {
+                return None;
+            }
+        }
+        if addrs.is_empty() {
+            return None;
+        }
+        Some(Members {
+            epoch,
+            version,
+            addrs,
+        })
+    }
+
+    pub fn oneline(&self) -> String {
+        format!(
+            "({},{}) {}",
+            self.epoch,
+            self.version,
+            self.addrs.iter().cloned().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// The membership as a node holds it, and on a leader whether the
+/// current generation is committed: a majority of it acknowledged at
+/// that generation and durably holds everything this leader had when
+/// the generation was made.
+#[derive(Debug, Clone)]
+pub struct MembersState {
+    pub current: Members,
+    pub committed: bool,
+    /// The last generation known committed; heartbeats fan out to its
+    /// members and the current ones.
+    pub last_committed: Members,
+    /// Per database, the leader's head when `current` was made.
+    pub created_heads: BTreeMap<String, u64>,
 }
 
 /// What a database's puller last saw.
@@ -100,11 +229,14 @@ pub enum SyncCommit {
     Majority,
 }
 
-/// The peers of a node started with `--peer`, and how to reach them.
+/// How a node started with `--peer` reaches the group, and the group's
+/// timing; the membership itself lives in [`Node::members`].
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
-    /// The other nodes' addresses, as advertised.
-    pub peers: Vec<String>,
+    /// The `--peer` addresses this node was started with: the seed of a
+    /// new group's membership, and where a node outside the membership
+    /// looks for the leader.
+    pub seeds: Vec<String>,
     /// This node's own address as the peers reach it.
     pub advertise: String,
     pub token: Option<String>,
@@ -120,11 +252,6 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
-    /// Votes or acknowledgments that make a majority, this node included.
-    pub fn quorum(&self) -> usize {
-        self.peers.len().div_ceil(2) + 1
-    }
-
     pub fn upstream(&self, addr: &str) -> Upstream {
         Upstream {
             addr: addr.to_string(),
@@ -188,7 +315,7 @@ pub struct DbNode {
 
 impl DbNode {
     pub fn new(name: String, db: Db, node: &Node) -> Arc<DbNode> {
-        let quorum = node.cluster.as_ref().map_or(1, |c| c.quorum());
+        let _ = node;
         Arc::new(DbNode {
             name,
             db,
@@ -197,7 +324,7 @@ impl DbNode {
             cancel: node.cancel.child_token(),
             reset: watch::Sender::new(None),
             replaced: std::sync::atomic::AtomicBool::new(false),
-            sync: crate::sync::SyncState::new(quorum),
+            sync: crate::sync::SyncState::new(),
             epoch_base: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -242,6 +369,11 @@ pub struct Node {
     pub max_message_bytes: usize,
     /// Set when started with peers.
     pub cluster: Option<ClusterConfig>,
+    /// The group's membership (see [`Members`]); a one-address set
+    /// without peers.
+    members: RwLock<MembersState>,
+    /// Serialises `ChangeMembers`.
+    pub member_changes: tokio::sync::Mutex<()>,
     lease: Mutex<Lease>,
     /// This node's address as clients and peers reach it; set once the
     /// listener is bound.
@@ -254,7 +386,7 @@ pub struct Node {
     pub stopping: std::sync::atomic::AtomicBool,
     /// Peers this node neither calls nor answers (a simulated partition).
     #[cfg(feature = "test-util")]
-    pub partition: Mutex<HashSet<String>>,
+    pub partition: Mutex<std::collections::HashSet<String>>,
     /// Grant votes without the recency check (the control for the test
     /// that a follower cut off from the leader cannot unseat it).
     #[cfg(feature = "test-util")]
@@ -266,6 +398,22 @@ pub struct Node {
     /// Answer Follow with UNIMPLEMENTED, as a daemon before 0.4.0 does.
     #[cfg(feature = "test-util")]
     pub refuse_follow: std::sync::atomic::AtomicBool,
+    /// Accept heartbeats and votes from any address (the control for the
+    /// non-member refusal).
+    #[cfg(feature = "test-util")]
+    pub skip_member_check: std::sync::atomic::AtomicBool,
+    /// Adopt a membership without persisting it (the control for
+    /// persist-before-acknowledge).
+    #[cfg(feature = "test-util")]
+    pub adopt_in_memory_only: std::sync::atomic::AtomicBool,
+    /// Commit a membership change on acknowledgments alone, without the
+    /// new majority holding the heads (the control for that rule).
+    #[cfg(feature = "test-util")]
+    pub skip_catchup_rule: std::sync::atomic::AtomicBool,
+    /// Lead without republishing the membership under the new epoch
+    /// (the control for the republish rule).
+    #[cfg(feature = "test-util")]
+    pub skip_restamp: std::sync::atomic::AtomicBool,
     /// FetchBackup for a database serves another one instead (the test
     /// of a fetched backup that is not the database it was asked for).
     #[cfg(feature = "test-util")]
@@ -312,6 +460,29 @@ impl Node {
             write_gate: RwLock::new(()),
             upstream: RwLock::new(upstream),
             max_message_bytes,
+            members: RwLock::new(MembersState {
+                current: Members {
+                    epoch: 0,
+                    version: 0,
+                    addrs: cluster
+                        .as_ref()
+                        .map(|c| c.advertise.clone())
+                        .into_iter()
+                        .collect(),
+                },
+                committed: true,
+                last_committed: Members {
+                    epoch: 0,
+                    version: 0,
+                    addrs: cluster
+                        .as_ref()
+                        .map(|c| c.advertise.clone())
+                        .into_iter()
+                        .collect(),
+                },
+                created_heads: BTreeMap::new(),
+            }),
+            member_changes: tokio::sync::Mutex::new(()),
             cluster,
             lease: Mutex::new(Lease::default()),
             advertise: std::sync::OnceLock::new(),
@@ -319,13 +490,21 @@ impl Node {
             cluster_task: Mutex::new(None),
             stopping: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-util")]
-            partition: Mutex::new(HashSet::new()),
+            partition: Mutex::new(std::collections::HashSet::new()),
             #[cfg(feature = "test-util")]
             skip_recency_check: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-util")]
             hold_apply: watch::Sender::new(false),
             #[cfg(feature = "test-util")]
             refuse_follow: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-util")]
+            skip_member_check: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-util")]
+            adopt_in_memory_only: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-util")]
+            skip_catchup_rule: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-util")]
+            skip_restamp: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-util")]
             fetch_alias: Mutex::new(HashMap::new()),
             db_opts,
@@ -379,6 +558,165 @@ impl Node {
     /// The address of the leader this node follows.
     pub fn leader_addr(&self) -> Option<String> {
         self.upstream().map(|u| u.addr)
+    }
+
+    // ---- membership
+
+    /// The membership this node holds.
+    pub fn members(&self) -> Members {
+        self.members
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .current
+            .clone()
+    }
+
+    pub fn members_state(&self) -> MembersState {
+        self.members
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Whether this node is in the membership it holds.
+    pub fn is_member(&self) -> bool {
+        self.cluster
+            .as_ref()
+            .is_none_or(|c| self.members().contains(&c.advertise))
+    }
+
+    /// Votes or acknowledgments that make a majority of the current
+    /// membership (1 without peers).
+    pub fn quorum(&self) -> usize {
+        self.members().quorum()
+    }
+
+    /// Every address a leader's heartbeats go to: the last committed
+    /// membership and the current one, less itself.
+    pub fn fanout(&self) -> Vec<String> {
+        let me = self.cluster.as_ref().map(|c| c.advertise.clone());
+        let st = self.members_state();
+        let mut all: BTreeSet<String> = st.last_committed.addrs.clone();
+        all.extend(st.current.addrs.iter().cloned());
+        all.into_iter().filter(|a| Some(a) != me.as_ref()).collect()
+    }
+
+    /// Writes the membership file. Blocking.
+    pub fn persist_members(&self, m: &Members) -> std::io::Result<()> {
+        self.write_marker_text(MEMBERS_FILE, &m.text())
+    }
+
+    /// Reads the membership file, if present; `Err` when it does not
+    /// parse.
+    pub fn read_members_file(&self) -> Result<Option<Members>, String> {
+        match self.marker_text(MEMBERS_FILE) {
+            None => Ok(None),
+            Some(text) => Members::parse(&text)
+                .map(Some)
+                .ok_or_else(|| format!("{} holds {text:?}", self.marker(MEMBERS_FILE).display())),
+        }
+    }
+
+    /// Installs `m` as the membership this node holds, committed as far
+    /// as this node is concerned (only a leader tracks a pending change),
+    /// and settles the Replica/Removed role on it. The caller persisted
+    /// it first.
+    pub fn install_members(&self, m: Members) {
+        {
+            let mut st = self.members.write().unwrap_or_else(|p| p.into_inner());
+            st.current = m.clone();
+            st.last_committed = m;
+            st.committed = true;
+            st.created_heads.clear();
+        }
+        self.reconcile_membership_role();
+    }
+
+    /// Persists and installs `m`: what a node behind a sender does
+    /// before acknowledging or voting. Blocking.
+    pub fn adopt_members(&self, m: &Members) -> Result<(), Status> {
+        self.persist_members(m)
+            .map_err(|e| Status::internal(format!("cannot write the members file: {e}")))?;
+        tracing::info!(members = %m.oneline(), "adopted the membership");
+        self.install_members(m.clone());
+        Ok(())
+    }
+
+    /// A leader's pending generation `m`: persisted, then current but
+    /// not committed, with every database's head noted for the commit
+    /// rule. Blocking.
+    pub fn propose_members(&self, m: &Members) -> Result<(), Status> {
+        self.persist_members(m)
+            .map_err(|e| Status::internal(format!("cannot write the members file: {e}")))?;
+        let heads: BTreeMap<String, u64> = self
+            .databases()
+            .iter()
+            .map(|d| (d.name.clone(), d.db.head()))
+            .collect();
+        let mut st = self.members.write().unwrap_or_else(|p| p.into_inner());
+        st.current = m.clone();
+        st.committed = false;
+        st.created_heads = heads;
+        Ok(())
+    }
+
+    /// On election: the membership republished under this leader's
+    /// epoch, to be committed before any change. Blocking.
+    pub fn restamp_members(&self, epoch: u64) -> Result<(), Status> {
+        let mut m = self.members();
+        m.epoch = epoch;
+        self.propose_members(&m)
+    }
+
+    /// The current generation, if it is `gen` and pending, is committed.
+    pub fn mark_members_committed(&self, generation: (u64, u64)) -> bool {
+        let mut st = self.members.write().unwrap_or_else(|p| p.into_inner());
+        if st.committed || st.current.generation() != generation {
+            return false;
+        }
+        st.committed = true;
+        st.last_committed = st.current.clone();
+        st.created_heads.clear();
+        true
+    }
+
+    /// Whether a majority of the current membership durably holds, on
+    /// every database, the head this leader had when the generation was
+    /// made (the second commit condition: the new majority holds every
+    /// write confirmed before the change).
+    pub fn new_majority_holds_created_heads(&self) -> bool {
+        let st = self.members_state();
+        let me = self.cluster.as_ref().map(|c| c.advertise.clone());
+        let self_counted = me.as_ref().is_some_and(|a| st.current.contains(a));
+        self.databases().iter().all(|d| {
+            let need = st.created_heads.get(&d.name).copied().unwrap_or(0);
+            d.sync.majority_for(&st.current, self_counted) >= need
+        })
+    }
+
+    /// Replica or Removed, by whether this node is in its membership;
+    /// a leader, candidate or fenced node that is not a member becomes
+    /// Removed (a leader after it stepped down).
+    pub fn reconcile_membership_role(&self) {
+        if self.cluster.is_none() {
+            return;
+        }
+        let member = self.is_member();
+        match (self.role(), member) {
+            (Role::Replica, false) => {
+                self.set_role(Role::Removed);
+                tracing::warn!("not in the group's membership: running removed (reads only)");
+            }
+            (Role::Removed, true) => {
+                self.set_role(Role::Replica);
+                tracing::info!("in the group's membership again: a replica");
+            }
+            (Role::Candidate | Role::Fenced, false) => {
+                self.set_role(Role::Removed);
+                tracing::warn!("not in the group's membership: running removed (reads only)");
+            }
+            _ => {}
+        }
     }
 
     // ---- the lease
@@ -760,6 +1098,11 @@ impl Node {
             Role::Candidate => Some(self.refuse(
                 "no leader: this node holds no lease and has heard none; retry on the node Discover names",
             )),
+            Role::Removed => Some(self.refuse(format!(
+                "not a member of the group (membership version {}); send writes to {}",
+                self.members().version,
+                self.leader_addr().as_deref().unwrap_or("the leader")
+            ))),
         }
     }
 
@@ -846,7 +1189,7 @@ impl Node {
         let _gate = self.write_gate.write().unwrap_or_else(|p| p.into_inner());
         let ours = self.epoch();
         match self.role() {
-            Role::Replica => {
+            Role::Replica | Role::Removed => {
                 return Err(self.refuse(format!(
                     "this node is a replica of {}",
                     self.leader_addr().as_deref().unwrap_or("?")
@@ -875,21 +1218,40 @@ impl Node {
 
     /// A leader whose lease expired becomes a candidate: writes were
     /// already refused by the lease check; this makes it visible and lets
-    /// the node follow whoever is elected. Blocking.
+    /// the node follow whoever is elected. A leader no longer in the
+    /// membership becomes Removed instead. Blocking.
     pub fn step_down(&self) {
         let _gate = self.write_gate.write().unwrap_or_else(|p| p.into_inner());
         if self.role() != Role::Leader {
             return;
         }
         self.with_lease(|l| l.held_until = None);
-        self.set_role(Role::Candidate);
-        tracing::warn!("stepped down: the majority lease expired");
+        if self.is_member() {
+            self.set_role(Role::Candidate);
+            tracing::warn!("stepped down: the majority lease expired");
+        } else {
+            self.set_role(Role::Removed);
+            tracing::warn!("stepped down: removed from the membership");
+        }
     }
 
-    /// Follows the leader at `addr` from now on: the role becomes Replica,
-    /// the replica marker names it, the fenced marker goes. Blocking; the
-    /// caller starts the pullers. A leader must be fenced or stepped down
-    /// first.
+    /// A leader that committed its own removal stops leading at once.
+    /// Blocking.
+    pub fn step_down_removed(&self) {
+        let _gate = self.write_gate.write().unwrap_or_else(|p| p.into_inner());
+        if self.role() != Role::Leader {
+            return;
+        }
+        self.with_lease(|l| l.held_until = None);
+        self.set_role(Role::Removed);
+        tracing::warn!("stepped down: this node removed itself from the membership");
+    }
+
+    /// Follows the leader at `addr` from now on: the role becomes
+    /// Replica (Removed when this node is not in the membership), the
+    /// replica marker names it, the fenced marker goes. Blocking; the
+    /// caller starts the pullers. A leader must be fenced or stepped
+    /// down first.
     pub fn become_replica_locked(&self, addr: &str) -> Result<(), Status> {
         let _gate = self.write_gate.write().unwrap_or_else(|p| p.into_inner());
         if self.role() == Role::Leader {
@@ -908,8 +1270,13 @@ impl Node {
         self.set_upstream(Some(up));
         self.set_fenced_by(None);
         self.with_lease(|l| l.held_until = None);
-        self.set_role(Role::Replica);
-        tracing::info!(leader = %addr, "following the leader");
+        if self.is_member() {
+            self.set_role(Role::Replica);
+            tracing::info!(leader = %addr, "following the leader");
+        } else {
+            self.set_role(Role::Removed);
+            tracing::info!(leader = %addr, "following the leader as a non-member (removed)");
+        }
         Ok(())
     }
 
@@ -963,6 +1330,9 @@ impl Node {
         lease_until: Option<Instant>,
     ) -> Result<(u64, u64), Status> {
         let _gate = self.write_gate.write().unwrap_or_else(|p| p.into_inner());
+        if self.role() == Role::Removed {
+            return Err(self.refuse("not a member of the group"));
+        }
         if !matches!(self.role(), Role::Replica | Role::Candidate | Role::Fenced) {
             return Err(self.refuse("already the leader"));
         }
@@ -991,6 +1361,17 @@ impl Node {
         // again; the marker must not bring the fence back at a restart.
         if let Err(e) = self.remove_marker(FENCED_MARKER) {
             tracing::warn!(error = %e, "cannot remove the fenced marker");
+        }
+        // The membership republished under this epoch, committed by the
+        // first heartbeat rounds before any change is taken (a stale
+        // leader's uncommitted change cannot outrank it afterwards);
+        // before the role flips, so a leader never shows the old stamp.
+        #[cfg(feature = "test-util")]
+        let restamp = !self.skip_restamp.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "test-util"))]
+        let restamp = true;
+        if self.cluster.is_some() && restamp {
+            self.restamp_members(epoch)?;
         }
         self.with_lease(|l| {
             l.held_until = lease_until;
@@ -1042,7 +1423,7 @@ mod tests {
     fn a_leader_refuses_writes_the_instant_its_lease_has_expired() {
         let dir = tempfile::tempdir().unwrap();
         let cluster = ClusterConfig {
-            peers: vec!["http://127.0.0.1:1".into(), "http://127.0.0.1:2".into()],
+            seeds: vec!["http://127.0.0.1:1".into(), "http://127.0.0.1:2".into()],
             advertise: "http://127.0.0.1:3".into(),
             token: None,
             tls: None,
@@ -1084,21 +1465,56 @@ mod tests {
     }
 
     #[test]
-    fn quorum_is_a_majority_of_peers_and_self() {
-        let c = |n: usize| ClusterConfig {
-            peers: (0..n).map(|i| format!("p{i}")).collect(),
-            advertise: "me".into(),
-            token: None,
-            tls: None,
-            max_message_bytes: 1,
-            lease_ttl: Duration::from_secs(1),
-            sync_commit: SyncCommit::Majority,
-            sync_timeout: Duration::from_secs(1),
+    fn quorum_is_a_majority_of_the_membership() {
+        let m = |n: usize| Members {
+            epoch: 0,
+            version: 1,
+            addrs: (0..n).map(|i| format!("p{i}")).collect(),
         };
-        assert_eq!(c(0).quorum(), 1);
-        assert_eq!(c(1).quorum(), 2);
-        assert_eq!(c(2).quorum(), 2);
-        assert_eq!(c(3).quorum(), 3);
-        assert_eq!(c(4).quorum(), 3);
+        assert_eq!(m(1).quorum(), 1);
+        assert_eq!(m(2).quorum(), 2);
+        assert_eq!(m(3).quorum(), 2);
+        assert_eq!(m(4).quorum(), 3);
+        assert_eq!(m(5).quorum(), 3);
+    }
+
+    #[test]
+    fn the_members_file_round_trips_and_rejects_junk() {
+        let m = Members {
+            epoch: 7,
+            version: 3,
+            addrs: ["http://b:1", "http://a:1"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        let text = m.text();
+        assert_eq!(
+            text,
+            "epoch 7\nversion 3\nmember http://a:1\nmember http://b:1\n"
+        );
+        assert_eq!(Members::parse(&text), Some(m.clone()));
+        assert_eq!(Members::from_wire(&m.to_wire()), Some(m));
+        for junk in [
+            "",
+            "epoch 7\n",
+            "epoch 7\nversion 3\n",
+            "version 3\nepoch 7\nmember a\n",
+            "epoch x\nversion 3\nmember a\n",
+            "epoch 7\nversion 3\nmember a\nmember a\n",
+            "epoch 7\nversion 3\nmember a b\n",
+            "epoch 7\nversion 3\npeer a\n",
+        ] {
+            assert_eq!(Members::parse(junk), None, "{junk:?}");
+        }
+        assert_eq!(
+            Members::from_wire(&pb::Members {
+                epoch: 1,
+                version: 1,
+                addrs: vec![]
+            }),
+            None
+        );
+        assert!((1, 2) < (2, 0), "generations order by epoch first");
     }
 }

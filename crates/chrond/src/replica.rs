@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::node::{DbNode, Node, Role, Upstream};
+use crate::node::{DbNode, Node, Upstream};
 
 const BACKOFF_MIN: Duration = Duration::from_millis(200);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
@@ -576,7 +576,7 @@ async fn self_restore(
     // The swap.
     let _ops = node.admin_ops.lock().await;
     let current = node.get(&name);
-    if !current.as_ref().is_some_and(|d| Arc::ptr_eq(d, dbn)) || node.role() != Role::Replica {
+    if !current.as_ref().is_some_and(|d| Arc::ptr_eq(d, dbn)) || !node.role().follows() {
         return fail(
             node,
             &name,
@@ -902,7 +902,7 @@ async fn tail(
             .chunks_applied
             .with_label_values(&[&dbn.name])
             .inc();
-        if node.role() != Role::Replica {
+        if !node.role().follows() {
             return Ok(());
         }
     }
@@ -954,7 +954,7 @@ async fn discover(node: &Arc<Node>) -> Result<(), String> {
         Err(_) => return Err(format!("{} did not answer ListDatabases", up.addr)),
     };
     let names: std::collections::HashSet<String> = listed.into_iter().map(|d| d.name).collect();
-    if node.role() != Role::Replica {
+    if !node.role().follows() {
         return Ok(());
     }
     for name in &names {

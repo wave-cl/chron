@@ -195,6 +195,9 @@ async fn the_endpoint_reports_calls_commits_and_gauges() {
         Some(1.0),
         "the subscription is open"
     );
+    assert_eq!(metric(&body, "chron_members", &[]), Some(0.0), "no group");
+    assert_eq!(metric(&body, "chron_member", &[]), Some(1.0));
+    assert_eq!(metric(&body, "chron_members_version", &[]), Some(0.0));
     assert!(
         !body.contains("chron_replication_lag_events") && !body.contains("chron_replica_connected"),
         "a leader reports no replica gauges"

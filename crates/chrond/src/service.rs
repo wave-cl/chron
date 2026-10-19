@@ -547,18 +547,15 @@ impl Chron for ChronService {
         self.admit_replica(&dbn, open.from_position, open.last_fingerprint)
             .await?;
         let leader_durable = self.node.db_opts.fsync == chron::Fsync::Always;
-        let is_peer = self
-            .node
-            .cluster
-            .as_ref()
-            .is_some_and(|c| c.peers.contains(&open.peer_addr));
-        let counted = is_peer && (open.durable || !leader_durable);
-        if is_peer && !counted {
+        let is_member =
+            self.node.cluster.is_some() && self.node.members().contains(&open.peer_addr);
+        let durable_ok = open.durable || !leader_durable;
+        if is_member && !durable_ok {
             tracing::warn!(peer = %open.peer_addr, database = %dbn.name, "the follower applies without fsync; its acknowledgments do not count toward the majority");
-        } else if !is_peer {
-            tracing::info!(peer = %open.peer_addr, database = %dbn.name, "not a configured peer; its acknowledgments are recorded, not counted");
+        } else if !is_member {
+            tracing::info!(peer = %open.peer_addr, database = %dbn.name, "not in the membership; its acknowledgments are recorded, not counted (until it is added)");
         }
-        let id = dbn.sync.attach(&open.peer_addr, open.durable, counted);
+        let id = dbn.sync.attach(&open.peer_addr, open.durable, durable_ok);
         let stream_cancel = dbn.cancel.child_token();
         let rx = spawn_chunk_stream(
             self.node.clone(),
@@ -569,6 +566,7 @@ impl Chron for ChronService {
         );
         let peer = open.peer_addr;
         let dbn2 = dbn.clone();
+        let node2 = self.node.clone();
         tokio::spawn(async move {
             loop {
                 let m = tokio::select! {
@@ -578,7 +576,15 @@ impl Chron for ChronService {
                 match m {
                     Ok(Some(pb::FollowRequest {
                         msg: Some(pb::follow_request::Msg::Applied(a)),
-                    })) => dbn2.sync.record(&peer, id, a.head, dbn2.db.head()),
+                    })) => {
+                        let members = node2.members();
+                        let self_counted = node2
+                            .cluster
+                            .as_ref()
+                            .is_some_and(|c| members.contains(&c.advertise));
+                        dbn2.sync
+                            .record(&peer, id, a.head, dbn2.db.head(), &members, self_counted)
+                    }
                     // A second `open`, an empty message, an error or the
                     // end of the inbound stream all end the follow.
                     _ => break,
@@ -597,6 +603,11 @@ impl Chron for ChronService {
         self.node.require_admin(req.metadata())?;
         match self.node.role() {
             Role::Leader => return Err(self.node.refuse("already the leader")),
+            Role::Removed => {
+                return Err(self
+                    .node
+                    .refuse("not a member of the group; add it with `chron members add` first"));
+            }
             Role::Fenced if self.node.cluster.is_none() => {
                 return Err(self
                     .node
@@ -607,6 +618,7 @@ impl Chron for ChronService {
             }
             Role::Replica | Role::Candidate | Role::Fenced => {}
         }
+        let _ = &Role::Removed;
         // Its own task: a client that gives up mid-way must not leave the
         // puller stopped and the role unchanged.
         let node = self.node.clone();
@@ -700,6 +712,36 @@ impl Chron for ChronService {
         _req: Request<pb::DiscoverRequest>,
     ) -> Result<Response<pb::DiscoverResponse>, Status> {
         Ok(Response::new(cluster::discover(&self.node)))
+    }
+
+    async fn get_members(
+        &self,
+        _req: Request<pb::GetMembersRequest>,
+    ) -> Result<Response<pb::GetMembersResponse>, Status> {
+        Ok(Response::new(ops::members(&self.node)))
+    }
+
+    /// One change to the membership, on the leader. Its own task: a
+    /// client that gives up must not leave a proposed generation
+    /// unpushed.
+    async fn change_members(
+        &self,
+        req: Request<pb::ChangeMembersRequest>,
+    ) -> Result<Response<pb::ChangeMembersResponse>, Status> {
+        self.node.require_admin(req.metadata())?;
+        let r = req.into_inner();
+        let change = r
+            .change
+            .ok_or_else(|| Status::invalid_argument("add or remove an address"))?;
+        let node = self.node.clone();
+        let (members, committed) =
+            tokio::spawn(async move { cluster::change_members(&node, change, r.force).await })
+                .await
+                .map_err(|e| codec::join("change_members", e))??;
+        Ok(Response::new(pb::ChangeMembersResponse {
+            members: Some(members.to_wire()),
+            committed,
+        }))
     }
 
     type FetchBackupStream = ByteStream;

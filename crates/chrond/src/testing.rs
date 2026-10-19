@@ -181,6 +181,55 @@ impl Cluster {
         cluster
     }
 
+    /// Starts one more node on a fresh port and directory, with node
+    /// `peer_of` as its only seed; returns its index. It comes up removed
+    /// (not in the membership) until the leader adds it.
+    pub async fn add_node(&mut self, peer_of: usize) -> usize {
+        let i = self.nodes.len();
+        self.nodes.push(ClusterNode {
+            dir: tempfile::tempdir().expect("tempdir"),
+            port: free_port(),
+            running: None,
+        });
+        let seed = self.addr(peer_of);
+        self.restart_with(i, move |o| o.peers = vec![seed]).await;
+        i
+    }
+
+    /// The membership node `i` holds.
+    pub fn members(&self, i: usize) -> crate::node::Members {
+        self.node(i).members()
+    }
+
+    /// Whether node `i` (a leader) has its membership generation
+    /// committed.
+    pub fn members_committed(&self, i: usize) -> bool {
+        self.node(i).members_state().committed
+    }
+
+    /// Waits until every running node holds membership `version`.
+    pub async fn wait_members(&self, version: u64, within: Duration) {
+        self.wait(
+            &format!("every node at membership version {version}"),
+            within,
+            || {
+                self.nodes
+                    .iter()
+                    .filter_map(|n| n.running.as_ref())
+                    .all(|r| r.node.members().version == version)
+            },
+        )
+        .await;
+    }
+
+    /// Waits until node `i` runs removed.
+    pub async fn wait_removed(&self, i: usize, within: Duration) {
+        self.wait(&format!("node {i} removed"), within, || {
+            self.role(i) == Some(Role::Removed)
+        })
+        .await;
+    }
+
     /// Holds (or releases) every apply on node `i`: its acknowledgments
     /// stop without its pullers stopping.
     pub fn hold_apply(&self, i: usize, held: bool) {
@@ -189,7 +238,9 @@ impl Cluster {
 
     /// The followers node `i` sees on `default`, when it leads.
     pub fn followers(&self, i: usize) -> Vec<chron_proto::v1::FollowerStatus> {
-        self.node(i).default_db().sync.snapshot()
+        let n = self.node(i);
+        let members = n.members();
+        n.default_db().sync.snapshot(&members)
     }
 
     /// The majority-applied position node `i` has for `default`.
@@ -236,11 +287,22 @@ impl Cluster {
 
     /// Starts (or restarts) node `i` with `f` adjusting its options.
     pub async fn restart_with(&mut self, i: usize, f: impl FnOnce(&mut Options)) {
+        self.try_restart_with(i, f).await.expect("the node starts");
+    }
+
+    /// [`restart_with`](Cluster::restart_with) that reports a start that
+    /// was refused.
+    pub async fn try_restart_with(
+        &mut self,
+        i: usize,
+        f: impl FnOnce(&mut Options),
+    ) -> anyhow::Result<()> {
         assert!(self.nodes[i].running.is_none(), "node {i} is running");
         let mut o = self.options(i);
         f(&mut o);
-        let running = crate::start(o).await.expect("the node starts");
+        let running = crate::start(o).await?;
         self.nodes[i].running = Some(running);
+        Ok(())
     }
 
     pub async fn restart(&mut self, i: usize) {
@@ -337,7 +399,7 @@ impl Cluster {
                 Some(r) => {
                     let st = r.node.default_db().replica_status();
                     format!(
-                        "node {i} ({}): {:?} epoch {} floor {} head {} leader {:?} lease {:?} connected {} error {:?}",
+                        "node {i} ({}): {:?} epoch {} floor {} head {} leader {:?} lease {:?} members {} connected {} error {:?}",
                         n.addr(),
                         r.node.role(),
                         r.node.data_epoch(),
@@ -345,6 +407,7 @@ impl Cluster {
                         r.node.default_db().db.head(),
                         r.node.leader_addr(),
                         r.node.lease_remaining(),
+                        r.node.members().oneline(),
                         st.connected,
                         st.last_error
                     )

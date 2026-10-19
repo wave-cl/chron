@@ -78,6 +78,10 @@ enum Role {
   // With peers: no leader is known and this node holds no lease; writes
   // are refused until a leader is elected or heard.
   ROLE_CANDIDATE = 4;
+  // With peers: this node is not in the group's membership (removed, or
+  // not yet added). It serves reads, follows the leader it hears without
+  // voting or counting, never campaigns, and refuses writes.
+  ROLE_REMOVED = 5;
 }
 
 message AppendResult {
@@ -185,6 +189,57 @@ message InfoResponse {
   // Whether the daemon acknowledges commits only once a majority holds
   // them (--sync-commit majority).
   bool sync_commit = 23;
+  // The group's membership generation this node holds (see Members).
+  uint64 members_version = 24;
+  uint64 members_epoch = 25;
+  // On a leader: whether that generation is committed (a majority of it
+  // holds it and everything confirmed before it was made).
+  bool members_committed = 26;
+  // Whether this node is in the membership.
+  bool member = 27;
+}
+
+// The failover group's membership: the full set of advertised addresses,
+// stamped with the epoch of the leader that published it and a version
+// that rises by one per change. Generations order by (epoch, version);
+// a node holding a lower one adopts a higher one it is sent, persisting
+// it first, and refuses a sender holding a lower one.
+message Members {
+  uint64 epoch = 1;
+  uint64 version = 2;
+  repeated string addrs = 3;
+}
+
+message GetMembersRequest {}
+
+// The membership as this node holds it. Open to any token.
+message GetMembersResponse {
+  Members members = 1;
+  // On a leader: whether the generation is committed.
+  bool committed = 2;
+  // Whether this node is in it.
+  bool member = 3;
+  optional string leader_addr = 4;
+}
+
+// Adds or removes one address, on the leader, one change at a time: the
+// next generation is persisted here and pushed with the heartbeats, and
+// is committed once a majority of the new membership has persisted it
+// and durably holds everything this leader held when it was made. An
+// added node must be following this leader unless `force`. An admin
+// call. Not committed in time is not an error: GetMembers says when it
+// is; a second change while one is pending is FAILED_PRECONDITION.
+message ChangeMembersRequest {
+  oneof change {
+    string add = 1;
+    string remove = 2;
+  }
+  bool force = 3;
+}
+
+message ChangeMembersResponse {
+  Members members = 1;
+  bool committed = 2;
 }
 
 // One follower as the leader sees it.
@@ -227,15 +282,20 @@ message HeartbeatRequest {
   string leader_addr = 2;
   uint64 head = 3;
   uint64 lease_ttl_ms = 4;
+  // The leader's membership generation; a receiver behind it adopts it
+  // (persisting it before acknowledging), one ahead refuses.
+  Members members = 5;
 }
 
 // `ok` acknowledges the lease; `epoch` is the answering node's own, so a
-// leader learns of a newer one.
+// leader learns of a newer one; `members` is the answering node's
+// membership, so a refused leader learns what it is behind.
 message HeartbeatResponse {
   bool ok = 1;
   uint64 epoch = 2;
   optional string leader_addr = 3;
   uint64 head = 4;
+  Members members = 5;
 }
 
 message DatabaseHead {
@@ -255,6 +315,8 @@ message RequestVoteRequest {
   repeated DatabaseHead databases = 4;
   bool forced = 5;
   bool pre_vote = 6;
+  // The candidate's membership generation (see HeartbeatRequest).
+  Members members = 7;
 }
 
 message RequestVoteResponse {
@@ -263,6 +325,8 @@ message RequestVoteResponse {
   uint64 epoch = 2;
   // Why the vote was refused, for the log.
   string reason = 3;
+  // The answering node's membership, for a candidate behind it.
+  Members members = 4;
 }
 
 // The stored crc32 of the records at `positions`, so a copy of the
@@ -288,6 +352,9 @@ message DiscoverRequest {}
 message DiscoverResponse {
   optional string leader_addr = 1;
   uint64 epoch = 2;
+  // The membership generation this node holds (see Members).
+  uint64 members_version = 6;
+  uint64 members_epoch = 7;
   Role role = 3;
   repeated string peers = 4;
   optional uint64 lease_remaining_ms = 5;
@@ -394,8 +461,10 @@ message RetainResponse {
 // failures are INTERNAL. A write refused because of the node's role or
 // epoch is FAILED_PRECONDITION with the metadata `chron-epoch`. A missing
 // or wrong bearer token is UNAUTHENTICATED; an administrative call
-// (Promote, Fence, Retain, Backup, ApplyBackup, Replicate) without the
-// admin token, when the daemon has one, is PERMISSION_DENIED. A
+// (Promote, Fence, Retain, Backup, ApplyBackup, Replicate, Follow,
+// FetchBackup, Fingerprints, ChangeMembers, the database calls and the
+// daemon-to-daemon Heartbeat and RequestVote) without the admin token,
+// when the daemon has one, is PERMISSION_DENIED. A
 // replication stream meets a transaction larger than the message limit
 // with RESOURCE_EXHAUSTED. Subscribe and Replicate end with UNAVAILABLE
 // when the daemon is fenced or stops.
@@ -415,6 +484,8 @@ service Chron {
   rpc Replicate(ReplicateRequest) returns (stream ReplicationChunk);
   rpc Promote(PromoteRequest) returns (PromoteResponse);
   rpc Fence(FenceRequest) returns (FenceResponse);
+  rpc GetMembers(GetMembersRequest) returns (GetMembersResponse);
+  rpc ChangeMembers(ChangeMembersRequest) returns (ChangeMembersResponse);
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
   rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
   rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);

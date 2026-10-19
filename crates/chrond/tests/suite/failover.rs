@@ -263,6 +263,9 @@ async fn a_vote_survives_a_restart_and_a_deleted_marker_does_not() {
             .await;
         assert_eq!(c.role(0), Some(Role::Candidate));
         let client = c.client(0).await;
+        // The configured peer is the candidate: a vote for an address
+        // outside the membership is refused.
+        let peer = "http://127.0.0.1:1";
         let vote = |who: &str, pre_vote: bool| pb::RequestVoteRequest {
             epoch: 5,
             candidate_addr: who.to_string(),
@@ -270,13 +273,14 @@ async fn a_vote_survives_a_restart_and_a_deleted_marker_does_not() {
             databases: vec![],
             forced: true,
             pre_vote,
+            members: None,
         };
-        let r = client.request_vote(vote("http://x", false)).await.unwrap();
+        let r = client.request_vote(vote(peer, false)).await.unwrap();
         assert!(r.granted, "{r:?}");
         let marker = c.nodes[0].dir.path().join("data").join("vote");
         assert_eq!(
             std::fs::read_to_string(&marker).unwrap(),
-            "epoch 5 for http://x\n"
+            format!("epoch 5 for {peer}\n")
         );
         c.stop(0).await;
         if delete_marker {
@@ -285,19 +289,47 @@ async fn a_vote_survives_a_restart_and_a_deleted_marker_does_not() {
         c.restart_with(0, |o| o.peers = vec!["http://127.0.0.1:1".into()])
             .await;
         let client = c.client(0).await;
-        let r = client.request_vote(vote("http://y", true)).await.unwrap();
+        // The same epoch asked again after the restart: the vote marker
+        // says it is promised; without the marker it is granted afresh.
+        let r = client.request_vote(vote(peer, true)).await.unwrap();
         assert_eq!(
             r.granted, want_granted,
             "delete_marker={delete_marker}: {r:?}"
         );
         if !delete_marker {
             assert!(r.reason.contains("promised epoch 5"), "{r:?}");
+        }
+        let hb_other = pb::HeartbeatRequest {
+            epoch: 5,
+            leader_addr: "http://y".into(),
+            head: 0,
+            lease_ttl_ms: 1000,
+            members: None,
+        };
+        assert!(
+            !client.heartbeat(hb_other).await.unwrap().ok,
+            "a non-member's heartbeat is refused"
+        );
+        let r = client
+            .request_vote(pb::RequestVoteRequest {
+                candidate_addr: "http://y".into(),
+                epoch: 6,
+                ..vote(peer, true)
+            })
+            .await
+            .unwrap();
+        assert!(
+            !r.granted && r.reason.contains("not a member"),
+            "delete_marker={delete_marker}: a non-member cannot be voted for: {r:?}"
+        );
+        if !delete_marker {
             assert_eq!(client.info().await.unwrap().voted_epoch, Some(5));
             let hb = |epoch| pb::HeartbeatRequest {
                 epoch,
-                leader_addr: "http://x".into(),
+                leader_addr: peer.into(),
                 head: 0,
                 lease_ttl_ms: 1000,
+                members: None,
             };
             assert!(!client.heartbeat(hb(4)).await.unwrap().ok);
             assert!(client.heartbeat(hb(5)).await.unwrap().ok);
@@ -327,6 +359,7 @@ async fn a_node_without_peers_leads_alone_and_refuses_cluster_calls() {
             leader_addr: "http://x".into(),
             head: 0,
             lease_ttl_ms: 1000,
+            members: None,
         })
         .await;
     assert!(
@@ -341,6 +374,7 @@ async fn a_node_without_peers_leads_alone_and_refuses_cluster_calls() {
             databases: vec![],
             forced: true,
             pre_vote: true,
+            members: None,
         })
         .await;
     assert!(

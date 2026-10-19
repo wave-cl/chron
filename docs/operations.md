@@ -106,6 +106,46 @@ reached within a third of the lease. Check the network between the
 nodes before raising `--lease-ttl`; a longer lease is a longer outage
 when a leader is cut off, and more writes on it that will be lost.
 
+## Adding a node
+
+1. Start it empty with any member as `--peer` and the same tokens and
+   TLS: `chrond --data-dir DIR --listen 0.0.0.0:4242 --advertise $D --peer $A ...`.
+   It comes up removed and follows the leader (`chron --addr $D status`
+   says `removed`, connected).
+2. `chron --addr $LEADER members add $D`: `committed` once a majority of
+   the new membership holds it and the leader's head, else `pending`,
+   then `chron --addr $LEADER members` says when. With four nodes a
+   majority is three: add the node only once it is reachable, since a
+   member that cannot answer costs the lease one failure sooner.
+3. `chron --addr $D status --max-lag 0` shows `replica`.
+
+One node at a time; a second change is refused while one is pending.
+
+## Removing a node
+
+- A follower, alive or dead: `chron --addr $LEADER members remove $X`,
+  committed once a majority of the remaining nodes holds it. Stop the
+  daemon, or leave it: it runs removed (reads only) until added again.
+- The leader: promote another node first (`chron --addr $B promote`,
+  no write pause), then remove the old leader as a follower. Removing
+  the leader directly works too, but pauses writes for about a lease
+  while the others elect.
+- Never go below three nodes unless an outage of either remaining node
+  is acceptable.
+- To reuse a removed node's directory alone or as the seed of a new
+  group: stop it, delete `DIR/members`, start it with the right `--peer`
+  flags (or none). On one node at a time, never on two at once: two
+  deleted files and matching flags form a group of their own.
+
+## Replacing a node
+
+Add the new node (above), wait for `status --max-lag 0` on it, then
+remove the old one. The group runs with one more member in between, so
+do it while the others are healthy. A node that changes address keeps
+its directory: `--advertise` is its identity, so remove the old address,
+start the daemon under the new one with `--peer` any member, and add the
+new address.
+
 ## Restoring a replica from the leader
 
 With peers nothing to do: a node below the leader's floor fetches the
@@ -159,7 +199,7 @@ so only file contents change.
    one `follower` line each: which peer lags (`applied`), which is
    missing (not attached: check `chron status` there), which is
    `counted false` (a `--no-fsync` follower of an fsync leader, or a
-   node outside `--peer`), which runs a version without `Follow`.
+   node outside the membership), which runs a version without `Follow`.
 2. `chron_follower_applied_head{peer}` over time shows a slow follower;
    `chron_replica_connected` on it shows a broken link.
 3. The escape hatch while fixing it: `--sync-commit off` on the leader,

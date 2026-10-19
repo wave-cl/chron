@@ -407,6 +407,15 @@ async fn admin_calls_need_the_admin_token_when_one_is_set() {
             .await
             .err(),
         ),
+        (
+            "change_members",
+            user.change_members(pb::ChangeMembersRequest {
+                change: Some(pb::change_members_request::Change::Add("http://x:1".into())),
+                force: false,
+            })
+            .await
+            .err(),
+        ),
     ] {
         let err = err.expect(what);
         assert_eq!(

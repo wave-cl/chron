@@ -71,6 +71,12 @@ enum Commands {
     Promote,
     /// Tell a leader that a newer epoch exists; it refuses writes from then on.
     Fence { epoch: u64 },
+    /// The failover group's membership; add or remove one node (on the
+    /// leader).
+    Members {
+        #[command(subcommand)]
+        cmd: Option<MembersCommands>,
+    },
     /// Create, list or drop the daemon's databases.
     Db {
         #[command(subcommand)]
@@ -97,6 +103,28 @@ enum Commands {
     },
     /// Offline: print a backup's header.
     Inspect { archive: std::path::PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+enum MembersCommands {
+    /// The membership as the daemon holds it (the default).
+    List,
+    /// Add a node by its advertised address; it must be following the
+    /// leader unless --force.
+    Add {
+        /// The node's advertised address (http://host:port).
+        #[arg(value_name = "ADDRESS")]
+        member: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove a node by its advertised address (the leader itself steps
+    /// down once the change commits).
+    Remove {
+        /// The node's advertised address (http://host:port).
+        #[arg(value_name = "ADDRESS")]
+        member: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -153,6 +181,15 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Health { service } => cmd::admin::health(conn, format, &service).await,
         Commands::Promote => cmd::admin::promote(conn, format).await,
         Commands::Fence { epoch } => cmd::admin::fence(conn, format, epoch).await,
+        Commands::Members { cmd } => match cmd.unwrap_or(MembersCommands::List) {
+            MembersCommands::List => cmd::admin::members(conn, format).await,
+            MembersCommands::Add { member, force } => {
+                cmd::admin::members_add(conn, format, &member, force).await
+            }
+            MembersCommands::Remove { member } => {
+                cmd::admin::members_remove(conn, format, &member).await
+            }
+        },
         Commands::Db { cmd } => match cmd {
             DbCommands::Create { name } => cmd::admin::db_create(conn, format, &name).await,
             DbCommands::List => cmd::admin::db_list(conn, format).await,

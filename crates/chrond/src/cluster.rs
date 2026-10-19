@@ -22,6 +22,22 @@
 //! granted by the live leader, which fences itself first, or by nodes
 //! that have heard no leader for a lease; it never lets two leaders
 //! overlap.
+//!
+//! Membership (which nodes vote and count) is a generation `(epoch,
+//! version)` with the full set of addresses, persisted on every node
+//! and carried on every heartbeat and vote request. A node behind the
+//! sender's generation adopts it (persisting it first), one ahead
+//! refuses and answers with its own. A change (one address at a time,
+//! on the leader, from a committed generation) is committed once a
+//! majority of the new set acknowledged at it and durably holds every
+//! database's head from when it was made; a majority of the old set and
+//! one of the new set always share a node, and once the new one is
+//! committed no majority of the old can form, so any two live
+//! majorities intersect and the lease argument above holds across
+//! changes. A new leader republishes the membership under its own epoch
+//! and commits that before taking a change, so a dead leader's
+//! uncommitted change at a lower epoch can never outrank it. A heartbeat
+//! or vote request from an address outside the membership is refused.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,7 +47,7 @@ use chron_proto::v1 as pb;
 use tokio::task::JoinHandle;
 use tonic::Status;
 
-use crate::node::{ClusterConfig, Node, Role};
+use crate::node::{ClusterConfig, Members, Node, Role};
 use crate::replica;
 
 /// Heartbeats go out this often; a peer call is bounded by the same.
@@ -72,6 +88,18 @@ async fn run(node: Arc<Node>) {
                     node.metrics.leader_changes.inc();
                     quiet_since = Instant::now();
                 }
+                tokio::select! {
+                    _ = node.cancel.cancelled() => return,
+                    _ = tokio::time::sleep(tick(ttl)) => {}
+                }
+            }
+            // Not a member: the leader does not heartbeat this node, so it
+            // looks for the leader itself (through its seeds and the
+            // members it knows), follows it for reads, and adopts the
+            // membership the leader holds; one that names this node makes
+            // it a replica again.
+            Role::Removed => {
+                removed_round(&node, &cfg).await;
                 tokio::select! {
                     _ = node.cancel.cancelled() => return,
                     _ = tokio::time::sleep(tick(ttl)) => {}
@@ -161,19 +189,25 @@ where
     }
 }
 
-/// One round of heartbeats to every peer. A majority (this node
-/// included) extends the lease from the instant before the round; a
-/// peer at a newer epoch fences this node.
+/// One round of heartbeats to every member of the last committed and
+/// the current membership. A majority of the current membership (this
+/// node included when it is in it) extends the lease from the instant
+/// before the round and, when a change is pending and that majority
+/// also holds every head from when it was made, commits it; a peer at a
+/// newer epoch fences this node.
 pub async fn heartbeat_round(node: &Arc<Node>, cfg: &ClusterConfig) {
     let t0 = Instant::now();
     let epoch = node.data_epoch();
+    let st = node.members_state();
     let req = pb::HeartbeatRequest {
         epoch,
         leader_addr: cfg.advertise.clone(),
         head: node.default_db().db.head(),
         lease_ttl_ms: ms(cfg.lease_ttl),
+        members: Some(st.current.to_wire()),
     };
-    let answers = futures_join(cfg.peers.iter().map(|peer| {
+    let targets = node.fanout();
+    let answers = futures_join(targets.iter().map(|peer| {
         let req = req.clone();
         async move {
             (
@@ -183,11 +217,15 @@ pub async fn heartbeat_round(node: &Arc<Node>, cfg: &ClusterConfig) {
         }
     }))
     .await;
-    let mut acks = 1;
+    let mut acks = usize::from(st.current.contains(&cfg.advertise));
     let mut newer: Option<u64> = None;
     for (peer, answer) in answers {
         match answer {
-            Ok(r) if r.ok => acks += 1,
+            Ok(r) if r.ok => {
+                if st.current.contains(&peer) {
+                    acks += 1;
+                }
+            }
             Ok(r) => {
                 tracing::debug!(%peer, epoch = r.epoch, "heartbeat not acknowledged");
                 if r.epoch > epoch {
@@ -210,8 +248,76 @@ pub async fn heartbeat_round(node: &Arc<Node>, cfg: &ClusterConfig) {
         node.metrics.leader_changes.inc();
         return;
     }
-    if acks >= cfg.quorum() {
+    if acks >= st.current.quorum() {
         node.extend_lease(t0 + cfg.lease_ttl);
+        #[cfg(feature = "test-util")]
+        let catch_up_ok = node
+            .skip_catchup_rule
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || node.new_majority_holds_created_heads();
+        #[cfg(not(feature = "test-util"))]
+        let catch_up_ok = node.new_majority_holds_created_heads();
+        if !st.committed && catch_up_ok && node.mark_members_committed(st.current.generation()) {
+            tracing::info!(members = %st.current.oneline(), "membership committed");
+            node.metrics.member_changes.inc();
+            if !st.current.contains(&cfg.advertise) {
+                let n = node.clone();
+                let _ = tokio::task::spawn_blocking(move || n.step_down_removed()).await;
+                node.metrics.leader_changes.inc();
+            }
+        }
+    }
+}
+
+/// One round of a removed node: asks its seeds and the members it knows
+/// who leads, adopts a higher membership the leader holds, and follows
+/// the leader when it does not already.
+async fn removed_round(node: &Arc<Node>, cfg: &ClusterConfig) {
+    let mut candidates: Vec<String> = cfg.seeds.clone();
+    for a in node.members().others(&cfg.advertise) {
+        if !candidates.contains(&a) {
+            candidates.push(a);
+        }
+    }
+    let mut leader: Option<String> = None;
+    for addr in &candidates {
+        let d = call(node, cfg, addr, |c| async move { c.discover().await }).await;
+        if let Ok(d) = d
+            && let Some(l) = d.leader_addr
+        {
+            leader = Some(l);
+            break;
+        }
+    }
+    let Some(leader) = leader else {
+        return;
+    };
+    if leader == cfg.advertise {
+        return;
+    }
+    let m = call(node, cfg, &leader, |c| async move { c.members().await }).await;
+    let _serial = node.transitions.lock().await;
+    if node.role() != Role::Removed {
+        return;
+    }
+    if let Ok(m) = m
+        && let Some(theirs) = Members::from_wire(&pb::Members {
+            epoch: m.members.epoch,
+            version: m.members.version,
+            addrs: m.members.addrs.clone(),
+        })
+        && theirs.generation() > node.members().generation()
+    {
+        let n = node.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || n.adopt_members(&theirs)).await {
+            tracing::error!(error = %e, "members task");
+        }
+    }
+    let connected = node.default_db().replica_status().connected;
+    if (node.leader_addr().as_deref() != Some(leader.as_str()) || !connected)
+        && let Err(e) = follow(node, &leader).await
+    {
+        tracing::debug!(error = %e.message(), "a removed node could not follow the leader");
     }
 }
 
@@ -243,26 +349,45 @@ where
     out.into_iter().map(|o| o.expect("completed")).collect()
 }
 
-/// One vote round at `epoch`; `(granted, behind)`: how many peers
-/// granted, and the first refusal that says this node is not up to date.
+/// What a vote round found.
+struct Round {
+    /// Members that granted.
+    granted: usize,
+    /// The first refusal that says this node is not up to date.
+    behind: Option<String>,
+    /// The highest membership a refusing peer answered with, when it
+    /// is above the candidate's.
+    newer_members: Option<Members>,
+}
+
+/// What a candidate asks for: the same in the pre-vote and the real
+/// round, under the membership it currently holds.
+struct Ballot<'a> {
+    epoch: u64,
+    data_epoch: u64,
+    heads: &'a [pb::DatabaseHead],
+    forced: bool,
+}
+
+/// One vote round to every other member of `members`.
 async fn vote_round(
     node: &Arc<Node>,
     cfg: &ClusterConfig,
-    epoch: u64,
-    data_epoch: u64,
-    heads: &[pb::DatabaseHead],
-    forced: bool,
+    members: &Members,
+    ballot: &Ballot<'_>,
     pre_vote: bool,
-) -> (usize, Option<String>) {
+) -> Round {
     let req = pb::RequestVoteRequest {
-        epoch,
+        epoch: ballot.epoch,
         candidate_addr: cfg.advertise.clone(),
-        last_epoch: data_epoch,
-        databases: heads.to_vec(),
-        forced,
+        last_epoch: ballot.data_epoch,
+        databases: ballot.heads.to_vec(),
+        forced: ballot.forced,
         pre_vote,
+        members: Some(members.to_wire()),
     };
-    let answers = futures_join(cfg.peers.iter().map(|peer| {
+    let targets = members.others(&cfg.advertise);
+    let answers = futures_join(targets.iter().map(|peer| {
         let req = req.clone();
         async move {
             (
@@ -278,22 +403,34 @@ async fn vote_round(
         }
     }))
     .await;
-    let mut granted = 0;
-    let mut behind = None;
+    let mut round = Round {
+        granted: 0,
+        behind: None,
+        newer_members: None,
+    };
     for (peer, answer) in answers {
         match answer {
-            Ok(r) if r.granted => granted += 1,
+            Ok(r) if r.granted => round.granted += 1,
             Ok(r) => {
                 node.note_seen(r.epoch);
                 tracing::info!(%peer, pre_vote, reason = %r.reason, "vote refused");
-                if r.reason.starts_with("behind") && behind.is_none() {
-                    behind = Some(format!("{peer}: {}", r.reason));
+                if r.reason.starts_with("behind") && round.behind.is_none() {
+                    round.behind = Some(format!("{peer}: {}", r.reason));
+                }
+                if let Some(theirs) = r.members.as_ref().and_then(Members::from_wire)
+                    && theirs.generation() > members.generation()
+                    && round
+                        .newer_members
+                        .as_ref()
+                        .is_none_or(|m| theirs.generation() > m.generation())
+                {
+                    round.newer_members = Some(theirs);
                 }
             }
             Err(e) => tracing::info!(%peer, pre_vote, error = %e, "vote request failed"),
         }
     }
-    (granted, behind)
+    round
 }
 
 /// Campaigns to lead under the next epoch: a pre-vote round first
@@ -317,6 +454,9 @@ pub async fn campaign(node: &Arc<Node>, forced: bool) -> Result<(u64, u64), Stat
     if node.is_stopping() {
         return Err(Status::unavailable("shutting down"));
     }
+    if node.role() == Role::Removed {
+        return Err(node.refuse("not a member of the group"));
+    }
     if !matches!(node.role(), Role::Replica | Role::Candidate | Role::Fenced) {
         return Err(node.refuse(format!("{:?}: already leading", node.role())));
     }
@@ -338,27 +478,62 @@ pub async fn campaign(node: &Arc<Node>, forced: bool) -> Result<(u64, u64), Stat
         })
         .collect();
     node.metrics.elections.inc();
-    let (granted, behind) = vote_round(node, &cfg, epoch, data_epoch, &heads, forced, true).await;
-    if forced && let Some(b) = behind {
+    // The pre-vote round, repeated on a membership a peer is ahead with
+    // (nothing is recorded there): the candidate adopts it and asks the
+    // members it names.
+    let mut members = node.members();
+    let ballot = Ballot {
+        epoch,
+        data_epoch,
+        heads: &heads,
+        forced,
+    };
+    let mut pre = None;
+    for _ in 0..3 {
+        let r = vote_round(node, &cfg, &members, &ballot, true).await;
+        match r.newer_members.clone() {
+            Some(m) => {
+                let n = node.clone();
+                let m2 = m.clone();
+                tokio::task::spawn_blocking(move || n.adopt_members(&m2))
+                    .await
+                    .map_err(|e| Status::internal(format!("members task: {e}")))??;
+                if node.role() == Role::Removed {
+                    return Err(node.refuse("not a member of the group (learned at the pre-vote)"));
+                }
+                members = m;
+            }
+            None => {
+                pre = Some(r);
+                break;
+            }
+        }
+    }
+    let Some(pre) = pre else {
+        return Err(node.refuse("the membership kept changing during the pre-vote"));
+    };
+    if forced && let Some(b) = pre.behind {
         return Err(node.refuse(format!("not up to date: {b}")));
     }
-    if granted + 1 < cfg.quorum() {
+    let quorum = members.quorum();
+    if pre.granted + 1 < quorum {
         return Err(node.refuse(format!(
-            "pre-vote at epoch {epoch}: {} of {} needed",
-            granted + 1,
-            cfg.quorum()
+            "pre-vote at epoch {epoch}: {} of {quorum} needed",
+            pre.granted + 1
         )));
     }
     let t0 = Instant::now();
-    let (granted, behind) = vote_round(node, &cfg, epoch, data_epoch, &heads, forced, false).await;
-    if forced && let Some(b) = behind {
+    let real = vote_round(node, &cfg, &members, &ballot, false).await;
+    if real.newer_members.is_some() {
+        return Err(node.refuse("a peer is ahead on the membership; campaigning again later"));
+    }
+    if forced && let Some(b) = real.behind {
         return Err(node.refuse(format!("not up to date: {b}")));
     }
-    if granted + 1 < cfg.quorum() {
+    if real.granted + 1 < quorum {
         return Err(node.refuse(format!(
-            "no majority at epoch {epoch}: {} of {} needed",
-            granted + 1,
-            cfg.quorum()
+            "no majority at epoch {epoch}: {} of {quorum} needed",
+            real.granted + 1
         )));
     }
     let n = node.clone();
@@ -405,9 +580,57 @@ async fn follow(node: &Arc<Node>, addr: &str) -> Result<(), Status> {
     Ok(())
 }
 
+/// Reconciles this node's membership with a sender's: a higher
+/// generation is adopted (persisted first), a lower one is refused with
+/// `Err(ours)`, an absent one (a sender before 0.5.0) changes nothing.
+/// Under the transition lock.
+async fn reconcile_members(node: &Arc<Node>, theirs: Option<&pb::Members>) -> Result<(), Members> {
+    let Some(theirs) = theirs.and_then(Members::from_wire) else {
+        return Ok(());
+    };
+    let ours = node.members();
+    if theirs.generation() > ours.generation() {
+        #[cfg(feature = "test-util")]
+        if node
+            .adopt_in_memory_only
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            node.install_members(theirs);
+            return Ok(());
+        }
+        let n = node.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || n.adopt_members(&theirs)).await {
+            tracing::error!(error = %e, "members task");
+        }
+        return Ok(());
+    }
+    if theirs.generation() < ours.generation() {
+        return Err(ours);
+    }
+    Ok(())
+}
+
+/// Whether `addr` may lead or campaign here: a member of the membership
+/// this node holds, or (for a heartbeat) the leader it already follows.
+fn member_check(node: &Node, addr: &str, already_followed_ok: bool) -> bool {
+    #[cfg(feature = "test-util")]
+    if node
+        .skip_member_check
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return true;
+    }
+    node.members().contains(addr)
+        || (already_followed_ok
+            && node.role().follows()
+            && node.leader_addr().as_deref() == Some(addr))
+}
+
 /// A peer's heartbeat: acknowledged when its epoch is at least this
-/// node's and at least the epoch it voted in. Acknowledging makes this
-/// node a replica of that leader (a leader at an older epoch is fenced
+/// node's and at least the epoch it voted in, its membership is not
+/// behind ours (a higher one is adopted first), and it is a member (or
+/// the leader this node already follows). Acknowledging makes this node
+/// a replica of that leader (a leader at an older epoch is fenced
 /// first); a replica already following it just records the time.
 pub async fn handle_heartbeat(
     node: &Arc<Node>,
@@ -435,8 +658,17 @@ pub async fn handle_heartbeat(
         epoch: node.floor_epoch(),
         leader_addr: node.leader_addr(),
         head: node.default_db().db.head(),
+        members: Some(node.members().to_wire()),
     };
     if req.epoch < node.floor_epoch() {
+        return Ok(answer(false, node));
+    }
+    if reconcile_members(node, req.members.as_ref()).await.is_err() {
+        tracing::info!(leader = %req.leader_addr, "heartbeat from a leader behind on the membership; refused");
+        return Ok(answer(false, node));
+    }
+    if !member_check(node, &req.leader_addr, true) {
+        tracing::warn!(leader = %req.leader_addr, "heartbeat from an address outside the membership; refused");
         return Ok(answer(false, node));
     }
     match node.role() {
@@ -456,10 +688,12 @@ pub async fn handle_heartbeat(
             node.record_heard(&req.leader_addr, req.epoch, ttl);
             follow(node, &req.leader_addr).await?;
         }
-        Role::Replica if node.leader_addr().as_deref() == Some(req.leader_addr.as_str()) => {
+        Role::Replica | Role::Removed
+            if node.leader_addr().as_deref() == Some(req.leader_addr.as_str()) =>
+        {
             node.record_heard(&req.leader_addr, req.epoch, ttl);
         }
-        Role::Replica | Role::Candidate | Role::Fenced => {
+        Role::Replica | Role::Removed | Role::Candidate | Role::Fenced => {
             node.record_heard(&req.leader_addr, req.epoch, ttl);
             follow(node, &req.leader_addr).await?;
         }
@@ -504,10 +738,24 @@ pub async fn handle_vote(
             granted: false,
             epoch: floor,
             reason,
+            members: Some(node.members().to_wire()),
         })
     };
     if req.epoch <= floor {
         return refuse(format!("stale: this node has promised epoch {floor}"));
+    }
+    if reconcile_members(node, req.members.as_ref()).await.is_err() {
+        return refuse("membership: the candidate is behind this node's".into());
+    }
+    if node.role() == Role::Removed {
+        return refuse("this node is not a member of the group".into());
+    }
+    if !member_check(node, &req.candidate_addr, false) {
+        return refuse(format!(
+            "not a member: {} is not in the membership (version {})",
+            req.candidate_addr,
+            node.members().version
+        ));
     }
     if let Some((e, who)) = node.lease().voted
         && e == req.epoch
@@ -554,6 +802,7 @@ pub async fn handle_vote(
             granted: true,
             epoch: floor,
             reason: String::new(),
+            members: Some(node.members().to_wire()),
         });
     }
     if node.role() == Role::Leader {
@@ -579,7 +828,144 @@ pub async fn handle_vote(
         granted: true,
         epoch: floor,
         reason: String::new(),
+        members: Some(node.members().to_wire()),
     })
+}
+
+/// One membership change on the leader: validated, persisted as the
+/// next generation, pushed with heartbeat rounds until committed or one
+/// lease has passed (pending is not an error). Serialised by
+/// `Node::member_changes`.
+pub async fn change_members(
+    node: &Arc<Node>,
+    change: pb::change_members_request::Change,
+    force: bool,
+) -> Result<(Members, bool), Status> {
+    let cfg = node.cluster.clone().ok_or_else(|| {
+        Status::failed_precondition("this node has no peers; start it with --peer")
+    })?;
+    let _one = node.member_changes.lock().await;
+    if node.role() != Role::Leader || !node.lease_held() {
+        return Err(node
+            .refuse("not the leader (or its lease expired); change the membership on the leader"));
+    }
+    let st = node.members_state();
+    if !st.committed {
+        let held = count_holding(node, &cfg, &st.current).await;
+        return Err(Status::failed_precondition(format!(
+            "a change to membership version {} is pending ({held} of {} members hold it); retry once `chron members` shows it committed",
+            st.current.version,
+            st.current.addrs.len()
+        )));
+    }
+    let mut next = st.current.clone();
+    next.epoch = node.data_epoch();
+    next.version += 1;
+    match change {
+        pb::change_members_request::Change::Add(addr) => {
+            let addr = valid_addr(&addr)?;
+            if next.contains(&addr) {
+                return Err(Status::already_exists(format!(
+                    "{addr} is a member already"
+                )));
+            }
+            if !force {
+                let following = node
+                    .default_db()
+                    .sync
+                    .snapshot(&st.current)
+                    .iter()
+                    .any(|f| f.peer == addr);
+                if !following {
+                    return Err(Status::failed_precondition(format!(
+                        "{addr} is not following this leader on `default`; start it with --peer {} and wait for `chron status` to show it connected, or add it with force",
+                        cfg.advertise
+                    )));
+                }
+            }
+            next.addrs.insert(addr);
+        }
+        pb::change_members_request::Change::Remove(addr) => {
+            let addr = valid_addr(&addr)?;
+            if !next.addrs.remove(&addr) {
+                return Err(Status::not_found(format!("{addr} is not a member")));
+            }
+            if next.addrs.is_empty() {
+                return Err(Status::failed_precondition(
+                    "the membership cannot be emptied",
+                ));
+            }
+        }
+    }
+    {
+        // Under the transition lock, so no heartbeat handler adopts or
+        // answers on a half-installed generation.
+        let _serial = node.transitions.lock().await;
+        if node.role() != Role::Leader || !node.lease_held() {
+            return Err(node.refuse("not the leader any more"));
+        }
+        let n = node.clone();
+        let m = next.clone();
+        tokio::task::spawn_blocking(move || n.propose_members(&m))
+            .await
+            .map_err(|e| Status::internal(format!("members task: {e}")))??;
+    }
+    tracing::info!(members = %next.oneline(), "membership change proposed");
+    // The new majority may exist already: the round decides.
+    let deadline = Instant::now() + cfg.lease_ttl;
+    loop {
+        heartbeat_round(node, &cfg).await;
+        let st = node.members_state();
+        if st.committed || st.current.generation() != next.generation() {
+            break;
+        }
+        if Instant::now() >= deadline || node.role() != Role::Leader {
+            break;
+        }
+        tokio::select! {
+            _ = node.cancel.cancelled() => break,
+            _ = tokio::time::sleep(tick(cfg.lease_ttl)) => {}
+        }
+    }
+    let st = node.members_state();
+    Ok((st.current.clone(), st.committed))
+}
+
+/// `http://host:port` or `https://...`, no whitespace.
+fn valid_addr(addr: &str) -> Result<String, Status> {
+    let a = addr.trim();
+    if a.is_empty()
+        || a.chars().any(char::is_whitespace)
+        || !(a.starts_with("http://") || a.starts_with("https://"))
+    {
+        return Err(Status::invalid_argument(format!(
+            "{addr:?} is not an advertised address (http://host:port or https://host:port)"
+        )));
+    }
+    Ok(a.to_string())
+}
+
+/// How many members of `m` answer a heartbeat at its generation right
+/// now (for the pending-change message).
+async fn count_holding(node: &Arc<Node>, cfg: &ClusterConfig, m: &Members) -> usize {
+    let req = pb::HeartbeatRequest {
+        epoch: node.data_epoch(),
+        leader_addr: cfg.advertise.clone(),
+        head: node.default_db().db.head(),
+        lease_ttl_ms: ms(cfg.lease_ttl),
+        members: Some(m.to_wire()),
+    };
+    let targets = m.others(&cfg.advertise);
+    let answers = futures_join(targets.iter().map(|peer| {
+        let req = req.clone();
+        async move { call(node, cfg, peer, |c| async move { c.heartbeat(req).await }).await }
+    }))
+    .await;
+    usize::from(m.contains(&cfg.advertise))
+        + answers
+            .iter()
+            .filter(|a| a.as_ref().is_ok_and(|r| r.ok))
+            .count()
 }
 
 fn cfg_advertise(node: &Node) -> String {
@@ -635,8 +1021,12 @@ pub fn discover(node: &Node) -> pb::DiscoverResponse {
         Role::Leader if node.lease_held() => Some(node.advertise()),
         Role::Leader => None,
         Role::Replica if node.cluster.is_none() => node.leader_addr(),
+        // A removed node hears no heartbeats; it names the leader it
+        // found and follows.
+        Role::Removed => node.leader_addr(),
         Role::Replica | Role::Candidate | Role::Fenced => node.heard_leader().map(|(a, _)| a),
     };
+    let members = node.members();
     pb::DiscoverResponse {
         leader_addr,
         epoch: node.data_epoch(),
@@ -644,10 +1034,12 @@ pub fn discover(node: &Node) -> pb::DiscoverResponse {
         peers: node
             .cluster
             .as_ref()
-            .map_or_else(Vec::new, |c| c.peers.clone()),
+            .map_or_else(Vec::new, |c| members.others(&c.advertise)),
         lease_remaining_ms: (role == Role::Leader)
             .then(|| node.lease_remaining().map(ms))
             .flatten(),
+        members_version: members.version,
+        members_epoch: members.epoch,
     }
 }
 

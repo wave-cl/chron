@@ -379,12 +379,23 @@ fn checkpoints_every_n_batches() {
         tmp().path(),
         always()
             .index_checkpoint_batches(usize::MAX)
-            .index_checkpoint_interval(Duration::from_millis(50)),
+            .index_checkpoint_interval(Duration::from_millis(300)),
     );
     commit_one(&db2, agg(1), Expected::Any, "a").unwrap();
-    std::thread::sleep(Duration::from_millis(80));
+    let after_a = db2.stats().index_checkpoints;
     commit_one(&db2, agg(1), Expected::Any, "b").unwrap();
-    assert_eq!(db2.stats().index_checkpoints, 1);
+    assert_eq!(
+        db2.stats().index_checkpoints,
+        after_a,
+        "within the interval"
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    commit_one(&db2, agg(1), Expected::Any, "c").unwrap();
+    assert_eq!(
+        db2.stats().index_checkpoints,
+        after_a + 1,
+        "past the interval"
+    );
 }
 
 #[test]

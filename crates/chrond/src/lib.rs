@@ -309,6 +309,13 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         if opts.peers.contains(&advertise) {
             anyhow::bail!("--peer lists this node's own address {advertise}");
         }
+        if let Some(p) = opts
+            .peers
+            .iter()
+            .find(|p| !(p.starts_with("http://") || p.starts_with("https://")))
+        {
+            anyhow::bail!("--peer {p:?} is not an http:// or https:// address");
+        }
         let sync_timeout = opts.sync_timeout.unwrap_or(opts.lease_ttl);
         if sync_timeout.is_zero() {
             anyhow::bail!("--sync-timeout 0 would answer every sync commit as unconfirmed");
@@ -321,7 +328,7 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
             );
         }
         Some(ClusterConfig {
-            peers: opts.peers.clone(),
+            seeds: opts.peers.clone(),
             advertise: advertise.clone(),
             token: opts.replicate_token.clone(),
             tls: opts.replicate_tls.clone(),
@@ -455,6 +462,7 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown),
     );
     if node.cluster.is_some() {
+        tracing::info!(members = %node.members().oneline(), "the group's membership");
         *node.cluster_task.lock().unwrap_or_else(|p| p.into_inner()) =
             Some(cluster::spawn(node.clone()));
         if opts.promote {
@@ -626,6 +634,53 @@ async fn open_all(node: &Arc<Node>) -> anyhow::Result<()> {
 /// a promoted replica, a fenced leader, or a leader.
 async fn settle_role(node: &Arc<Node>, opts: &Options) -> anyhow::Result<()> {
     let dir = opts.data_dir.display();
+    // The membership file wins over the flags once it exists; the flags
+    // seed it; a grouped directory refuses to start without them.
+    let file = node.read_members_file().map_err(|e| {
+        anyhow::anyhow!("{e}: not `epoch N / version N / member ADDR...`; fix or remove the file")
+    })?;
+    match (&file, &node.cluster) {
+        (Some(m), Some(c)) => {
+            let seeded: std::collections::BTreeSet<String> = opts
+                .peers
+                .iter()
+                .cloned()
+                .chain(std::iter::once(c.advertise.clone()))
+                .collect();
+            if seeded != m.addrs {
+                tracing::warn!(file = %m.oneline(), flags = %seeded.iter().cloned().collect::<Vec<_>>().join(","), "ignoring --peer: the members file is the membership");
+            }
+            node.install_members(m.clone());
+        }
+        (Some(m), None) => {
+            anyhow::bail!(
+                "{dir} belongs to a failover group (membership version {}: {}): start it with --peer, or remove {} to run it alone",
+                m.version,
+                m.addrs.iter().cloned().collect::<Vec<_>>().join(","),
+                node.marker(node::MEMBERS_FILE).display()
+            );
+        }
+        (None, Some(c)) => {
+            let m = node::Members {
+                epoch: 0,
+                version: 1,
+                addrs: opts
+                    .peers
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(c.advertise.clone()))
+                    .collect(),
+            };
+            let n = node.clone();
+            let m2 = m.clone();
+            tokio::task::spawn_blocking(move || n.persist_members(&m2))
+                .await
+                .context("members task")?
+                .context("write the members file")?;
+            node.install_members(m);
+        }
+        (None, None) => {}
+    }
     if node.cluster.is_some() {
         if let Some(text) = node.marker_text(node::VOTE_MARKER) {
             let v = node::parse_vote(&text).ok_or_else(|| {
@@ -653,6 +708,12 @@ async fn settle_role(node: &Arc<Node>, opts: &Options) -> anyhow::Result<()> {
             node.set_role(Role::Candidate);
             tracing::info!(
                 "starting as a candidate: following the first leader heard, or electing one"
+            );
+        }
+        if !node.is_member() {
+            node.set_role(Role::Removed);
+            tracing::warn!(
+                "not in the membership this directory holds: starting removed (reads only) until added"
             );
         }
         return Ok(());

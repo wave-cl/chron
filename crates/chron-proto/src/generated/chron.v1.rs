@@ -267,6 +267,79 @@ pub struct InfoResponse {
     /// them (--sync-commit majority).
     #[prost(bool, tag = "23")]
     pub sync_commit: bool,
+    /// The group's membership generation this node holds (see Members).
+    #[prost(uint64, tag = "24")]
+    pub members_version: u64,
+    #[prost(uint64, tag = "25")]
+    pub members_epoch: u64,
+    /// On a leader: whether that generation is committed (a majority of it
+    /// holds it and everything confirmed before it was made).
+    #[prost(bool, tag = "26")]
+    pub members_committed: bool,
+    /// Whether this node is in the membership.
+    #[prost(bool, tag = "27")]
+    pub member: bool,
+}
+/// The failover group's membership: the full set of advertised addresses,
+/// stamped with the epoch of the leader that published it and a version
+/// that rises by one per change. Generations order by (epoch, version);
+/// a node holding a lower one adopts a higher one it is sent, persisting
+/// it first, and refuses a sender holding a lower one.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Members {
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    #[prost(uint64, tag = "2")]
+    pub version: u64,
+    #[prost(string, repeated, tag = "3")]
+    pub addrs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetMembersRequest {}
+/// The membership as this node holds it. Open to any token.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetMembersResponse {
+    #[prost(message, optional, tag = "1")]
+    pub members: ::core::option::Option<Members>,
+    /// On a leader: whether the generation is committed.
+    #[prost(bool, tag = "2")]
+    pub committed: bool,
+    /// Whether this node is in it.
+    #[prost(bool, tag = "3")]
+    pub member: bool,
+    #[prost(string, optional, tag = "4")]
+    pub leader_addr: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Adds or removes one address, on the leader, one change at a time: the
+/// next generation is persisted here and pushed with the heartbeats, and
+/// is committed once a majority of the new membership has persisted it
+/// and durably holds everything this leader held when it was made. An
+/// added node must be following this leader unless `force`. An admin
+/// call. Not committed in time is not an error: GetMembers says when it
+/// is; a second change while one is pending is FAILED_PRECONDITION.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ChangeMembersRequest {
+    #[prost(bool, tag = "3")]
+    pub force: bool,
+    #[prost(oneof = "change_members_request::Change", tags = "1, 2")]
+    pub change: ::core::option::Option<change_members_request::Change>,
+}
+/// Nested message and enum types in `ChangeMembersRequest`.
+pub mod change_members_request {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Change {
+        #[prost(string, tag = "1")]
+        Add(::prost::alloc::string::String),
+        #[prost(string, tag = "2")]
+        Remove(::prost::alloc::string::String),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ChangeMembersResponse {
+    #[prost(message, optional, tag = "1")]
+    pub members: ::core::option::Option<Members>,
+    #[prost(bool, tag = "2")]
+    pub committed: bool,
 }
 /// One follower as the leader sees it.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -332,9 +405,14 @@ pub struct HeartbeatRequest {
     pub head: u64,
     #[prost(uint64, tag = "4")]
     pub lease_ttl_ms: u64,
+    /// The leader's membership generation; a receiver behind it adopts it
+    /// (persisting it before acknowledging), one ahead refuses.
+    #[prost(message, optional, tag = "5")]
+    pub members: ::core::option::Option<Members>,
 }
 /// `ok` acknowledges the lease; `epoch` is the answering node's own, so a
-/// leader learns of a newer one.
+/// leader learns of a newer one; `members` is the answering node's
+/// membership, so a refused leader learns what it is behind.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HeartbeatResponse {
     #[prost(bool, tag = "1")]
@@ -345,6 +423,8 @@ pub struct HeartbeatResponse {
     pub leader_addr: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint64, tag = "4")]
     pub head: u64,
+    #[prost(message, optional, tag = "5")]
+    pub members: ::core::option::Option<Members>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DatabaseHead {
@@ -372,6 +452,9 @@ pub struct RequestVoteRequest {
     pub forced: bool,
     #[prost(bool, tag = "6")]
     pub pre_vote: bool,
+    /// The candidate's membership generation (see HeartbeatRequest).
+    #[prost(message, optional, tag = "7")]
+    pub members: ::core::option::Option<Members>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RequestVoteResponse {
@@ -383,6 +466,9 @@ pub struct RequestVoteResponse {
     /// Why the vote was refused, for the log.
     #[prost(string, tag = "3")]
     pub reason: ::prost::alloc::string::String,
+    /// The answering node's membership, for a candidate behind it.
+    #[prost(message, optional, tag = "4")]
+    pub members: ::core::option::Option<Members>,
 }
 /// The stored crc32 of the records at `positions`, so a copy of the
 /// database can find where its history parts from this one. An admin call.
@@ -424,6 +510,11 @@ pub struct DiscoverResponse {
     pub leader_addr: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint64, tag = "2")]
     pub epoch: u64,
+    /// The membership generation this node holds (see Members).
+    #[prost(uint64, tag = "6")]
+    pub members_version: u64,
+    #[prost(uint64, tag = "7")]
+    pub members_epoch: u64,
     #[prost(enumeration = "Role", tag = "3")]
     pub role: i32,
     #[prost(string, repeated, tag = "4")]
@@ -590,6 +681,10 @@ pub enum Role {
     /// With peers: no leader is known and this node holds no lease; writes
     /// are refused until a leader is elected or heard.
     Candidate = 4,
+    /// With peers: this node is not in the group's membership (removed, or
+    /// not yet added). It serves reads, follows the leader it hears without
+    /// voting or counting, never campaigns, and refuses writes.
+    Removed = 5,
 }
 impl Role {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -603,6 +698,7 @@ impl Role {
             Self::Replica => "ROLE_REPLICA",
             Self::Fenced => "ROLE_FENCED",
             Self::Candidate => "ROLE_CANDIDATE",
+            Self::Removed => "ROLE_REMOVED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -613,6 +709,7 @@ impl Role {
             "ROLE_REPLICA" => Some(Self::Replica),
             "ROLE_FENCED" => Some(Self::Fenced),
             "ROLE_CANDIDATE" => Some(Self::Candidate),
+            "ROLE_REMOVED" => Some(Self::Removed),
             _ => None,
         }
     }
@@ -642,8 +739,10 @@ pub mod chron_client {
     /// failures are INTERNAL. A write refused because of the node's role or
     /// epoch is FAILED_PRECONDITION with the metadata `chron-epoch`. A missing
     /// or wrong bearer token is UNAUTHENTICATED; an administrative call
-    /// (Promote, Fence, Retain, Backup, ApplyBackup, Replicate) without the
-    /// admin token, when the daemon has one, is PERMISSION_DENIED. A
+    /// (Promote, Fence, Retain, Backup, ApplyBackup, Replicate, Follow,
+    /// FetchBackup, Fingerprints, ChangeMembers, the database calls and the
+    /// daemon-to-daemon Heartbeat and RequestVote) without the admin token,
+    /// when the daemon has one, is PERMISSION_DENIED. A
     /// replication stream meets a transaction larger than the message limit
     /// with RESOURCE_EXHAUSTED. Subscribe and Replicate end with UNAVAILABLE
     /// when the daemon is fenced or stops.
@@ -1027,6 +1126,53 @@ pub mod chron_client {
             req.extensions_mut().insert(GrpcMethod::new("chron.v1.Chron", "Fence"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_members(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetMembersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetMembersResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/GetMembers",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("chron.v1.Chron", "GetMembers"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn change_members(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ChangeMembersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ChangeMembersResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/ChangeMembers",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("chron.v1.Chron", "ChangeMembers"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn create_database(
             &mut self,
             request: impl tonic::IntoRequest<super::CreateDatabaseRequest>,
@@ -1349,6 +1495,20 @@ pub mod chron_server {
             &self,
             request: tonic::Request<super::FenceRequest>,
         ) -> std::result::Result<tonic::Response<super::FenceResponse>, tonic::Status>;
+        async fn get_members(
+            &self,
+            request: tonic::Request<super::GetMembersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetMembersResponse>,
+            tonic::Status,
+        >;
+        async fn change_members(
+            &self,
+            request: tonic::Request<super::ChangeMembersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ChangeMembersResponse>,
+            tonic::Status,
+        >;
         async fn create_database(
             &self,
             request: tonic::Request<super::CreateDatabaseRequest>,
@@ -1440,8 +1600,10 @@ pub mod chron_server {
     /// failures are INTERNAL. A write refused because of the node's role or
     /// epoch is FAILED_PRECONDITION with the metadata `chron-epoch`. A missing
     /// or wrong bearer token is UNAUTHENTICATED; an administrative call
-    /// (Promote, Fence, Retain, Backup, ApplyBackup, Replicate) without the
-    /// admin token, when the daemon has one, is PERMISSION_DENIED. A
+    /// (Promote, Fence, Retain, Backup, ApplyBackup, Replicate, Follow,
+    /// FetchBackup, Fingerprints, ChangeMembers, the database calls and the
+    /// daemon-to-daemon Heartbeat and RequestVote) without the admin token,
+    /// when the daemon has one, is PERMISSION_DENIED. A
     /// replication stream meets a transaction larger than the message limit
     /// with RESOURCE_EXHAUSTED. Subscribe and Replicate end with UNAVAILABLE
     /// when the daemon is fenced or stops.
@@ -2168,6 +2330,94 @@ pub mod chron_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = FenceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/GetMembers" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetMembersSvc<T: Chron>(pub Arc<T>);
+                    impl<T: Chron> tonic::server::UnaryService<super::GetMembersRequest>
+                    for GetMembersSvc<T> {
+                        type Response = super::GetMembersResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetMembersRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::get_members(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetMembersSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/ChangeMembers" => {
+                    #[allow(non_camel_case_types)]
+                    struct ChangeMembersSvc<T: Chron>(pub Arc<T>);
+                    impl<
+                        T: Chron,
+                    > tonic::server::UnaryService<super::ChangeMembersRequest>
+                    for ChangeMembersSvc<T> {
+                        type Response = super::ChangeMembersResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ChangeMembersRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::change_members(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ChangeMembersSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

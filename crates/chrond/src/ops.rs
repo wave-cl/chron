@@ -248,6 +248,17 @@ pub async fn commit(
     result
 }
 
+/// The membership as this node holds it.
+pub fn members(node: &Node) -> pb::GetMembersResponse {
+    let st = node.members_state();
+    pb::GetMembersResponse {
+        members: Some(st.current.to_wire()),
+        committed: st.committed,
+        member: node.is_member(),
+        leader_addr: crate::cluster::discover(node).leader_addr,
+    }
+}
+
 /// What `Info` reports about one database.
 pub async fn info(node: &Node, dbn: &DbNode) -> Result<pb::InfoResponse, Status> {
     let info = blocking(&dbn.db, "info", |db| db.info()).await?;
@@ -259,6 +270,7 @@ pub async fn info(node: &Node, dbn: &DbNode) -> Result<pb::InfoResponse, Status>
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
+    let members = node.members_state();
     Ok(pb::InfoResponse {
         path: dbn.db.path().display().to_string(),
         database: dbn.name.clone(),
@@ -279,16 +291,20 @@ pub async fn info(node: &Node, dbn: &DbNode) -> Result<pb::InfoResponse, Status>
         peers: node
             .cluster
             .as_ref()
-            .map_or_else(Vec::new, |c| c.peers.clone()),
+            .map_or_else(Vec::new, |c| members.current.others(&c.advertise)),
         voted_epoch: node.lease().voted.map(|(e, _)| e),
         majority_applied: (role == Role::Leader && node.cluster.is_some())
             .then(|| dbn.sync.majority()),
         followers: if role == Role::Leader && node.cluster.is_some() {
-            dbn.sync.snapshot()
+            dbn.sync.snapshot(&members.current)
         } else {
             Vec::new()
         },
         sync_commit: node.wants_sync(None),
+        members_version: members.current.version,
+        members_epoch: members.current.epoch,
+        members_committed: members.committed,
+        member: node.is_member(),
         replica_connected: is_replica && replica.connected,
         leader_head: replica.leader_head.filter(|_| is_replica),
         last_replication_error: replica

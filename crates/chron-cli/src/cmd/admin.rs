@@ -49,14 +49,18 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
     if let Some(by) = i.fenced_by {
         human.push_str(&format!("\nfenced_by {by}"));
     }
-    if !i.peers.is_empty() {
+    if !i.peers.is_empty() || i.role == chron_client::Role::Removed {
         human.push_str(&format!(
-            "\nleader {}  lease_remaining {}  voted_epoch {}\npeers {}\nsync_commit {}  majority_applied {}",
+            "\nleader {}  lease_remaining {}  voted_epoch {}\npeers {}\nmembers_version {} (epoch {})  committed {}  member {}\nsync_commit {}  majority_applied {}",
             i.leader_addr.as_deref().unwrap_or("none"),
             i.lease_remaining
                 .map_or("-".to_string(), |d| format!("{} ms", d.as_millis())),
             i.voted_epoch.map_or("-".to_string(), |e| e.to_string()),
             i.peers.join(","),
+            i.members_version,
+            i.members_epoch,
+            i.members_committed,
+            i.member,
             if i.sync_commit { "majority" } else { "off" },
             i.majority_applied
                 .map_or("-".to_string(), |m| m.to_string())
@@ -86,6 +90,8 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
             "followers": i.followers.iter().map(|f| json!({
                 "peer": f.peer, "applied": f.applied, "durable": f.durable, "counted": f.counted,
             })).collect::<Vec<_>>(),
+            "members_version": i.members_version, "members_epoch": i.members_epoch,
+            "members_committed": i.members_committed, "member": i.member,
         }),
     );
     Ok(())
@@ -108,7 +114,7 @@ pub async fn discover(conn: &Conn, format: Format) -> anyhow::Result<()> {
                 print_value(
                     format,
                     format!(
-                        "{addr}: leader {}  role {}  epoch {}  lease_remaining {}  peers {}",
+                        "{addr}: leader {}  role {}  epoch {}  lease_remaining {}  peers {}  members_version {}",
                         d.leader_addr.as_deref().unwrap_or("none"),
                         d.role,
                         d.epoch,
@@ -118,12 +124,13 @@ pub async fn discover(conn: &Conn, format: Format) -> anyhow::Result<()> {
                             "none".to_string()
                         } else {
                             d.peers.join(",")
-                        }
+                        },
+                        d.members_version
                     ),
                     json!({
                         "node": addr, "leader_addr": d.leader_addr, "role": d.role.to_string(),
                         "epoch": d.epoch, "lease_remaining_ms": d.lease_remaining.map(|l| l.as_millis() as u64),
-                        "peers": d.peers,
+                        "peers": d.peers, "members_version": d.members_version, "members_epoch": d.members_epoch,
                     }),
                 );
             }
@@ -255,6 +262,82 @@ pub async fn promote(conn: &Conn, format: Format) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn members_human(
+    m: &chron_client::Members,
+    committed: Option<bool>,
+    member: Option<bool>,
+) -> String {
+    let mut s = format!("version {} (epoch {})", m.version, m.epoch);
+    if let Some(c) = committed {
+        s.push_str(&format!("  committed {}", if c { "yes" } else { "no" }));
+    }
+    if let Some(mem) = member {
+        s.push_str(&format!("  member {}", if mem { "yes" } else { "no" }));
+    }
+    for a in &m.addrs {
+        s.push_str(&format!("\nmember {a}"));
+    }
+    s
+}
+
+fn members_value(m: &chron_client::Members) -> serde_json::Value {
+    json!({ "epoch": m.epoch, "version": m.version, "addrs": m.addrs })
+}
+
+pub async fn members(conn: &Conn, format: Format) -> anyhow::Result<()> {
+    let m = client::connect_one(conn, &conn.addrs()[0])
+        .await?
+        .members()
+        .await?;
+    print_value(
+        format,
+        members_human(&m.members, Some(m.committed), Some(m.member)),
+        json!({ "members": members_value(&m.members), "committed": m.committed, "member": m.member, "leader_addr": m.leader_addr }),
+    );
+    Ok(())
+}
+
+pub async fn members_add(
+    conn: &Conn,
+    format: Format,
+    addr: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    let (m, committed) = client::connect(conn).await?.add_member(addr, force).await?;
+    print_value(
+        format,
+        format!(
+            "{}\n{}",
+            if committed {
+                "committed"
+            } else {
+                "pending: `chron members` says when it is committed"
+            },
+            members_human(&m, Some(committed), None)
+        ),
+        json!({ "members": members_value(&m), "committed": committed }),
+    );
+    Ok(())
+}
+
+pub async fn members_remove(conn: &Conn, format: Format, addr: &str) -> anyhow::Result<()> {
+    let (m, committed) = client::connect(conn).await?.remove_member(addr).await?;
+    print_value(
+        format,
+        format!(
+            "{}\n{}",
+            if committed {
+                "committed"
+            } else {
+                "pending: `chron members` says when it is committed"
+            },
+            members_human(&m, Some(committed), None)
+        ),
+        json!({ "members": members_value(&m), "committed": committed }),
+    );
+    Ok(())
+}
+
 pub async fn fence(conn: &Conn, format: Format, epoch: u64) -> anyhow::Result<()> {
     let own = client::connect(conn).await?.fence(epoch).await?;
     print_value(
@@ -339,6 +422,12 @@ pub async fn status(conn: &Conn, format: Format, a: StatusArgs) -> anyhow::Resul
                 .unwrap_or_default()
         ));
     }
+    if i.role == chron_client::Role::Removed {
+        reasons.push(format!(
+            "removed from the group (membership version {}); add it with `chron members add`, or stop it",
+            i.members_version
+        ));
+    }
     if i.role == chron_client::Role::Leader && i.lease_remaining == Some(std::time::Duration::ZERO)
     {
         reasons.push("the majority lease has expired; writes are refused".to_string());
@@ -378,13 +467,14 @@ pub async fn status(conn: &Conn, format: Format, a: StatusArgs) -> anyhow::Resul
     if let Some(by) = i.fenced_by {
         human.push_str(&format!("\nfenced_by {by}"));
     }
-    if !i.peers.is_empty() {
+    if !i.peers.is_empty() || i.role == chron_client::Role::Removed {
         human.push_str(&format!(
-            "\nleader {}  lease_remaining {}  peers {}",
+            "\nleader {}  lease_remaining {}  members {} (version {})",
             i.leader_addr.as_deref().unwrap_or("none"),
             i.lease_remaining
                 .map_or("-".to_string(), |d| format!("{} ms", d.as_millis())),
-            i.peers.len()
+            i.peers.len() + usize::from(i.member),
+            i.members_version
         ));
     }
     human.push_str(&format!(
@@ -405,6 +495,7 @@ pub async fn status(conn: &Conn, format: Format, a: StatusArgs) -> anyhow::Resul
             "last_replication_error": i.last_replication_error, "fenced_by": i.fenced_by,
             "leader_addr": i.leader_addr, "lease_remaining_ms": i.lease_remaining.map(|d| d.as_millis() as u64),
             "peers": i.peers, "voted_epoch": i.voted_epoch,
+            "members_version": i.members_version, "member": i.member,
             "healthy": healthy, "reasons": reasons,
         }),
     );

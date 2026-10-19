@@ -803,3 +803,49 @@ async fn the_gateway_takes_commit_id_and_answers_duplicate() {
     );
     s.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_members_routes_answer() {
+    let s = Server::start_with(|o| {
+        with_http(o);
+        o.token = Some("user".into());
+        o.admin_token = Some("admin".into());
+    })
+    .await;
+    let addr = s.running.as_ref().unwrap().http_addr.unwrap();
+    let user = vec![("Authorization", "Bearer user".to_string())];
+    let admin = vec![("Authorization", "Bearer admin".to_string())];
+    let (code, v, _) = call(addr, "GET", "/v1/members".into(), user.clone(), None).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["members"]["version"], 0, "no peers: no group");
+    assert_eq!(v["member"], true);
+    let body = json!({"add": "http://x:1"}).to_string();
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/members".into(),
+        user.clone(),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!((code, v["code"].as_str()), (403, Some("PermissionDenied")));
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/members".into(),
+        admin.clone(),
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (409, Some("FailedPrecondition")),
+        "no peers: {v}"
+    );
+    let both = json!({"add": "http://x:1", "remove": "http://y:1"}).to_string();
+    let (code, _, _) = call(addr, "POST", "/v1/members".into(), admin, Some(both)).await;
+    assert_eq!(code, 400);
+    let (code, v, _) = call(addr, "GET", "/v1/status".into(), user, None).await;
+    assert_eq!((code, v["member"].as_bool()), (200, Some(true)));
+    s.stop().await;
+}
