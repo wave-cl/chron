@@ -6,6 +6,10 @@ crates share one version.
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.4.0 - 2026-10-19
+
 ### chron-proto
 
 - `Follow`: replication with acknowledgments (a `FollowRequest` stream
