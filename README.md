@@ -720,9 +720,10 @@ or an expired lease. The metrics are `chron_role{role="candidate"}`,
 - Forward pages (iterators, subscriptions, the daemon's streams) are
   bounded by `Options::page_max_bytes` (4 MiB) as well as by records;
   backward pages are bounded by records only.
-- An incremental apply or replication chunk interrupted mid-way (a crash
-  between the segment write and the index commit) is rolled back on the
-  next open; the caller retries from the head the error reports.
+- An incremental apply or replication chunk interrupted mid-way is
+  finished from the segment on the next open: the complete transactions
+  it synced are replayed into the index and a torn trailing one is cut;
+  the caller resumes from the head the open reports.
 - Per-database options (fsync, record limit) are daemon-wide, and
   `default` cannot be dropped.
 - With `--sync-commit off`, or `sync=false` on a request, a failover
