@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chron_client::{ClientConfig, ClientError, Expected, NewEvent, Role, Transaction};
+use chron_client::{Client, ClientConfig, ClientError, Expected, NewEvent, Role, Transaction};
 use tokio_stream::StreamExt;
 
 use crate::common::*;
@@ -290,4 +290,52 @@ async fn fetch_backup_to_writes_a_restorable_archive() {
     let again = f.client.fetch_backup_to(&path).await.unwrap();
     assert_eq!(again.head, 3);
     assert!(!f.dir.path().join("fetched.chronbak.tmp").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_commit_id_is_sent_and_a_resend_is_a_duplicate() {
+    let f = Fixture::start().await;
+    let txn = || {
+        let mut t = Transaction::new();
+        t.append(agg(1), Expected::New, vec![NewEvent::new("a0")]);
+        t.append_free(vec![NewEvent::new("f")]);
+        t
+    };
+    let options = chron_client::CommitOptions {
+        commit_id: Some([2; 16]),
+        ..Default::default()
+    };
+    let c = f.client.commit_with(txn(), options).await.unwrap();
+    assert_eq!((c.first, c.next, c.duplicate), (0, 2, false));
+    let again = f.client.commit_with(txn(), options).await.unwrap();
+    assert_eq!((again.first, again.next, again.duplicate), (0, 2, true));
+    assert_eq!(again.appends, c.appends);
+    assert_eq!(f.client.head().await.unwrap(), 2);
+    let events = f.client.read_all(0, 0).await.unwrap();
+    assert_eq!(events[0].commit_id, Some([2; 16]));
+    assert_eq!(events[1].commit_id, None);
+    // A client-chosen id is on by default and visible on the record.
+    let c2 = f.client.commit(txn_free("auto")).await.unwrap();
+    let events = f.client.read_all(c2.first, 1).await.unwrap();
+    assert!(events[0].commit_id.is_some());
+    // Off: no id on the record.
+    let plain = Client::connect(
+        format!("http://{}", f.addr()),
+        ClientConfig {
+            commit_ids: false,
+            ..ClientConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let c3 = plain.commit(txn_free("plain")).await.unwrap();
+    let events = plain.read_all(c3.first, 1).await.unwrap();
+    assert_eq!(events[0].commit_id, None);
+    f.stop().await;
+}
+
+fn txn_free(payload: &str) -> Transaction {
+    let mut t = Transaction::new();
+    t.append_free(vec![NewEvent::new(payload.to_string())]);
+    t
 }

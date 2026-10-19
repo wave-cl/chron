@@ -267,6 +267,7 @@ pub async fn fill(client: &mut ChronClient<Channel>, aggregate: Uuid, n: usize) 
                 )],
                 epoch: None,
                 sync: None,
+                commit_id: Vec::new(),
             })
             .await
             .unwrap();

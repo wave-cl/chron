@@ -3,8 +3,8 @@
 
 use bytes::Bytes;
 use chron::{
-    AppendResult, BackupKind, BackupMeta, Committed, Event, Expected, FLAG_FIRST_IN_TXN, FLAG_FREE,
-    FLAG_LAST_IN_TXN, NewEvent, Retained, Uuid,
+    AppendResult, BackupKind, BackupMeta, Committed, Event, Expected, FLAG_COMMIT_ID,
+    FLAG_FIRST_IN_TXN, FLAG_FREE, FLAG_LAST_IN_TXN, NewEvent, Retained, Uuid,
 };
 
 use crate::v1 as pb;
@@ -14,12 +14,15 @@ use crate::v1 as pb;
 pub enum ConvertError {
     /// An aggregate field of this many bytes, where 16 were needed.
     Aggregate(usize),
+    /// A commit id of this many bytes, where 16 (or none) were needed.
+    CommitId(usize),
 }
 
 impl std::fmt::Display for ConvertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConvertError::Aggregate(n) => write!(f, "aggregate must be 16 bytes, got {n}"),
+            ConvertError::CommitId(n) => write!(f, "commit_id must be 16 bytes, got {n}"),
         }
     }
 }
@@ -30,6 +33,17 @@ impl From<ConvertError> for tonic::Status {
     fn from(e: ConvertError) -> Self {
         tonic::Status::invalid_argument(e.to_string())
     }
+}
+
+/// A wire commit id: empty means none, sixteen bytes an id, anything
+/// else [`ConvertError::CommitId`].
+pub fn commit_id_from_wire(bytes: &[u8]) -> Result<Option<[u8; 16]>, ConvertError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    <[u8; 16]>::try_from(bytes)
+        .map(Some)
+        .map_err(|_| ConvertError::CommitId(bytes.len()))
 }
 
 /// Sixteen bytes, or [`ConvertError::Aggregate`].
@@ -51,6 +65,7 @@ pub fn event_to_wire(ev: Event) -> pb::Event {
         tags: ev.tags.into_iter().map(|t| t.to_vec()).collect(),
         metadata: ev.metadata.to_vec(),
         payload: ev.payload.to_vec(),
+        commit_id: ev.commit_id.map(|i| i.to_vec()),
     }
 }
 
@@ -66,12 +81,20 @@ pub fn event_from_wire(ev: pb::Event) -> Result<Event, ConvertError> {
     if aggregate.is_none() {
         flags |= FLAG_FREE;
     }
+    let commit_id = match ev.commit_id.as_deref() {
+        None => None,
+        Some(bytes) => commit_id_from_wire(bytes)?,
+    };
+    if commit_id.is_some() {
+        flags |= FLAG_COMMIT_ID;
+    }
     Ok(Event {
         position: ev.position,
         aggregate,
         index: if aggregate.is_some() { ev.index } else { 0 },
         recorded_at: ev.recorded_at_unix_nanos,
         flags,
+        commit_id,
         tags: ev.tags.into_iter().map(Bytes::from).collect(),
         metadata: Bytes::from(ev.metadata),
         payload: Bytes::from(ev.payload),
@@ -155,6 +178,7 @@ pub fn committed_to_wire(c: Committed) -> pb::CommitResponse {
         last: c.last,
         next: c.next,
         appends: c.appends.iter().map(append_result_to_wire).collect(),
+        duplicate: c.duplicate,
     }
 }
 
@@ -168,6 +192,7 @@ pub fn committed_from_wire(c: pb::CommitResponse) -> Result<Committed, ConvertEr
             .into_iter()
             .map(append_result_from_wire)
             .collect::<Result<_, _>>()?,
+        duplicate: c.duplicate,
     })
 }
 
@@ -252,6 +277,7 @@ mod tests {
             index: 3,
             recorded_at: -1,
             flags: FLAG_FIRST_IN_TXN,
+            commit_id: None,
             tags: vec![Bytes::from_static(b"t")],
             metadata: Bytes::from_static(b"m"),
             payload: Bytes::from_static(b"p"),
@@ -272,9 +298,23 @@ mod tests {
             ..owned
         };
         assert_eq!(event_from_wire(event_to_wire(both.clone())).unwrap(), both);
-        let mut bad = event_to_wire(both);
+        let mut bad = event_to_wire(both.clone());
         bad.aggregate = Some(vec![1; 17]);
         assert_eq!(event_from_wire(bad), Err(ConvertError::Aggregate(17)));
+        let with_id = Event {
+            flags: FLAG_FIRST_IN_TXN | FLAG_COMMIT_ID,
+            commit_id: Some([3; 16]),
+            ..both
+        };
+        let wire = event_to_wire(with_id.clone());
+        assert_eq!(wire.commit_id.as_deref(), Some(&[3u8; 16][..]));
+        assert_eq!(event_from_wire(wire.clone()).unwrap(), with_id);
+        let mut short = wire;
+        short.commit_id = Some(vec![3; 15]);
+        assert_eq!(event_from_wire(short), Err(ConvertError::CommitId(15)));
+        assert_eq!(commit_id_from_wire(&[]), Ok(None));
+        assert_eq!(commit_id_from_wire(&[1; 16]), Ok(Some([1; 16])));
+        assert_eq!(commit_id_from_wire(&[1; 3]), Err(ConvertError::CommitId(3)));
     }
 
     #[test]
@@ -299,6 +339,7 @@ mod tests {
                     new_len: 0,
                 },
             ],
+            duplicate: true,
         };
         assert_eq!(
             committed_from_wire(committed_to_wire(c.clone())).unwrap(),

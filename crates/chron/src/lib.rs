@@ -39,8 +39,8 @@ pub use bytes::Bytes;
 pub use db::{Db, EventIter, Info, Stats, WriterHold};
 pub use error::{Error, Result};
 pub use event::{
-    Event, FLAG_FIRST_IN_TXN, FLAG_FREE, FLAG_LAST_IN_TXN, MAX_TAG_BYTES, MAX_TAGS_PER_EVENT,
-    NewEvent,
+    Event, FLAG_COMMIT_ID, FLAG_FIRST_IN_TXN, FLAG_FREE, FLAG_LAST_IN_TXN, MAX_TAG_BYTES,
+    MAX_TAGS_PER_EVENT, NewEvent,
 };
 pub use options::{Fsync, Options};
 pub use rebuild::Rebuilt;

@@ -201,13 +201,15 @@ pub async fn commit(
     appends: Vec<pb::Append>,
     epoch: Option<u64>,
     sync: Option<bool>,
+    commit_id: Option<[u8; 16]>,
 ) -> Result<Committed, Status> {
     let start = std::time::Instant::now();
     let n = node.clone();
     let d = dbn.clone();
-    let mut result = tokio::task::spawn_blocking(move || n.commit_guarded(&d, appends, epoch))
-        .await
-        .map_err(|e| codec::join("commit", e))?;
+    let mut result =
+        tokio::task::spawn_blocking(move || n.commit_guarded(&d, appends, epoch, commit_id))
+            .await
+            .map_err(|e| codec::join("commit", e))?;
     if let Ok(c) = &result
         && node.wants_sync(sync)
     {

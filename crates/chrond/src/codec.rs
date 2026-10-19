@@ -11,6 +11,12 @@ pub use chron_proto::convert::{
     options_to_wire as options,
 };
 
+/// A wire commit id: empty is none; anything but 16 bytes is
+/// INVALID_ARGUMENT.
+pub fn commit_id(bytes: &[u8]) -> Result<Option<[u8; 16]>, Status> {
+    convert::commit_id_from_wire(bytes).map_err(Status::from)
+}
+
 /// Adds one wire append to a transaction. A free append may not carry an
 /// expectation other than `any`.
 pub fn apply_append(txn: &mut Transaction, a: pb::Append) -> Result<(), Status> {
@@ -70,6 +76,7 @@ pub fn status(e: Error) -> Status {
         Error::EmptyTransaction
         | Error::EmptyAppend { .. }
         | Error::RecordTooLarge { .. }
+        | Error::CommitIdReused { .. }
         | Error::InvalidTag(_) => Status::invalid_argument(e.to_string()),
         Error::PositionOutOfRange { position, head } => {
             let mut s = Status::out_of_range(e.to_string());

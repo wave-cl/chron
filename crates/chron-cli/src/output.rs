@@ -52,6 +52,12 @@ pub fn event_json(e: &Event) -> Value {
     obj.insert("index".into(), json!(e.index));
     obj.insert("recorded_at_unix_nanos".into(), json!(e.recorded_at));
     obj.insert("first_in_txn".into(), json!(e.is_first_in_txn()));
+    if let Some(id) = e.commit_id {
+        obj.insert(
+            "commit_id".into(),
+            Value::String(chron::Uuid::from_bytes(id).to_string()),
+        );
+    }
     obj.insert("last_in_txn".into(), json!(e.is_last_in_txn()));
     let (text, binary): (Vec<&[u8]>, Vec<&[u8]>) = e
         .tags
@@ -128,11 +134,18 @@ pub fn print_commit(format: Format, c: &Committed) {
                 .collect();
             println!(
                 "{}",
-                json!({ "first": c.first, "last": c.last, "next": c.next, "appends": appends })
+                json!({ "first": c.first, "last": c.last, "next": c.next, "appends": appends, "duplicate": c.duplicate })
             );
         }
         Format::Human => {
-            println!("committed {}..{} (next {})", c.first, c.last, c.next);
+            if c.duplicate {
+                println!(
+                    "already committed {}..{} (next {}); nothing written",
+                    c.first, c.last, c.next
+                );
+            } else {
+                println!("committed {}..{} (next {})", c.first, c.last, c.next);
+            }
             for a in &c.appends {
                 println!(
                     "  {}  first {}  index {}  count {}  len {}",

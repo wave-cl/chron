@@ -21,6 +21,10 @@ pub struct Event {
     pub metadata: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "9")]
     pub payload: ::prost::alloc::vec::Vec<u8>,
+    /// The 16-byte commit id the writer gave the transaction, on its first
+    /// event only.
+    #[prost(bytes = "vec", optional, tag = "10")]
+    pub commit_id: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NewEvent {
@@ -80,10 +84,19 @@ pub struct CommitRequest {
     /// landed locally but was not confirmed by a majority within the sync
     /// timeout, or before the node stopped leading, is DEADLINE_EXCEEDED
     /// with the metadata `chron-committed-first` and `chron-committed-next`:
-    /// it is on this node's disk and replicates unless the node dies; do not
-    /// resend it blindly.
+    /// it is on this node's disk and replicates unless the node dies. Resend
+    /// it with the same commit_id, or check before resending it without one.
     #[prost(bool, optional, tag = "3")]
     pub sync: ::core::option::Option<bool>,
+    /// Sixteen bytes chosen by the writer, or empty. A later commit with the
+    /// same id and the same events' aggregates is answered with the first
+    /// one's positions and `duplicate = true`, nothing written, whatever its
+    /// expectations and payloads; the same id on another shape is
+    /// INVALID_ARGUMENT. Stored in the transaction's first record (a 0.4.0
+    /// daemon cannot read it). Ids of transactions dropped by retention or
+    /// truncation are forgotten.
+    #[prost(bytes = "vec", tag = "4")]
+    pub commit_id: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AppendResult {
@@ -110,6 +123,10 @@ pub struct CommitResponse {
     pub next: u64,
     #[prost(message, repeated, tag = "4")]
     pub appends: ::prost::alloc::vec::Vec<AppendResult>,
+    /// The commit_id was seen before: these are the positions of the earlier
+    /// landing and nothing was written now.
+    #[prost(bool, tag = "5")]
+    pub duplicate: bool,
 }
 /// For every finite read, `limit` 0 means "to the end". Forward, `from` is
 /// the first index or position returned; backward, the inclusive upper

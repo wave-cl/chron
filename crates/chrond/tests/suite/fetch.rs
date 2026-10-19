@@ -19,6 +19,7 @@ async fn fill_bytes(s: &Server, n: usize, bytes: usize) {
             appends: vec![append(None, None, vec![new_event(&"x".repeat(bytes), &[])])],
             epoch: None,
             sync: None,
+            commit_id: Vec::new(),
         })
         .await
         .unwrap_or_else(|e| panic!("event {i}: {e}"));

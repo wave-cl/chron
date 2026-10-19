@@ -1,6 +1,7 @@
 mod common;
 
 mod backup;
+mod commit_ids;
 mod concurrency;
 mod crash;
 mod free;

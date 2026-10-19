@@ -71,6 +71,7 @@ async fn replica_refuses_writes_and_apply_but_backs_up_and_retains() {
             appends: vec![append(Some(agg(1)), any(), vec![new_event("x", &[])])],
             epoch: None,
             sync: None,
+            commit_id: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -180,6 +181,7 @@ async fn promotion_bumps_the_epoch_fences_the_old_leader_and_the_old_leader_rejo
             appends: vec![append(Some(agg(1)), any(), vec![new_event("late", &[])])],
             epoch: None,
             sync: None,
+            commit_id: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -287,6 +289,7 @@ async fn fencing_token_on_commit() {
         appends: vec![append(Some(agg(1)), any(), vec![new_event("x", &[])])],
         epoch,
         sync: None,
+        commit_id: Vec::new(),
     };
     s.client.commit(req(None)).await.unwrap();
     s.client.commit(req(Some(0))).await.unwrap();

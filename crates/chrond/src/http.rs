@@ -28,8 +28,8 @@ use tower::ServiceExt;
 
 use crate::auth::BearerAuth;
 use crate::http_json::{
-    ApiError, TxnJson, appends_from_json, committed_json, database_json, error_json, event_json,
-    info_json, retained_json, role_name,
+    ApiError, TxnJson, appends_from_json, commit_id_from_json, committed_json, database_json,
+    error_json, event_json, info_json, retained_json, role_name,
 };
 use crate::metrics::Metrics;
 use crate::node::{DbNode, Node};
@@ -241,8 +241,9 @@ async fn commit(
     let dbn = db(&st, &name)?;
     let Query(q) = q.map_err(bad)?;
     let Json(txn) = body.map_err(json_rejection)?;
+    let commit_id = commit_id_from_json(&txn)?;
     let appends = appends_from_json(txn)?;
-    let committed = ops::commit(&st.node, dbn, appends, q.epoch, q.sync).await?;
+    let committed = ops::commit(&st.node, dbn, appends, q.epoch, q.sync, commit_id).await?;
     Ok(Json(committed_json(&committed)))
 }
 

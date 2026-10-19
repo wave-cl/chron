@@ -13,10 +13,10 @@ use uuid::Uuid;
 use crate::db::{Db, Inner};
 use crate::error::{Error, Result};
 use crate::event::{
-    self, Event, FLAG_FIRST_IN_TXN, FLAG_FREE, FLAG_LAST_IN_TXN, MAX_TAG_BYTES, MAX_TAGS_PER_EVENT,
-    NewEvent,
+    self, Event, FLAG_COMMIT_ID, FLAG_FIRST_IN_TXN, FLAG_FREE, FLAG_LAST_IN_TXN, MAX_TAG_BYTES,
+    MAX_TAGS_PER_EVENT, NewEvent,
 };
-use crate::index::{AGG_INDEX, AGG_LEN, HEAD_KEY, META, POS, TAG};
+use crate::index::{AGG_INDEX, AGG_LEN, HEAD_KEY, Location, META, POS, TAG, TXN_ID};
 use crate::options::Fsync;
 use crate::segment::{self, FRAME_LEN, SegmentWriter};
 
@@ -55,10 +55,22 @@ pub(crate) struct PendingAppend {
 /// Appends are checked at [`commit`](Transaction::commit), in call order.
 /// The same aggregate may be appended to more than once; a later append's
 /// expectation is checked against the length the earlier ones leave.
+///
+/// A transaction given a [`commit_id`](Transaction::commit_id) can be
+/// resent: a later commit with the same id and the same shape (the same
+/// sequence of events' aggregates, with each append's events on one
+/// aggregate) is answered with the first landing's positions and
+/// [`Committed::duplicate`] set, whatever its expectations and payloads,
+/// and writes nothing. The same id on a transaction of another shape is
+/// [`Error::CommitIdReused`].
+/// Ids live in the records, so they survive restarts, rebuilds, restores
+/// and replication; truncation and retention forget the ids of the
+/// records they drop, after which a resend lands again.
 #[derive(Debug)]
 pub struct Transaction {
     db: Db,
     appends: Vec<PendingAppend>,
+    commit_id: Option<[u8; 16]>,
 }
 
 impl Transaction {
@@ -66,7 +78,16 @@ impl Transaction {
         Transaction {
             db,
             appends: Vec::new(),
+            commit_id: None,
         }
+    }
+
+    /// Gives the transaction an id, under which a resend is deduplicated
+    /// (see the type's documentation). Stored in the first record, so a
+    /// 0.4.0 binary cannot read a database holding one.
+    pub fn commit_id(&mut self, id: [u8; 16]) -> &mut Self {
+        self.commit_id = Some(id);
+        self
     }
 
     /// Appends `events` to `aggregate`, checked against `expected` at commit.
@@ -114,11 +135,11 @@ impl Transaction {
     /// Checks every expectation, writes every event, and commits. On any
     /// error nothing is written.
     pub fn commit(self) -> Result<Committed> {
-        commit(&self.db.inner, self.appends, Mode::Commit)
+        commit(&self.db.inner, self.appends, self.commit_id, Mode::Commit)
     }
 
-    pub(crate) fn into_parts(self) -> (Db, Vec<PendingAppend>) {
-        (self.db, self.appends)
+    pub(crate) fn into_parts(self) -> (Db, Vec<PendingAppend>, Option<[u8; 16]>) {
+        (self.db, self.appends, self.commit_id)
     }
 }
 
@@ -133,6 +154,9 @@ pub struct Committed {
     pub next: u64,
     /// One per `append` call, in call order.
     pub appends: Vec<AppendResult>,
+    /// The commit id was seen before: these are the positions of the
+    /// earlier landing and nothing was written now.
+    pub duplicate: bool,
 }
 
 /// What one `append` or `append_free` call received.
@@ -177,11 +201,12 @@ fn now_nanos() -> i64 {
 
 /// Checks the shape of a transaction before any lock is taken and returns
 /// an upper bound on its encoded size (tags are deduplicated later).
-fn check_shape(appends: &[PendingAppend], max_record: usize) -> Result<usize> {
+fn check_shape(appends: &[PendingAppend], has_id: bool, max_record: usize) -> Result<usize> {
     if appends.is_empty() {
         return Err(Error::EmptyTransaction);
     }
     let mut bytes = 0usize;
+    let mut first = has_id;
     for a in appends {
         if a.events.is_empty() {
             return Err(Error::EmptyAppend {
@@ -201,7 +226,9 @@ fn check_shape(appends: &[PendingAppend], max_record: usize) -> Result<usize> {
                     t.len()
                 )));
             }
-            let size = FRAME_LEN + event::body_len(&ev.tags, ev.metadata.len(), ev.payload.len());
+            let size =
+                FRAME_LEN + event::body_len(&ev.tags, ev.metadata.len(), ev.payload.len(), first);
+            first = false;
             if size > max_record || size > u32::MAX as usize {
                 return Err(Error::RecordTooLarge {
                     size,
@@ -221,7 +248,8 @@ fn check_shape(appends: &[PendingAppend], max_record: usize) -> Result<usize> {
 /// lock.
 /// Lands one batch of whole transactions, encoded back to back in `buf`:
 /// one segment write, one sync, one index commit. `txns` is how many
-/// transactions the batch holds, for the counters.
+/// transactions the batch holds, for the counters; `txn_ids` the commit
+/// ids the batch carries with each one's `(first, next)`.
 #[allow(clippy::too_many_arguments)]
 fn land(
     inner: &Inner,
@@ -230,13 +258,16 @@ fn land(
     buf: &[u8],
     entries: &[Entry],
     lens: &HashMap<Uuid, u64>,
+    txn_ids: &[([u8; 16], u64, u64)],
     new_head: u64,
     txns: u64,
 ) -> Result<()> {
     // Bytes first, synced before the index commit vouches for them.
     let base = w.base();
     let at = w.write_at_end(buf)?;
-    let landed = land_index(inner, w, wtxn, base, at, buf, entries, lens, new_head, txns);
+    let landed = land_index(
+        inner, w, wtxn, base, at, buf, entries, lens, txn_ids, new_head, txns,
+    );
     if landed.is_err() {
         // Leftover bytes past the logical end would survive a later,
         // shorter commit and a roll; cut them now.
@@ -255,6 +286,7 @@ fn land_index(
     buf: &[u8],
     entries: &[Entry],
     lens: &HashMap<Uuid, u64>,
+    txn_ids: &[([u8; 16], u64, u64)],
     new_head: u64,
     txns: u64,
 ) -> Result<()> {
@@ -292,6 +324,12 @@ fn land_index(
         for (id, len) in lens {
             agg_len.insert(id.as_bytes(), *len)?;
         }
+        if !txn_ids.is_empty() {
+            let mut ids = wtxn.open_table(TXN_ID)?;
+            for (id, first, next) in txn_ids {
+                ids.insert(id, (*first, *next))?;
+            }
+        }
         meta.insert(HEAD_KEY, new_head)?;
     }
     // Commit point.
@@ -321,6 +359,8 @@ struct Group {
     entries: Vec<Entry>,
     lens: HashMap<Uuid, u64>,
     new_head: u64,
+    /// The id on the transaction's first record, if any.
+    commit_id: Option<[u8; 16]>,
 }
 
 /// Appends `frames` (back-to-back `len, crc, body` records, as an
@@ -377,6 +417,7 @@ pub(crate) fn import_frames(
             entries: Vec::new(),
             lens: HashMap::new(),
             new_head: position,
+            commit_id: ev.commit_id,
         });
         if let Some(id) = ev.aggregate {
             let cur = match group.lens.get(&id).or_else(|| lens.get(&id)) {
@@ -426,6 +467,12 @@ pub(crate) fn import_frames(
 
     for g in groups {
         let wtxn = inner.index.begin_write()?;
+        let first = g.entries[0].position;
+        let ids: Vec<([u8; 16], u64, u64)> = g
+            .commit_id
+            .map(|id| (id, first, g.new_head))
+            .into_iter()
+            .collect();
         land(
             inner,
             &mut w,
@@ -433,6 +480,7 @@ pub(crate) fn import_frames(
             &frames[g.start..g.end],
             &g.entries,
             &g.lens,
+            &ids,
             g.new_head,
             1,
         )?;
@@ -443,6 +491,7 @@ pub(crate) fn import_frames(
 /// A transaction waiting to be landed by whoever holds the writer lock.
 pub(crate) struct Pending {
     appends: Vec<PendingAppend>,
+    commit_id: Option<[u8; 16]>,
     /// Upper bound on the encoded size, from `check_shape`.
     bytes: usize,
     slot: Arc<Slot>,
@@ -523,8 +572,13 @@ impl Slot {
 /// queued transaction in batches; a committer that finds the lock taken
 /// joins the queue and waits for its result, or for the lock to be
 /// handed to it.
-pub(crate) fn commit(inner: &Inner, appends: Vec<PendingAppend>, mode: Mode) -> Result<Committed> {
-    let bytes = check_shape(&appends, inner.opts.max_record_bytes)?;
+pub(crate) fn commit(
+    inner: &Inner,
+    appends: Vec<PendingAppend>,
+    commit_id: Option<[u8; 16]>,
+    mode: Mode,
+) -> Result<Committed> {
+    let bytes = check_shape(&appends, commit_id.is_some(), inner.opts.max_record_bytes)?;
 
     if mode == Mode::WriteWithoutCommit {
         let mut w = inner.lock_writer();
@@ -544,6 +598,7 @@ pub(crate) fn commit(inner: &Inner, appends: Vec<PendingAppend>, mode: Mode) -> 
         let mut position = head;
         let committed = encode_txn(
             appends,
+            commit_id,
             &plan.first_indices,
             now_nanos(),
             &mut position,
@@ -563,6 +618,7 @@ pub(crate) fn commit(inner: &Inner, appends: Vec<PendingAppend>, mode: Mode) -> 
         .unwrap_or_else(|p| p.into_inner())
         .push_back(Pending {
             appends,
+            commit_id,
             bytes,
             slot: slot.clone(),
         });
@@ -705,8 +761,10 @@ fn plan_txn(
 
 /// Encodes one transaction's records after the ones already in `buf`,
 /// advancing `position`, and returns what the committer is told.
+#[allow(clippy::too_many_arguments)]
 fn encode_txn(
     appends: Vec<PendingAppend>,
+    commit_id: Option<[u8; 16]>,
     first_indices: &[u64],
     recorded_at: i64,
     position: &mut u64,
@@ -732,6 +790,9 @@ fn encode_txn(
             let mut flags = if free { FLAG_FREE } else { 0 };
             if seq == 0 {
                 flags |= FLAG_FIRST_IN_TXN;
+                if commit_id.is_some() {
+                    flags |= FLAG_COMMIT_ID;
+                }
             }
             if seq + 1 == total {
                 flags |= FLAG_LAST_IN_TXN;
@@ -745,6 +806,7 @@ fn encode_txn(
                 index: if free { 0 } else { first_index + j as u64 },
                 recorded_at,
                 flags,
+                commit_id: if seq == 0 { commit_id } else { None },
                 tags,
                 metadata: ev.metadata,
                 payload: ev.payload,
@@ -770,14 +832,141 @@ fn encode_txn(
         last: *position - 1,
         next: *position,
         appends: results,
+        duplicate: false,
     }
+}
+
+/// The shape of a transaction: per append, the aggregate (`None` for a
+/// free append) and the event count. Two commits with one id must agree
+/// on it for the second to be a duplicate of the first.
+type Shape = Vec<(Option<Uuid>, u64)>;
+
+fn shape(appends: &[PendingAppend]) -> Shape {
+    appends
+        .iter()
+        .map(|a| (a.aggregate, a.events.len() as u64))
+        .collect()
+}
+
+/// Reads the records of the committed transaction at `first..next`, by
+/// the index's locations, checking each carries its position.
+fn read_committed(
+    inner: &Inner,
+    pos: &impl ReadableTable<u64, (u64, u64, u32)>,
+    first: u64,
+    next: u64,
+) -> Result<Vec<Event>> {
+    let mut out = Vec::with_capacity((next - first) as usize);
+    for p in first..next {
+        let loc: Location =
+            pos.get(p)?
+                .map(|v| v.value().into())
+                .ok_or_else(|| Error::Inconsistent {
+                    position: p,
+                    reason: "a commit id names it but the position table lacks it".into(),
+                })?;
+        let path = inner.layout.segment(loc.base);
+        let file = inner.file(loc.base)?;
+        let body = segment::read_record_at(
+            &file,
+            &path,
+            loc.offset,
+            loc.frame_len,
+            inner.opts.max_record_bytes,
+        )?;
+        let ev = event::decode_body(&body)
+            .map_err(|e| Error::corrupt(&path, loc.offset, e.to_string()))?;
+        if ev.position != p {
+            return Err(Error::corrupt(
+                &path,
+                loc.offset,
+                format!(
+                    "index points position {p} at a record carrying {}",
+                    ev.position
+                ),
+            ));
+        }
+        out.push(ev);
+    }
+    Ok(out)
+}
+
+/// What a resend with a known id is told: the first landing's result,
+/// rebuilt from its records and the resend's append shape, which must
+/// match the records (same aggregates, same counts, in order).
+fn reconstruct(
+    id: [u8; 16],
+    first: u64,
+    next: u64,
+    recs: &[Event],
+    appends: &[PendingAppend],
+) -> Result<Committed> {
+    let reused = |reason: String| Error::CommitIdReused {
+        id,
+        first,
+        next,
+        reason,
+    };
+    let total: u64 = appends.iter().map(|a| a.events.len() as u64).sum();
+    if total != next - first {
+        return Err(reused(format!(
+            "{total} events where the landed transaction has {}",
+            next - first
+        )));
+    }
+    let mut results = Vec::with_capacity(appends.len());
+    let mut cursor = 0usize;
+    for (k, a) in appends.iter().enumerate() {
+        let count = a.events.len();
+        let slice = &recs[cursor..cursor + count];
+        if slice.iter().any(|r| r.aggregate != a.aggregate) {
+            return Err(reused(format!(
+                "append {k} names {} where the landed records belong to {}",
+                describe(a.aggregate),
+                describe(slice[0].aggregate)
+            )));
+        }
+        let free = a.aggregate.is_none();
+        let first_index = if free { 0 } else { slice[0].index };
+        if !free
+            && slice
+                .iter()
+                .enumerate()
+                .any(|(j, r)| r.index != first_index + j as u64)
+        {
+            return Err(reused(format!(
+                "append {k} spans records whose aggregate indices are not consecutive"
+            )));
+        }
+        results.push(AppendResult {
+            aggregate: a.aggregate,
+            first_position: first + cursor as u64,
+            first_index,
+            count: count as u64,
+            new_len: if free { 0 } else { first_index + count as u64 },
+        });
+        cursor += count;
+    }
+    Ok(Committed {
+        first,
+        last: next - 1,
+        next,
+        appends: results,
+        duplicate: true,
+    })
+}
+
+fn describe(aggregate: Option<Uuid>) -> String {
+    aggregate.map_or("no aggregate".to_string(), |a| format!("aggregate {a}"))
 }
 
 /// Lands one batch: every transaction is checked in order against the
 /// committed state as the batch so far leaves it; a refused one gets its
-/// error and consumes nothing; the rest are written, synced and indexed
-/// together and each acknowledged with its own result. A failure of the
-/// write or the index commit fails every accepted transaction.
+/// error and consumes nothing; a resend of a landed commit id gets the
+/// first landing's result and consumes nothing; the rest are written,
+/// synced and indexed together and each acknowledged with its own
+/// result. A failure of the write or the index commit fails every
+/// accepted transaction.
 fn run_batch(inner: &Inner, w: &mut SegmentWriter, batch: Vec<Pending>) {
     let n = batch.len();
     let mut filler = SlotFiller {
@@ -820,16 +1009,68 @@ fn run_batch(inner: &Inner, w: &mut SegmentWriter, batch: Vec<Pending>) {
     let mut accepted: Vec<usize> = Vec::new();
     let mut overlay_rejected: Vec<usize> = Vec::new();
     let mut committed: Vec<Option<Committed>> = (0..n).map(|_| None).collect();
+    // Commit ids this batch lands, with the accepted transaction's index.
+    let mut batch_ids: HashMap<[u8; 16], usize> = HashMap::new();
+    let mut shapes: Vec<Option<Shape>> = (0..n).map(|_| None).collect();
+    // (i, j): i resends j's transaction, which lands in this batch.
+    let mut echoes: Vec<(usize, usize)> = Vec::new();
+    let mut txn_ids: Vec<([u8; 16], u64, u64)> = Vec::new();
     {
-        let agg_len = match wtxn.open_table(AGG_LEN) {
+        let tables = (|| -> Result<_> {
+            Ok((
+                wtxn.open_table(AGG_LEN)?,
+                wtxn.open_table(TXN_ID)?,
+                wtxn.open_table(POS)?,
+            ))
+        })();
+        let (agg_len, ids, pos) = match tables {
             Ok(t) => t,
             Err(e) => {
                 let all: Vec<usize> = (0..n).collect();
-                fail_all(&mut filler, Error::from(e), &all);
+                fail_all(&mut filler, e, &all);
                 return;
             }
         };
         for (i, p) in batch.into_iter().enumerate() {
+            if let Some(id) = p.commit_id {
+                if let Some(&j) = batch_ids.get(&id) {
+                    if shapes[j].as_deref() == Some(shape(&p.appends).as_slice()) {
+                        echoes.push((i, j));
+                    } else {
+                        filler.set(
+                            i,
+                            Err(Error::CommitIdReused {
+                                id,
+                                first: 0,
+                                next: 0,
+                                reason: "another transaction with this id is in the same batch"
+                                    .into(),
+                            }),
+                        );
+                        overlay_rejected.push(i);
+                    }
+                    continue;
+                }
+                let landed = match ids.get(&id) {
+                    Ok(v) => v.map(|v| v.value()),
+                    Err(e) => {
+                        let rest: Vec<usize> = (i..n).collect();
+                        fail_all(&mut filler, Error::from(e), &rest);
+                        return;
+                    }
+                };
+                if let Some((first, next)) = landed {
+                    let answer = read_committed(inner, &pos, first, next)
+                        .and_then(|recs| reconstruct(id, first, next, &recs, &p.appends));
+                    if answer.is_ok() {
+                        inner.counters.duplicates.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Judged against committed state: it stands whatever
+                    // happens to the batch.
+                    filler.set(i, answer);
+                    continue;
+                }
+            }
             let plan = match plan_txn(&agg_len, &overlay, &p.appends, true) {
                 Ok(Ok(plan)) => plan,
                 Ok(Err((e, against_committed))) => {
@@ -846,15 +1087,24 @@ fn run_batch(inner: &Inner, w: &mut SegmentWriter, batch: Vec<Pending>) {
                 }
             };
             overlay.extend(plan.lens.iter().map(|(k, v)| (*k, *v)));
-            committed[i] = Some(encode_txn(
+            if let Some(id) = p.commit_id {
+                batch_ids.insert(id, i);
+                shapes[i] = Some(shape(&p.appends));
+            }
+            let c = encode_txn(
                 p.appends,
+                p.commit_id,
                 &plan.first_indices,
                 now_nanos(),
                 &mut position,
                 &mut buf,
                 &mut body,
                 &mut entries,
-            ));
+            );
+            if let Some(id) = p.commit_id {
+                txn_ids.push((id, c.first, c.next));
+            }
+            committed[i] = Some(c);
             accepted.push(i);
         }
     }
@@ -869,20 +1119,32 @@ fn run_batch(inner: &Inner, w: &mut SegmentWriter, batch: Vec<Pending>) {
         &buf,
         &entries,
         &overlay,
+        &txn_ids,
         position,
         accepted.len() as u64,
     ) {
         Ok(()) => {
+            for &(i, j) in &echoes {
+                let mut c = committed[j].clone().expect("planned");
+                c.duplicate = true;
+                filler.set(i, Ok(c));
+            }
+            inner
+                .counters
+                .duplicates
+                .fetch_add(echoes.len() as u64, Ordering::Relaxed);
             for i in accepted {
                 filler.set(i, Ok(committed[i].take().expect("planned")));
             }
         }
         Err(e) => {
             // The first accepted transaction keeps the original error; the
-            // others, and any refusal that was judged against lengths this
+            // others, any refusal that was judged against lengths this
+            // batch did not land, and any resend of a transaction this
             // batch did not land, get a copy.
             let mut which = accepted;
             which.extend(overlay_rejected);
+            which.extend(echoes.iter().map(|&(i, _)| i));
             which.sort_unstable();
             let first = which[0];
             let copies: Vec<Error> = which.iter().skip(1).map(|_| e.redescribe()).collect();

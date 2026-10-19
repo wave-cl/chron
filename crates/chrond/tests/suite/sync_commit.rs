@@ -111,6 +111,7 @@ async fn a_sync_commit_times_out_as_unconfirmed_and_still_replicates() {
             CommitOptions {
                 epoch: None,
                 sync: Some(false),
+                commit_id: None,
             },
         )
         .await
@@ -165,6 +166,7 @@ async fn the_per_request_choice_wins_over_the_daemon_default() {
         CommitOptions {
             epoch: None,
             sync: Some(true),
+            commit_id: None,
         },
     ));
     assert!(
@@ -189,6 +191,7 @@ async fn a_node_without_peers_treats_sync_as_local() {
             CommitOptions {
                 epoch: None,
                 sync: Some(true),
+                commit_id: None,
             },
         )
         .await
@@ -309,6 +312,7 @@ async fn a_leader_without_follow_gets_no_acknowledgments() {
             CommitOptions {
                 epoch: None,
                 sync: Some(false),
+                commit_id: None,
             },
         )
         .await
@@ -390,5 +394,74 @@ async fn the_gateway_takes_sync_and_answers_504_when_unconfirmed() {
     for i in &others {
         c.hold_apply(*i, false);
     }
+    c.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unconfirmed_commit_resent_with_its_id_is_a_duplicate() {
+    let mut c = Cluster::start_with(3, TTL, |o| {
+        o.sync_timeout = Some(Duration::from_millis(300))
+    })
+    .await;
+    let (l, others) = settled(&c).await;
+    for i in &others {
+        c.hold_apply(*i, true);
+    }
+    // A single-address client: it never resends on its own.
+    let client = c.client(l).await;
+    let id = Uuid::from_u128(5);
+    let options = CommitOptions {
+        commit_id: Some([8; 16]),
+        ..CommitOptions::default()
+    };
+    let txn = || {
+        let mut t = Transaction::new();
+        t.append(id, Expected::Exact(0), vec![NewEvent::new("once")]);
+        t
+    };
+    let r = client.commit_with(txn(), options).await;
+    assert!(
+        matches!(
+            r,
+            Err(ClientError::Unconfirmed {
+                first: 0,
+                next: 1,
+                ..
+            })
+        ),
+        "{r:?}"
+    );
+    // Resent without the wait: the landing is there, so a duplicate,
+    // whatever the expectation says now.
+    let again = client
+        .commit_with(
+            txn(),
+            CommitOptions {
+                sync: Some(false),
+                ..options
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!((again.first, again.next, again.duplicate), (0, 1, true));
+    assert_eq!(c.node(l).default_db().db.head(), 1);
+    for i in &others {
+        c.hold_apply(*i, false);
+    }
+    // Resent with the wait once the followers apply: confirmed, still a
+    // duplicate.
+    let confirmed = client
+        .commit_with(
+            txn(),
+            CommitOptions {
+                sync: Some(true),
+                ..options
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!((confirmed.first, confirmed.duplicate), (0, true));
+    c.wait_heads(1, SOON).await;
+    assert_eq!(c.node(l).default_db().db.head(), 1, "landed once");
     c.stop_all().await;
 }

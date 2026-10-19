@@ -76,6 +76,12 @@ pub struct ClientConfig {
     /// follow the daemon's `--sync-commit` (`None`, the default). A
     /// daemon without peers ignores it.
     pub sync_commit: Option<bool>,
+    /// Give every commit a random commit id when the caller sets none
+    /// (the default), so a failed commit can be sent again: the daemon
+    /// answers a resend with the first landing instead of writing twice.
+    /// See [`Client::commit`] for the retry rule it unlocks. Turn it off
+    /// against 0.4.0 daemons, which drop the id and would write twice.
+    pub commit_ids: bool,
 }
 
 /// Per-commit choices.
@@ -86,6 +92,11 @@ pub struct CommitOptions {
     /// Wait for a majority, or not; `None` is the client's
     /// [`ClientConfig::sync_commit`], then the daemon's default.
     pub sync: Option<bool>,
+    /// The transaction's commit id; `None` lets the client choose one
+    /// when [`ClientConfig::commit_ids`] is on. A commit resent with the
+    /// same id and the same events' aggregates is answered with the
+    /// first landing ([`Committed::duplicate`]), nothing written.
+    pub commit_id: Option<[u8; 16]>,
 }
 
 impl Default for ClientConfig {
@@ -100,6 +111,7 @@ impl Default for ClientConfig {
             database: None,
             failover_timeout: Duration::from_secs(30),
             sync_commit: None,
+            commit_ids: true,
         }
     }
 }
@@ -644,18 +656,38 @@ impl Client {
     }
 
     /// Whether a failed commit may be sent again to the leader found
-    /// next without writing twice: a refusal for the node's role came
-    /// before any write; a connection failure may have come after it,
-    /// so it is retried only when every append carries an expectation
-    /// that makes a second landing a conflict. A commit with an epoch
-    /// token is the caller's own fencing and is never retried.
+    /// next without writing twice. With a commit id the daemon answers
+    /// a resend with the first landing, so every failure that may have
+    /// landed (a lost connection, a deadline, an unconfirmed sync
+    /// commit) is retried, as is a refusal for the node's role; with an
+    /// epoch token a refusal at an epoch above the token is final, since
+    /// every leader from now on is above it too. Without an id: a
+    /// refusal for the node's role came before any write; a connection
+    /// failure may have come after it, so it is retried only when every
+    /// append carries an expectation that makes a second landing a
+    /// conflict; a commit with an epoch token is the caller's own
+    /// fencing and is never retried.
     fn retryable(
         &self,
         e: &ClientError,
         epoch: Option<u64>,
         expectations: &[(Option<Uuid>, Expected)],
+        has_id: bool,
     ) -> bool {
-        if self.seeds.is_none() || epoch.is_some() {
+        if self.seeds.is_none() {
+            return false;
+        }
+        if has_id {
+            return match e {
+                ClientError::Fenced { epoch: at, .. } => epoch.is_none_or(|token| *at <= token),
+                ClientError::Unavailable(_)
+                | ClientError::Transport(_)
+                | ClientError::Unconfirmed { .. } => true,
+                ClientError::Status(s) => s.code() == tonic::Code::DeadlineExceeded,
+                _ => false,
+            };
+        }
+        if epoch.is_some() {
             return false;
         }
         match e {
@@ -722,22 +754,33 @@ impl Client {
     ///
     /// On a client made by [`connect_any`](Client::connect_any) a commit
     /// the node refused for its role ([`ClientError::Fenced`]) was never
-    /// written and is sent again to the leader found next. One that
-    /// failed with [`ClientError::Unavailable`] or
-    /// [`ClientError::Transport`] may have landed before the connection
-    /// broke: it is sent again only when every append names an aggregate
-    /// with [`Expected::Exact`] or [`Expected::New`], where a second
-    /// landing is a [`ClientError::Conflict`] (one that may then report
-    /// the caller's own earlier write); with [`Expected::Any`] or free
-    /// events the error is returned and the caller decides. A timed-out
-    /// call is never retried.
+    /// written and is sent again to the leader found next.
+    ///
+    /// With a commit id (every commit has one unless
+    /// [`ClientConfig::commit_ids`] is off or
+    /// [`CommitOptions::commit_id`] names one) a commit that failed with
+    /// [`ClientError::Unavailable`], [`ClientError::Transport`],
+    /// [`ClientError::Unconfirmed`] or a deadline is sent again too: the
+    /// leader found next answers it with the first landing
+    /// ([`Committed::duplicate`]) if the write survived, and lands it
+    /// once if it died with the old leader. An epoch token is sent
+    /// along; a refusal at an epoch above it is final.
+    ///
+    /// Without an id, one that failed with [`ClientError::Unavailable`]
+    /// or [`ClientError::Transport`] may have landed before the
+    /// connection broke: it is sent again only when every append names
+    /// an aggregate with [`Expected::Exact`] or [`Expected::New`], where
+    /// a second landing is a [`ClientError::Conflict`] (one that may
+    /// then report the caller's own earlier write); with
+    /// [`Expected::Any`] or free events the error is returned and the
+    /// caller decides. A timed-out or unconfirmed call is never retried,
+    /// and neither is a commit with an epoch token.
     pub async fn commit(&self, txn: Transaction) -> Result<Committed, ClientError> {
         self.commit_with(txn, CommitOptions::default()).await
     }
 
-    /// [`commit`](Client::commit) with an epoch token and a sync choice.
-    /// A sync commit that a majority did not confirm in time fails with
-    /// [`ClientError::Unconfirmed`] and is never retried.
+    /// [`commit`](Client::commit) with an epoch token, a sync choice and
+    /// a commit id of the caller's own.
     pub async fn commit_with(
         &self,
         txn: Transaction,
@@ -745,6 +788,9 @@ impl Client {
     ) -> Result<Committed, ClientError> {
         let options = CommitOptions {
             sync: options.sync.or(self.config.sync_commit),
+            commit_id: options
+                .commit_id
+                .or_else(|| self.config.commit_ids.then(|| Uuid::new_v4().into_bytes())),
             ..options
         };
         self.commit_inner(txn, options).await
@@ -761,7 +807,7 @@ impl Client {
             txn,
             CommitOptions {
                 epoch: Some(epoch),
-                sync: None,
+                ..CommitOptions::default()
             },
         )
         .await
@@ -773,6 +819,7 @@ impl Client {
         options: CommitOptions,
     ) -> Result<Committed, ClientError> {
         let epoch = options.epoch;
+        let has_id = options.commit_id.is_some();
         let appends = txn.into_appends();
         let expectations: Vec<(Option<Uuid>, Expected)> =
             appends.iter().map(|a| (a.aggregate, a.expected)).collect();
@@ -781,7 +828,7 @@ impl Client {
             .map(|a| convert::append_to_wire(a.aggregate, a.expected, a.events))
             .collect();
         let mut last = match self.commit_once(&wire, options, &expectations).await {
-            Err(e) if self.retryable(&e, epoch, &expectations) => e,
+            Err(e) if self.retryable(&e, epoch, &expectations, has_id) => e,
             other => return other,
         };
         // Look for the leader until the deadline, resending only once one
@@ -797,7 +844,7 @@ impl Client {
                 Ok(_) => {
                     search_failed = None;
                     match self.commit_once(&wire, options, &expectations).await {
-                        Err(e) if self.retryable(&e, epoch, &expectations) => last = e,
+                        Err(e) if self.retryable(&e, epoch, &expectations, has_id) => last = e,
                         other => return other,
                     }
                 }
@@ -824,6 +871,7 @@ impl Client {
                 appends: wire.to_vec(),
                 epoch: options.epoch,
                 sync: options.sync,
+                commit_id: options.commit_id.map(|i| i.to_vec()).unwrap_or_default(),
             })
             .await
             .map_err(|s| match ClientError::from(s) {

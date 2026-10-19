@@ -18,6 +18,21 @@ use crate::metrics::code_label;
 #[derive(Deserialize)]
 pub struct TxnJson {
     pub appends: Vec<AppendJson>,
+    /// A commit id as 32 hex digits or a hyphenated UUID; absent for none.
+    #[serde(default)]
+    pub commit_id: Option<String>,
+}
+
+/// The commit id a JSON transaction names, parsed.
+pub fn commit_id_from_json(txn: &TxnJson) -> Result<Option<[u8; 16]>, Status> {
+    txn.commit_id
+        .as_deref()
+        .map(|s| {
+            Uuid::parse_str(s).map(Uuid::into_bytes).map_err(|_| {
+                Status::invalid_argument(format!("commit_id {s:?} is not 32 hex digits or a UUID"))
+            })
+        })
+        .transpose()
 }
 
 #[derive(Deserialize)]
@@ -149,6 +164,12 @@ pub fn event_json(e: &Event) -> Value {
     obj.insert("recorded_at_unix_nanos".into(), json!(e.recorded_at));
     obj.insert("first_in_txn".into(), json!(e.is_first_in_txn()));
     obj.insert("last_in_txn".into(), json!(e.is_last_in_txn()));
+    if let Some(id) = e.commit_id {
+        obj.insert(
+            "commit_id".into(),
+            Value::String(Uuid::from_bytes(id).to_string()),
+        );
+    }
     let (text, binary): (Vec<&[u8]>, Vec<&[u8]>) = e
         .tags
         .iter()
@@ -192,7 +213,7 @@ pub fn committed_json(c: &Committed) -> Value {
             })
         })
         .collect();
-    json!({ "first": c.first, "last": c.last, "next": c.next, "appends": appends })
+    json!({ "first": c.first, "last": c.last, "next": c.next, "appends": appends, "duplicate": c.duplicate })
 }
 
 pub fn role_name(role: pb::Role) -> &'static str {
@@ -360,6 +381,7 @@ mod tests {
             index: 0,
             recorded_at: 1,
             flags: 0,
+            commit_id: None,
             tags: vec![],
             metadata: bytes::Bytes::new(),
             payload: bytes::Bytes::from_static(&[0xff, 0xfe]),

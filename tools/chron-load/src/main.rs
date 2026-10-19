@@ -160,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", report.to_json());
     } else {
         println!(
-            "transactions {}  events {}  conflicts {}  errors {}\nreads {} ({} events)  subscribed {}  backups {}  retentions {}\ncommit p50 {:.2} ms  p99 {:.2} ms\nfinal head {}  replica head {:?}\nkills {}  lost acks {}  failover errors {}  unconfirmed {}",
+            "transactions {}  events {}  conflicts {}  errors {}\nreads {} ({} events)  subscribed {}  backups {}  retentions {}\ncommit p50 {:.2} ms  p99 {:.2} ms\nfinal head {}  replica head {:?}\nkills {}  lost acks {}  failover errors {}  unconfirmed {}  duplicates {}",
             report.transactions,
             report.events,
             report.conflicts,
@@ -177,7 +177,8 @@ async fn main() -> anyhow::Result<()> {
             report.kills,
             report.lost_acks,
             report.failover_errors,
-            report.unconfirmed
+            report.unconfirmed,
+            report.duplicates
         );
         for v in &report.violations {
             println!("VIOLATION: {v}");

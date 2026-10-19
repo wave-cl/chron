@@ -88,6 +88,7 @@ pub fn code_label(code: i32) -> &'static str {
 /// How a commit went, for `chron_commits_total`.
 pub fn commit_result(r: &Result<chron::Committed, tonic::Status>) -> &'static str {
     match r {
+        Ok(c) if c.duplicate => "duplicate",
         Ok(_) => "ok",
         Err(s) => match s.code() {
             tonic::Code::FailedPrecondition

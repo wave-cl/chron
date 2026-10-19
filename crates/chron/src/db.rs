@@ -776,8 +776,14 @@ impl Db {
     /// dropped afterwards.
     #[doc(hidden)]
     pub fn debug_write_without_commit(&self, txn: Transaction) -> Result<Committed> {
-        let (_db, appends) = txn.into_parts();
-        txn::commit(&self.inner, appends, Mode::WriteWithoutCommit)
+        let (_db, appends, commit_id) = txn.into_parts();
+        txn::commit(&self.inner, appends, commit_id, Mode::WriteWithoutCommit)
+    }
+
+    /// Where the transaction committed under `id` landed, `(first, next)`,
+    /// if one did and retention or truncation has not dropped it.
+    pub fn lookup_commit(&self, id: [u8; 16]) -> Result<Option<(u64, u64)>> {
+        self.inner.index.lookup_commit(&id)
     }
 
     /// Rebuilds `index.redb` from the segment files alone, for a database
@@ -1136,6 +1142,7 @@ impl Inner {
             events: c.events.load(Ordering::Relaxed),
             fsyncs: c.fsyncs.load(Ordering::Relaxed),
             fsync_nanos: c.fsync_nanos.load(Ordering::Relaxed),
+            duplicates: c.duplicates.load(Ordering::Relaxed),
         }
     }
 
@@ -1265,6 +1272,7 @@ pub(crate) struct Counters {
     pub(crate) events: AtomicU64,
     pub(crate) fsyncs: AtomicU64,
     pub(crate) fsync_nanos: AtomicU64,
+    pub(crate) duplicates: AtomicU64,
 }
 
 /// What the commit path has done since the database was opened.
@@ -1283,6 +1291,9 @@ pub struct Stats {
     pub fsyncs: u64,
     /// Time spent in those syncs, in nanoseconds.
     pub fsync_nanos: u64,
+    /// Commits answered with an earlier landing because their commit id
+    /// was seen before; nothing was written for them.
+    pub duplicates: u64,
 }
 
 /// Holds the writer lock from a test, so that commits from other threads

@@ -79,9 +79,12 @@ pub enum ClientError {
     NoLeader(String),
     /// A sync commit landed on the leader's disk but a majority did not
     /// confirm it in time (or the node stopped leading first). It is at
-    /// `first..next` there and replicates unless the node dies. Never
-    /// retried by the client: a resend could write it twice. Resolve
-    /// with an exact expectation on the aggregate, or a read.
+    /// `first..next` there and replicates unless the node dies. With a
+    /// commit id the client resends it to the leader it finds next
+    /// (see [`Client::commit`](crate::Client::commit)), so a caller sees
+    /// it only once the failover timeout has passed; without one it is
+    /// never retried, since a resend could write it twice: resolve with
+    /// an exact expectation on the aggregate, or a read.
     #[error("unconfirmed: committed locally at {first} (next {next}) but {message}")]
     Unconfirmed {
         /// The transaction's first position on the leader.

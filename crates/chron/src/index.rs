@@ -25,6 +25,10 @@ pub(crate) const POS: TableDefinition<u64, (u64, u64, u32)> = TableDefinition::n
 pub(crate) const TAG: TableDefinition<(&[u8], u64), ()> = TableDefinition::new("tag");
 /// Byte-valued metadata: `"db_id"` → the database's 16-byte identity.
 pub(crate) const META_BYTES: TableDefinition<&str, &[u8]> = TableDefinition::new("meta_bytes");
+/// commit id → (first position, next position) of the transaction that
+/// carried it. Absent on an index written before 0.5.0, which reads as
+/// empty; the first write creates it.
+pub(crate) const TXN_ID: TableDefinition<&[u8; 16], (u64, u64)> = TableDefinition::new("txn_id");
 
 pub(crate) const DB_ID_KEY: &str = "db_id";
 /// `"epoch"` → the fencing epoch; absent means 0.
@@ -129,6 +133,7 @@ impl Index {
             txn.open_table(AGG_INDEX)?;
             txn.open_table(POS)?;
             txn.open_table(TAG)?;
+            txn.open_table(TXN_ID)?;
         }
         txn.commit()?;
         Ok(())
@@ -180,6 +185,18 @@ impl Index {
             .get(DB_ID_KEY)?
             .and_then(|v| <[u8; 16]>::try_from(v.value()).ok())
             .map(Uuid::from_bytes))
+    }
+
+    /// Where the transaction committed under `id` landed, if one did and
+    /// its records are still kept: `(first, next)`.
+    pub(crate) fn lookup_commit(&self, id: &[u8; 16]) -> Result<Option<(u64, u64)>> {
+        let txn = self.begin_read()?;
+        let table = match txn.open_table(TXN_ID) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(table.get(id)?.map(|v| v.value()))
     }
 
     /// The identity, minting and durably storing one if absent.

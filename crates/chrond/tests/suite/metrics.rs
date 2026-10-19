@@ -81,12 +81,28 @@ async fn the_endpoint_reports_calls_commits_and_gauges() {
             appends: vec![append(Some(agg(1)), exact(7), vec![new_event("x", &[])])],
             epoch: None,
             sync: None,
+            commit_id: Vec::new(),
         })
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    let dup = pb::CommitRequest {
+        appends: vec![append(Some(agg(1)), any(), vec![new_event("d", &[])])],
+        epoch: None,
+        sync: None,
+        commit_id: vec![4; 16],
+    };
+    assert!(
+        !s.client
+            .commit(dup.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .duplicate
+    );
+    assert!(s.client.commit(dup).await.unwrap().into_inner().duplicate);
     let all = read_all_payloads(&mut s.client).await;
-    assert_eq!(all.len(), 2);
+    assert_eq!(all.len(), 3);
     let mut sub = s
         .client
         .subscribe(pb::SubscribeRequest { from: 0, tag: None })
@@ -107,7 +123,7 @@ async fn the_endpoint_reports_calls_commits_and_gauges() {
             "chron_rpc_calls_total",
             &[d, ("method", commit), ("code", "OK")]
         ),
-        Some(2.0),
+        Some(4.0),
         "{body}"
     );
     assert_eq!(
@@ -129,7 +145,11 @@ async fn the_endpoint_reports_calls_commits_and_gauges() {
     );
     assert_eq!(
         metric(&body, "chron_commits_total", &[d, ("result", "ok")]),
-        Some(2.0)
+        Some(3.0)
+    );
+    assert_eq!(
+        metric(&body, "chron_commits_total", &[d, ("result", "duplicate")]),
+        Some(1.0)
     );
     assert_eq!(
         metric(&body, "chron_commits_total", &[d, ("result", "conflict")]),
@@ -141,13 +161,13 @@ async fn the_endpoint_reports_calls_commits_and_gauges() {
             "chron_rpc_duration_seconds_count",
             &[d, ("method", commit)]
         ),
-        Some(3.0)
+        Some(5.0)
     );
     assert_eq!(
         metric(&body, "chron_events_committed_total", &[d]),
-        Some(2.0)
+        Some(3.0)
     );
-    assert_eq!(metric(&body, "chron_head", &[d]), Some(2.0));
+    assert_eq!(metric(&body, "chron_head", &[d]), Some(3.0));
     assert_eq!(metric(&body, "chron_floor", &[d]), Some(0.0));
     assert_eq!(
         metric(&body, "chron_role", &[d, ("role", "leader")]),

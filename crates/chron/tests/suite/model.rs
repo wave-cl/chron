@@ -33,6 +33,10 @@ enum Op {
     Reopen,
     /// Retain from this percentage of the head.
     Retain(u8),
+    /// Resend the transaction op `k` sent, with its id and the
+    /// expectations it carried then. A no-op when op `k` lies ahead or
+    /// is not a transaction.
+    Resend(u8),
 }
 
 fn arb_append() -> impl Strategy<Value = Append> {
@@ -56,6 +60,7 @@ fn arb_ops() -> impl Strategy<Value = Vec<Op>> {
         10 => prop::collection::vec(arb_append(), 1..=3).prop_map(Op::Txn),
         1 => Just(Op::Reopen),
         1 => (0..=100u8).prop_map(Op::Retain),
+        2 => (0..40u8).prop_map(Op::Resend),
     ];
     prop::collection::vec(op, 1..=40)
 }
@@ -98,9 +103,41 @@ fn new_event(payload: u8, tags: &[u8]) -> NewEvent {
     NewEvent::new(format!("p{payload}")).tags(tags.iter().map(|t| TAGS[*t as usize].to_string()))
 }
 
+/// An append with `Current` resolved: what is sent to the database.
+#[derive(Debug, Clone)]
+struct Resolved {
+    aggregate: Option<u8>,
+    expected: Expected,
+    events: Vec<(u8, Vec<u8>)>,
+}
+
 impl Model {
+    /// Resolves `Current` against the model's running lengths, so the
+    /// database and the model are asked the same question.
+    fn resolve(&self, appends: &[Append]) -> Vec<Resolved> {
+        let mut lens = self.lens.clone();
+        appends
+            .iter()
+            .map(|a| {
+                let expected = match a.aggregate {
+                    None => Expected::Any,
+                    Some(n) => {
+                        let cur = lens.get(&id(n)).copied().unwrap_or(0);
+                        lens.insert(id(n), cur + a.events.len() as u64);
+                        real_expected(&a.expected, cur)
+                    }
+                };
+                Resolved {
+                    aggregate: a.aggregate,
+                    expected,
+                    events: a.events.clone(),
+                }
+            })
+            .collect()
+    }
+
     /// Predicts a transaction's outcome, and applies it when it commits.
-    fn txn(&mut self, appends: &[Append]) -> Result<(u64, u64), (Uuid, Expected, u64)> {
+    fn txn(&mut self, appends: &[Resolved]) -> Result<(u64, u64), (Uuid, Expected, u64)> {
         let mut lens = self.lens.clone();
         let mut planned: Vec<Projected> = Vec::new();
         let total: usize = appends.iter().map(|a| a.events.len()).sum();
@@ -111,12 +148,7 @@ impl Model {
             let mut index = 0;
             if let Some(agg) = aggregate {
                 let cur = lens.get(&agg).copied().unwrap_or(0);
-                let expected = match a.expected {
-                    Exp::Any => Expected::Any,
-                    Exp::New => Expected::New,
-                    Exp::Exact(n) => Expected::Exact(n as u64),
-                    Exp::Current => Expected::Exact(cur),
-                };
+                let expected = a.expected;
                 let ok = match expected {
                     Expected::Any => true,
                     Expected::New => cur == 0,
@@ -271,34 +303,59 @@ proptest! {
         let o = opts().segment_max_bytes(300);
         let mut db = Some(Db::open(d.path(), o.clone()).unwrap());
         let mut model = Model::default();
-        for op in &ops {
+        // Per op: what was sent (resolved appends) and where it landed.
+        let mut sent: Vec<Option<Sent>> = Vec::new();
+        for (k, op) in ops.iter().enumerate() {
             let handle = db.as_ref().unwrap();
+            let mut record = None;
             match op {
                 Op::Txn(appends) => {
-                    // Resolve `Current` against the model's running lengths.
-                    let mut lens = model.lens.clone();
+                    let resolved = model.resolve(appends);
                     let mut txn = handle.transaction();
-                    for a in appends {
-                        let events: Vec<NewEvent> = a.events.iter().map(|(p, t)| new_event(*p, t)).collect();
-                        match a.aggregate {
-                            None => { txn.append_free(events); }
-                            Some(n) => {
-                                let cur = lens.get(&id(n)).copied().unwrap_or(0);
-                                let expected = real_expected(&a.expected, cur);
-                                lens.insert(id(n), cur + a.events.len() as u64);
-                                txn.append(id(n), expected, events);
-                            }
-                        }
-                    }
-                    let predicted = model.txn(appends);
-                    match (txn.commit(), predicted) {
+                    send(&mut txn, &resolved);
+                    txn.commit_id(commit_id(k));
+                    let predicted = model.txn(&resolved);
+                    let landed = match (txn.commit(), predicted) {
                         (Ok(c), Ok((first, last))) => {
-                            prop_assert_eq!((c.first, c.last, c.next), (first, last, last + 1));
+                            prop_assert_eq!((c.first, c.last, c.next, c.duplicate), (first, last, last + 1, false));
+                            Some((first, last))
                         }
                         (Err(Error::ExpectedLength { aggregate, expected, actual }), Err((a, e, cur))) => {
                             prop_assert_eq!((aggregate, expected, actual), (a, e, cur));
+                            None
                         }
-                        (got, want) => prop_assert!(false, "db {:?} vs model {:?}", got.map(|c| c.next), want),
+                        (got, want) => { prop_assert!(false, "db {:?} vs model {:?}", got.map(|c| c.next), want); None }
+                    };
+                    record = Some((resolved, landed));
+                }
+                Op::Resend(j) => {
+                    let j = *j as usize;
+                    if let Some(Some((resolved, landed))) = sent.get(j) {
+                        let mut txn = handle.transaction();
+                        send(&mut txn, resolved);
+                        txn.commit_id(commit_id(j));
+                        let kept = landed.filter(|(first, _)| *first >= model.floor);
+                        match kept {
+                            // Landed and still kept: a duplicate, nothing new.
+                            Some((first, last)) => {
+                                let c = txn.commit().unwrap();
+                                prop_assert_eq!((c.first, c.last, c.duplicate), (first, last, true));
+                            }
+                            // Never landed, or forgotten below the floor: a
+                            // fresh transaction with the old expectations.
+                            None => {
+                                let predicted = model.txn(resolved);
+                                match (txn.commit(), predicted) {
+                                    (Ok(c), Ok((first, last))) => {
+                                        prop_assert_eq!((c.first, c.last, c.duplicate), (first, last, false));
+                                    }
+                                    (Err(Error::ExpectedLength { aggregate, expected, actual }), Err((a, e, cur))) => {
+                                        prop_assert_eq!((aggregate, expected, actual), (a, e, cur));
+                                    }
+                                    (got, want) => prop_assert!(false, "resend: db {:?} vs model {:?}", got.map(|c| c.next), want),
+                                }
+                            }
+                        }
                     }
                 }
                 Op::Reopen => {
@@ -314,7 +371,29 @@ proptest! {
                     model.floor = want;
                 }
             }
+            sent.push(record);
             check(db.as_ref().unwrap(), &model)?;
+        }
+    }
+}
+
+/// What a transaction op sent, and where it landed if it did.
+type Sent = (Vec<Resolved>, Option<(u64, u64)>);
+
+fn commit_id(k: usize) -> [u8; 16] {
+    (k as u128 + 1).to_be_bytes()
+}
+
+fn send(txn: &mut chron::Transaction, resolved: &[Resolved]) {
+    for a in resolved {
+        let events: Vec<NewEvent> = a.events.iter().map(|(p, t)| new_event(*p, t)).collect();
+        match a.aggregate {
+            None => {
+                txn.append_free(events);
+            }
+            Some(n) => {
+                txn.append(id(n), a.expected, events);
+            }
         }
     }
 }

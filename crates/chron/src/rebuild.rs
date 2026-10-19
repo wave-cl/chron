@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::db::{Layout, Lock};
 use crate::error::{Error, Result};
 use crate::index::{
-    AGG_INDEX, AGG_LEN, DB_ID_KEY, FLOOR_KEY, HEAD_KEY, Index, META, META_BYTES, POS, TAG,
+    AGG_INDEX, AGG_LEN, DB_ID_KEY, FLOOR_KEY, HEAD_KEY, Index, META, META_BYTES, POS, TAG, TXN_ID,
 };
 use crate::options::{Fsync, Options};
 use crate::recover::{Item, Records};
@@ -57,6 +57,7 @@ const FLUSH_EVERY: usize = 50_000;
 fn flush(
     index: &Index,
     batch: &mut Vec<Entry>,
+    txn_ids: &mut Vec<([u8; 16], u64, u64)>,
     lens: &HashMap<Uuid, u64>,
     touched: &mut HashSet<Uuid>,
 ) -> Result<()> {
@@ -66,6 +67,10 @@ fn flush(
         let mut agg_index = txn.open_table(AGG_INDEX)?;
         let mut tag = txn.open_table(TAG)?;
         let mut agg_len = txn.open_table(AGG_LEN)?;
+        let mut ids = txn.open_table(TXN_ID)?;
+        for (id, first, next) in txn_ids.drain(..) {
+            ids.insert(&id, (first, next))?;
+        }
         for e in batch.drain(..) {
             pos.insert(e.position, (e.base, e.offset, e.frame_len))?;
             if let Some(id) = &e.aggregate {
@@ -206,7 +211,9 @@ fn rebuild_from(
     let mut lens: HashMap<Uuid, u64> = HashMap::new();
     let mut touched: HashSet<Uuid> = HashSet::new();
     let mut batch: Vec<Entry> = Vec::new();
+    let mut txn_ids: Vec<([u8; 16], u64, u64)> = Vec::new();
     let mut open_txn: Vec<Entry> = Vec::new();
+    let mut open_id: Option<[u8; 16]> = None;
     let mut pending: HashMap<Uuid, u64> = HashMap::new();
     let floor = segments.first().map_or(0, |(b, _)| *b);
     let mut next_base = floor;
@@ -265,6 +272,9 @@ fn rebuild_from(
                         0
                     };
                     let last_in_txn = ev.is_last_in_txn();
+                    if ev.is_first_in_txn() {
+                        open_id = ev.commit_id;
+                    }
                     open_txn.push(Entry {
                         position: r.position,
                         base: *base,
@@ -277,13 +287,16 @@ fn rebuild_from(
                     if last_in_txn {
                         head = r.position + 1;
                         last_complete_end = r.offset + u64::from(r.frame_len);
+                        if let Some(id) = open_id.take() {
+                            txn_ids.push((id, open_txn[0].position, head));
+                        }
                         batch.append(&mut open_txn);
                         for (id, len) in pending.drain() {
                             lens.insert(id, len);
                             touched.insert(id);
                         }
                         if batch.len() >= FLUSH_EVERY {
-                            flush(&index, &mut batch, &lens, &mut touched)?;
+                            flush(&index, &mut batch, &mut txn_ids, &lens, &mut touched)?;
                         }
                     }
                 }
@@ -343,7 +356,7 @@ fn rebuild_from(
         }
     }
     touched.extend(lens.keys().copied());
-    flush(&index, &mut batch, &lens, &mut touched)?;
+    flush(&index, &mut batch, &mut txn_ids, &lens, &mut touched)?;
     let txn = index.begin_write_durable()?;
     {
         let mut meta = txn.open_table(META)?;
@@ -400,6 +413,7 @@ mod tests {
                     } else {
                         0
                     },
+                commit_id: None,
                 tags: vec![],
                 metadata: Bytes::new(),
                 payload: Bytes::from_static(b"p"),

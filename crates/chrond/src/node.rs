@@ -796,6 +796,7 @@ impl Node {
         dbn: &DbNode,
         appends: Vec<pb::Append>,
         epoch: Option<u64>,
+        commit_id: Option<[u8; 16]>,
     ) -> Result<Committed, Status> {
         let gate = self.write_gate.read().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = self.write_refusal() {
@@ -832,6 +833,9 @@ impl Node {
         let mut txn = dbn.db.transaction();
         for a in appends {
             codec::apply_append(&mut txn, a)?;
+        }
+        if let Some(id) = commit_id {
+            txn.commit_id(id);
         }
         txn.commit().map_err(codec::status)
     }

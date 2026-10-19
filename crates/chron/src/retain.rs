@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::db::Inner;
 use crate::error::{Error, Result};
-use crate::index::{AGG_INDEX, FLOOR_KEY, META, POS, TAG};
+use crate::index::{AGG_INDEX, FLOOR_KEY, META, POS, TAG, TXN_ID};
 use crate::recover::{Item, Records};
 use crate::segment;
 
@@ -66,6 +66,7 @@ pub(crate) fn retain(inner: &Inner, floor: u64, remove_files: bool) -> Result<Re
     let mut positions: Vec<u64> = Vec::new();
     let mut agg_keys: Vec<(Uuid, u64)> = Vec::new();
     let mut tag_keys: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut ids: Vec<[u8; 16]> = Vec::new();
     for (k, (base, path)) in dropped.iter().enumerate() {
         let end = dropped.get(k + 1).map_or(new_floor, |(b, _)| *b);
         let mut records = Records::open(path, *base, inner.opts.max_record_bytes)?;
@@ -76,6 +77,9 @@ pub(crate) fn retain(inner: &Inner, floor: u64, remove_files: bool) -> Result<Re
             match records.next()? {
                 Item::Record(r) => {
                     positions.push(r.position);
+                    if let Some(id) = r.event.commit_id {
+                        ids.push(id);
+                    }
                     if let Some(id) = r.event.aggregate {
                         agg_keys.push((id, r.event.index));
                     }
@@ -117,6 +121,11 @@ pub(crate) fn retain(inner: &Inner, floor: u64, remove_files: bool) -> Result<Re
         }
         for (t, p) in &tag_keys {
             tag.remove((t.as_slice(), *p))?;
+        }
+        // Ids below the floor are forgotten with their records.
+        let mut txn_ids = txn.open_table(TXN_ID)?;
+        for id in &ids {
+            txn_ids.remove(id)?;
         }
         txn.open_table(META)?.insert(FLOOR_KEY, new_floor)?;
         Ok(())

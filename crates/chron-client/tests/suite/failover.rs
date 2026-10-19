@@ -17,6 +17,15 @@ fn config() -> ClientConfig {
     }
 }
 
+/// The 0.4.0 rule: no commit ids, so a resend is only safe where a
+/// second landing would conflict.
+fn config_without_ids() -> ClientConfig {
+    ClientConfig {
+        commit_ids: false,
+        ..config()
+    }
+}
+
 async fn free(client: &Client, payload: &str) -> Result<u64, ClientError> {
     let mut t = Transaction::new();
     t.append_free(vec![NewEvent::new(payload.to_string())]);
@@ -54,7 +63,7 @@ async fn connect_any_finds_the_leader_from_any_seed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_commit_follows_a_failover_and_reads_do_not() {
+async fn without_ids_a_commit_follows_a_failover_only_where_a_second_landing_conflicts() {
     let mut c = Cluster::start(3, TTL).await;
     let l = c.wait_for_leader(SOON).await;
     for i in 0..3 {
@@ -63,7 +72,9 @@ async fn a_commit_follows_a_failover_and_reads_do_not() {
         }
     }
     let seeds: Vec<String> = (0..3).map(|i| c.addr(i)).collect();
-    let client = Client::connect_any(seeds, config()).await.unwrap();
+    let client = Client::connect_any(seeds, config_without_ids())
+        .await
+        .unwrap();
     let bound = client.database("default");
     let first = free(&client, "before").await.unwrap();
     c.wait_heads(first + 1, SOON).await;
@@ -108,6 +119,58 @@ async fn a_commit_follows_a_failover_and_reads_do_not() {
     c.stop_all().await;
 }
 
+/// With commit ids (the default) every commit follows a failover: a
+/// free append whose connection broke is resent and lands exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_free_append_is_resent_with_an_id_and_lands_once() {
+    let mut c = Cluster::start(3, TTL).await;
+    let l = c.wait_for_leader(SOON).await;
+    for i in 0..3 {
+        if i != l {
+            c.wait_following(i, l, SOON).await;
+        }
+    }
+    c.wait("followers attached", SOON, || c.followers(l).len() == 2)
+        .await;
+    let seeds: Vec<String> = (0..3).map(|i| c.addr(i)).collect();
+    let client = Client::connect_any(seeds, config()).await.unwrap();
+    let first = free(&client, "before").await.unwrap();
+    c.wait_heads(first + 1, SOON).await;
+    c.stop(l).await;
+    let l2 = c.wait_for_leader(SOON).await;
+    let p = free(&client, "after").await.unwrap();
+    assert_eq!(p, first + 1);
+    assert_eq!(client.addr(), c.addr(l2));
+    let log = client.read_all(0, 0).await.unwrap();
+    assert_eq!(
+        log.iter().filter(|e| e.payload == "after").count(),
+        1,
+        "landed once"
+    );
+    assert!(
+        log[(first + 1) as usize].commit_id.is_some(),
+        "the client chose an id"
+    );
+    // An epoch token travels with the resend; a fenced answer at an
+    // epoch above the token is final rather than retried for 30 s.
+    let stale_epoch = client.info().await.unwrap().epoch - 1;
+    let r = client
+        .commit_with(
+            {
+                let mut t = Transaction::new();
+                t.append_free(vec![NewEvent::new("stale")]);
+                t
+            },
+            chron_client::CommitOptions {
+                epoch: Some(stale_epoch),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(r, Err(ClientError::Fenced { .. })), "{r:?}");
+    c.stop_all().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn no_leader_is_an_error_that_names_every_seed() {
     let mut c = Cluster::start(2, TTL).await;
@@ -135,7 +198,7 @@ async fn no_leader_is_an_error_that_names_every_seed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unconfirmed_commit_is_not_retried() {
+async fn an_unconfirmed_commit_is_retried_with_an_id_and_ends_once() {
     let mut c = Cluster::start_with(3, TTL, |o| {
         o.sync_timeout = Some(Duration::from_millis(300))
     })
@@ -151,7 +214,78 @@ async fn an_unconfirmed_commit_is_not_retried() {
         c.hold_apply(*i, true);
     }
     let seeds: Vec<String> = (0..3).map(|i| c.addr(i)).collect();
-    let client = Client::connect_any(seeds, config()).await.unwrap();
+    let client = Client::connect_any(
+        seeds,
+        ClientConfig {
+            failover_timeout: Duration::from_secs(20),
+            ..config()
+        },
+    )
+    .await
+    .unwrap();
+    let id = chron_client::Uuid::from_u128(3);
+    let head_before = c.node(l).default_db().db.head();
+    let pending = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .append(
+                    id,
+                    chron_client::Expected::Exact(0),
+                    vec![NewEvent::new("once")],
+                )
+                .await
+        }
+    });
+    // Unconfirmed on the leader, the client keeps resending it; releasing
+    // the followers lets a resend be confirmed as a duplicate.
+    c.wait("the first attempt landed", SOON, || {
+        c.node(l).default_db().db.head() == head_before + 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(!pending.is_finished(), "still retrying");
+    for i in &others {
+        c.hold_apply(*i, false);
+    }
+    let c1 = tokio::time::timeout(SOON, pending)
+        .await
+        .expect("ends once the followers apply")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (c1.first, c1.next, c1.duplicate),
+        (head_before, head_before + 1, true)
+    );
+    assert_eq!(
+        c.node(l).default_db().db.head(),
+        head_before + 1,
+        "landed once"
+    );
+    assert_eq!(client.aggregate_len(id).await.unwrap(), 1);
+    c.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_ids_off_keeps_the_old_rule_for_an_unconfirmed_commit() {
+    let mut c = Cluster::start_with(3, TTL, |o| {
+        o.sync_timeout = Some(Duration::from_millis(300))
+    })
+    .await;
+    let l = c.wait_for_leader(SOON).await;
+    let others: Vec<usize> = (0..3).filter(|i| *i != l).collect();
+    for i in &others {
+        c.wait_following(*i, l, SOON).await;
+    }
+    c.wait("followers attached", SOON, || c.followers(l).len() == 2)
+        .await;
+    for i in &others {
+        c.hold_apply(*i, true);
+    }
+    let seeds: Vec<String> = (0..3).map(|i| c.addr(i)).collect();
+    let client = Client::connect_any(seeds, config_without_ids())
+        .await
+        .unwrap();
     let id = chron_client::Uuid::from_u128(3);
     let head_before = c.node(l).default_db().db.head();
     let r = client
@@ -183,6 +317,7 @@ async fn an_unconfirmed_commit_is_not_retried() {
             chron_client::CommitOptions {
                 epoch: None,
                 sync: Some(false),
+                commit_id: None,
             },
         )
         .await

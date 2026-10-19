@@ -311,7 +311,8 @@ impl Chron for ChronService {
     ) -> Result<Response<pb::CommitResponse>, Status> {
         let dbn = self.db(&req)?;
         let r = req.into_inner();
-        let committed = ops::commit(&self.node, dbn, r.appends, r.epoch, r.sync).await?;
+        let commit_id = codec::commit_id(&r.commit_id)?;
+        let committed = ops::commit(&self.node, dbn, r.appends, r.epoch, r.sync, commit_id).await?;
         Ok(Response::new(codec::committed(committed)))
     }
 

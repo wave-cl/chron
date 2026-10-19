@@ -41,6 +41,17 @@ pub struct AppendArgs {
     /// Return once the commit is on the leader's disk.
     #[arg(long = "async")]
     r#async: bool,
+    /// The commit id, 32 hex digits or a UUID; a resend with the same
+    /// id is answered with the first landing. Random when absent.
+    #[arg(long)]
+    commit_id: Option<String>,
+}
+
+/// A commit id from the command line or a file.
+fn parse_commit_id(s: &str) -> Result<[u8; 16], Usage> {
+    chron::Uuid::parse_str(s)
+        .map(chron::Uuid::into_bytes)
+        .map_err(|_| Usage(format!("commit id {s:?} is not 32 hex digits or a UUID")))
 }
 
 /// `--sync`, `--async` or the daemon's default.
@@ -97,6 +108,7 @@ pub async fn append(conn: &Conn, format: Format, a: AppendArgs) -> anyhow::Resul
         Some(id) => txn.append(id, expected, events),
         None => txn.append_free(events),
     };
+    let commit_id = a.commit_id.as_deref().map(parse_commit_id).transpose()?;
     send(
         conn,
         format,
@@ -104,6 +116,7 @@ pub async fn append(conn: &Conn, format: Format, a: AppendArgs) -> anyhow::Resul
         chron_client::CommitOptions {
             epoch: a.epoch,
             sync: sync_choice(a.sync, a.r#async),
+            commit_id,
         },
     )
     .await
@@ -128,11 +141,17 @@ pub struct CommitArgs {
     /// Return once the commit is on the leader's disk.
     #[arg(long = "async")]
     r#async: bool,
+    /// The commit id, 32 hex digits or a UUID; wins over the file's
+    /// `commit_id`. Random when neither gives one.
+    #[arg(long)]
+    commit_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct TxnJson {
     appends: Vec<AppendJson>,
+    #[serde(default)]
+    commit_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -230,6 +249,12 @@ pub async fn commit(conn: &Conn, format: Format, a: CommitArgs) -> anyhow::Resul
             None => txn.append_free(events),
         };
     }
+    let commit_id = a
+        .commit_id
+        .as_deref()
+        .or(parsed.commit_id.as_deref())
+        .map(parse_commit_id)
+        .transpose()?;
     send(
         conn,
         format,
@@ -237,6 +262,7 @@ pub async fn commit(conn: &Conn, format: Format, a: CommitArgs) -> anyhow::Resul
         chron_client::CommitOptions {
             epoch: a.epoch,
             sync: sync_choice(a.sync, a.r#async),
+            commit_id,
         },
     )
     .await

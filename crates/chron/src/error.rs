@@ -98,6 +98,22 @@ pub enum Error {
     #[error("transaction has no appends")]
     EmptyTransaction,
 
+    /// A commit id seen before, on a transaction of another shape (other
+    /// aggregates, or other event counts per append). A resend of the
+    /// same transaction is answered with its first landing instead.
+    #[error("commit id {} was used by transaction {first}..{next} with a different shape: {reason}", Uuid::from_bytes(*id))]
+    CommitIdReused {
+        /// The id.
+        id: [u8; 16],
+        /// Where the earlier transaction landed (0 when it is in the same
+        /// batch and not landed yet).
+        first: u64,
+        /// Its next position.
+        next: u64,
+        /// What differed.
+        reason: String,
+    },
+
     /// An append in the transaction carried no events. `aggregate` is
     /// `None` for a free append.
     #[error("append to {} has no events", aggregate.map_or("no aggregate".to_string(), |a| format!("aggregate {a}")))]

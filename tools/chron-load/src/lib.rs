@@ -105,6 +105,9 @@ pub struct Report {
     /// Sync commits the leader could not get confirmed in time: landed
     /// locally, not acknowledged to the writer, not counted as acks.
     pub unconfirmed: u64,
+    /// Commits the leader answered with an earlier landing because the
+    /// client resent them under their commit id.
+    pub duplicates: u64,
     /// Every invariant that failed, with where and what.
     pub violations: Vec<String>,
 }
@@ -123,6 +126,7 @@ impl Report {
             "commit_p99_ms": self.commit_p99_ms, "final_head": self.final_head,
             "replica_head": self.replica_head, "kills": self.kills, "lost_acks": self.lost_acks,
             "failover_errors": self.failover_errors, "unconfirmed": self.unconfirmed,
+            "duplicates": self.duplicates,
             "violations": self.violations, "ok": self.ok(),
         })
     }
@@ -168,6 +172,7 @@ struct Shared {
     kills: AtomicU64,
     failover_errors: AtomicU64,
     unconfirmed: AtomicU64,
+    duplicates: AtomicU64,
     /// Kill mode: every acknowledged write as (position, payload hash,
     /// when).
     acks: std::sync::Mutex<Vec<(u64, u64, Instant)>>,
@@ -360,6 +365,11 @@ async fn writer(cfg: Config, client: Client, shared: Arc<Shared>, w: usize) {
                     .lock()
                     .await
                     .push(start.elapsed().as_nanos() as u64);
+                if c.duplicate {
+                    // A resend answered with the first landing: real
+                    // positions, acknowledged like any other.
+                    shared.duplicates.fetch_add(1, Ordering::Relaxed);
+                }
                 shared.transactions.fetch_add(1, Ordering::Relaxed);
                 shared.events.fetch_add(n, Ordering::Relaxed);
                 if c.appends[0].first_index != len || c.appends[0].new_len != len + n {
@@ -377,8 +387,9 @@ async fn writer(cfg: Config, client: Client, shared: Arc<Shared>, w: usize) {
                 seq += 1;
             }
             Err(ClientError::Unconfirmed { .. }) => {
-                // Landed on the leader, unconfirmed: not acknowledged, so
-                // not an ack to check; the length is read again.
+                // Landed on the leader, unconfirmed, and the client's
+                // resends ran out of time: not acknowledged, so not an
+                // ack to check; the length is read again.
                 shared.unconfirmed.fetch_add(1, Ordering::Relaxed);
                 lens.remove(&agg);
             }
@@ -790,6 +801,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         kills: AtomicU64::new(0),
         failover_errors: AtomicU64::new(0),
         unconfirmed: AtomicU64::new(0),
+        duplicates: AtomicU64::new(0),
         acks: std::sync::Mutex::new(Vec::new()),
         kill_log: std::sync::Mutex::new(Vec::new()),
     });
@@ -930,6 +942,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         lost_acks,
         failover_errors: shared.failover_errors.load(Ordering::Relaxed),
         unconfirmed: shared.unconfirmed.load(Ordering::Relaxed),
+        duplicates: shared.duplicates.load(Ordering::Relaxed),
         violations: shared
             .violations
             .lock()

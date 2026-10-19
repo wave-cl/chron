@@ -40,7 +40,16 @@ also takes a dense position in **one global order**, readable sequentially
 from any position, and carries any number of **tags**; reading a tag yields
 every event carrying it, in global order. An event may also belong to no
 aggregate at all (a **free** event); it still takes a global position and
-tags and commits with the rest of its transaction.
+tags and commits with the rest of its transaction. A transaction given a
+16-byte **commit id** (`txn.commit_id(id)`) can be sent again freely: a
+later commit with the same id and the same events' aggregates is
+answered with the first landing's positions and `Committed::duplicate`,
+nothing written, whatever its expectations and payloads; the same id on
+another shape is `Error::CommitIdReused`. The id lives in the
+transaction's first record (`Event::commit_id`), so it survives
+restarts, rebuilds, restores and replication; truncation and retention
+forget the ids of the records they drop, after which a resend lands
+again. `Db::lookup_commit(id)` says where an id landed.
 
 ```rust
 use chron::{Db, Expected, NewEvent, Options, Uuid};
@@ -227,14 +236,24 @@ with `limit` 0 for everything, each with a `_stream` variant,
 and `create_database` / `list_databases` / `drop_database`. A client is
 bound to one database: `ClientConfig.database`, or
 `client.database("orders")` for another binding over the same
-connection.
+connection. Every commit carries a random commit id
+(`ClientConfig.commit_ids`, on by default; `CommitOptions.commit_id` to
+choose one), which is what lets a `connect_any` client resend a commit
+that failed with `Unavailable`, `Transport`, `Unconfirmed` or a
+deadline to the leader it finds next: the answer is the first landing
+(`Committed::duplicate`) when the write survived, a single fresh
+landing when it died with the old leader. With ids off, only a commit
+refused for the node's role, or one whose every append carries an
+exact or `new` expectation, is resent. Run clients with ids off against
+0.4.0 daemons, which drop the id.
 Errors are typed: `Conflict`, `Fenced { epoch }`, `PositionOutOfRange
 { position, head }`, `BelowFloor { position, floor }`, `Unauthenticated`,
-`PermissionDenied`, `ResourceExhausted`, `Unavailable`, `NoLeader`.
+`PermissionDenied`, `ResourceExhausted`, `Unavailable`, `NoLeader`,
+`Unconfirmed { first, next }`.
 `ClientConfig` takes the TLS settings (`ca_pem`, an `Identity`,
 `domain`; only for `https://`), `token`, `admin_token`,
-`connect_timeout`, `request_timeout`, `max_message_bytes` and, for
-`connect_any`, `failover_timeout`. Code written against an embedded `chron::Db`
+`connect_timeout`, `request_timeout`, `max_message_bytes`,
+`commit_ids`, `sync_commit` and, for `connect_any`, `failover_timeout`. Code written against an embedded `chron::Db`
 moves to a daemon by swapping the handle; `examples/bank` does exactly
 that behind a small `Store` trait.
 
@@ -377,8 +396,9 @@ admin token, and with `--tls-cert` the gateway is HTTPS (a client CA is
 enforced there too). Bodies are bounded by `--max-message-bytes` (a
 third more, since JSON carries binary as base64), a response's head by
 `--request-timeout` (a bodiless 408 whose outcome is unknown: a commit
-may still land, so check before resending; a `tail` stream keeps running
-once it has started), and
+may still land, so resend it with the same `commit_id` or check before
+resending it without one; a `tail` stream keeps running once it has
+started), and
 `chron_http_requests_total{route,status}` counts the calls. Off by
 default; on a non-loopback address without a token or TLS the daemon
 warns.
@@ -402,6 +422,7 @@ chron promote | fence <EPOCH>                        # replication
 chron discover                                       # who leads, as the node at --addr knows it
 chron db create <NAME> | db list | db drop <NAME>    # databases; --db NAME (CHRON_DB) addresses one
 chron append --epoch N … | commit --epoch N …        # fencing token
+chron append --commit-id ID … | commit --commit-id ID …   # 32 hex digits or a UUID; a resend prints "already committed"; random when absent
 chron rebuild-index <DIR> | verify <DIR> | restore <ARCHIVE> <DIR> | inspect <ARCHIVE>   # offline, no daemon
 ```
 
@@ -560,8 +581,11 @@ When the wait ends without confirmation, because the followers are slow
 or gone or because the node stopped leading, the answer is
 `DEADLINE_EXCEEDED` "unconfirmed" with the positions the transaction
 landed at: it is on the leader's disk and replicates unless that node
-dies, so it must not be resent blindly; check with an exact expectation
-(a resend then conflicts) or a read. The client never retries it.
+dies. A resend with the same commit id (the client's default) is safe:
+the leader found next answers it with the first landing if the write
+replicated and lands it once if it died with the old leader. Without an
+id it must not be resent blindly; check with an exact expectation (a
+resend then conflicts) or a read.
 
 A request chooses for itself (`CommitRequest.sync`, `?sync=` on the
 gateway, `chron append --sync` / `--async`, `Client::commit_with`); the

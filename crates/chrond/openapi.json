@@ -85,6 +85,10 @@
             "items": {
               "$ref": "#/components/schemas/Append"
             }
+          },
+          "commit_id": {
+            "type": "string",
+            "description": "16 bytes as 32 hex digits or a hyphenated UUID. A later commit with the same id and the same events' aggregates is answered with the first one's positions and duplicate: true, nothing written, whatever its expectations and payloads; the same id on another shape is 400. Ids of transactions dropped by retention or truncation are forgotten."
           }
         }
       },
@@ -93,6 +97,10 @@
         "properties": {
           "position": {
             "type": "integer"
+          },
+          "commit_id": {
+            "type": "string",
+            "description": "the transaction's commit id, on its first event only; absent otherwise"
           },
           "aggregate": {
             "type": [
@@ -165,6 +173,10 @@
       "Committed": {
         "type": "object",
         "properties": {
+          "duplicate": {
+            "type": "boolean",
+            "description": "the commit_id was seen before: these are the earlier landing's positions and nothing was written now"
+          },
           "first": {
             "type": "integer"
           },
@@ -520,7 +532,7 @@
             "schema": {
               "type": "boolean"
             },
-            "description": "true: answer once a majority of the group durably holds the transaction; false: once it is on this node's disk; absent: the daemon's --sync-commit. Ignored without peers. A transaction that landed locally but was not confirmed in time is 504 with committed_first and committed_next: it stays on this node and replicates unless the node dies; do not resend it blindly."
+            "description": "true: answer once a majority of the group durably holds the transaction; false: once it is on this node's disk; absent: the daemon's --sync-commit. Ignored without peers. A transaction that landed locally but was not confirmed in time is 504 with committed_first and committed_next: it stays on this node and replicates unless the node dies; resend it with the same commit_id, or check first."
           }
         ],
         "requestBody": {
@@ -533,7 +545,7 @@
             }
           }
         },
-        "description": " With --request-timeout a 408 has no body and means the outcome is unknown: the transaction may still land; check with an exact expectation or a read before resending."
+        "description": " With --request-timeout a 408 has no body and means the outcome is unknown: the transaction may still land; resend it with the same commit_id, or check with an exact expectation or a read before resending it without one."
       }
     },
     "/v1/db/{db}/events": {

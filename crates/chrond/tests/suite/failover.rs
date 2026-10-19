@@ -965,3 +965,97 @@ async fn a_fetched_backup_of_another_database_is_refused_and_the_old_copy_stays(
     c.wait_heads(200, SOON).await;
     c.stop_all().await;
 }
+
+/// A commit resent under its id after the leader died lands exactly
+/// once: as a duplicate when the write had replicated, afresh when it
+/// died with the leader.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_id_lands_once_across_a_leader_death() {
+    let mut c = Cluster::start(3, TTL).await;
+    let l1 = c.wait_for_leader(SOON).await;
+    let others: Vec<usize> = (0..3).filter(|i| *i != l1).collect();
+    for i in &others {
+        c.wait_following(*i, l1, SOON).await;
+    }
+    c.wait("followers attached", SOON, || c.followers(l1).len() == 2)
+        .await;
+    let txn = |payload: &str| {
+        let mut t = chron_client::Transaction::new();
+        t.append_free(vec![NewEvent::new(payload.to_string())]);
+        t
+    };
+    let with_id = |id: u8| chron_client::CommitOptions {
+        commit_id: Some([id; 16]),
+        ..Default::default()
+    };
+    // (a) Replicated, then the leader dies: the resend is a duplicate.
+    let a = c
+        .client(l1)
+        .await
+        .commit_with(txn("replicated"), with_id(1))
+        .await
+        .unwrap();
+    assert_eq!((a.first, a.duplicate), (0, false));
+    c.wait_heads(1, SOON).await;
+    c.stop(l1).await;
+    let l2 = c.wait_for_leader(SOON).await;
+    let again = c
+        .client(l2)
+        .await
+        .commit_with(txn("replicated"), with_id(1))
+        .await
+        .unwrap();
+    assert_eq!((again.first, again.next, again.duplicate), (0, 1, true));
+    // (b) Held back on the follower, so it dies with the leader: the
+    // resend lands afresh on the next leader.
+    let f = (0..3).find(|i| *i != l1 && *i != l2).unwrap();
+    c.restart(l1).await;
+    c.wait_following(l1, l2, SOON).await;
+    c.wait("followers attached", SOON, || c.followers(l2).len() == 2)
+        .await;
+    c.hold_apply(f, true);
+    c.hold_apply(l1, true);
+    let client = c.client(l2).await;
+    let r = client
+        .commit_with(
+            txn("lost"),
+            chron_client::CommitOptions {
+                sync: Some(false),
+                ..with_id(2)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!((r.first, r.duplicate), (1, false));
+    assert_eq!(c.node(l2).default_db().db.head(), 2);
+    // The holds stay through the election: a released follower would
+    // apply the chunk it already received.
+    c.stop(l2).await;
+    let l3 = c.wait_for_leader(SOON).await;
+    assert_ne!(l3, l2);
+    assert_eq!(
+        c.node(l3).default_db().db.head(),
+        1,
+        "the write died with {l2}"
+    );
+    let fresh = c
+        .client(l3)
+        .await
+        .commit_with(
+            txn("lost"),
+            chron_client::CommitOptions {
+                sync: Some(false),
+                ..with_id(2)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!((fresh.first, fresh.duplicate), (1, false));
+    c.hold_apply(f, false);
+    c.hold_apply(l1, false);
+    let log = c.client(l3).await.read_all(0, 0).await.unwrap();
+    let lost: Vec<_> = log.iter().filter(|e| e.payload == "lost").collect();
+    assert_eq!(lost.len(), 1, "exactly one copy");
+    assert_eq!(log.iter().filter(|e| e.payload == "replicated").count(), 1);
+    c.stop_all().await;
+}

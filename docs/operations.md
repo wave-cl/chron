@@ -54,12 +54,14 @@ The leader died:
 1. Nothing to do: within one to two leases the surviving pair elects the
    more up-to-date one; `chron_leader_changes_total` rises on it,
    `chron --addr $B,$C discover` names it. Writers using `connect_any`
-   retry on their own for `failover_timeout` (30 s) under the rule the
-   README states (a commit that may have landed is resent only with an
-   exact or `new` expectation); others repoint.
+   retry on their own for `failover_timeout` (30 s): with commit ids
+   (the default since 0.5.0) every commit is resent and lands exactly
+   once; with ids off a commit that may have landed is resent only with
+   an exact or `new` expectation. Others repoint.
 2. With `--sync-commit majority` (the default) nothing acknowledged is
-   lost; writers that received "unconfirmed" must check before resending
-   (an exact expectation, or a read). With `off`, writes the dead leader
+   lost; a writer that received "unconfirmed" resends with the same
+   commit id, or without one checks before resending (an exact
+   expectation, or a read). With `off`, writes the dead leader
    acknowledged after the last transaction the new leader had pulled are
    lost: the replication lag at that moment (`chron_replication_lag_events`;
    `chron-load --kill-leader-every` measures it on your traffic).
@@ -131,7 +133,9 @@ on the replica host:
    operator does (two runbooks above).
 3. `chron --addr $LEADER retain FLOOR`, then the same on each replica.
 4. `chron info` (or `chron_floor`) confirms the floor, which lands on a
-   segment boundary at or below FLOOR.
+   segment boundary at or below FLOOR. Commit ids of transactions below
+   the floor are forgotten with them: a client resending one that old
+   lands it again.
 
 ## Rotating tokens
 
@@ -172,6 +176,14 @@ so only file contents change.
 3. The leader last: restart it (writes pause while it is down; replicas
    reconnect), or promote a replica, upgrade the old leader and rejoin it.
 4. `chron_build_info{version}` on every node shows the new version.
+5. 0.5.0 writes records 0.4.0 cannot read as soon as a client sends a
+   commit id, and every 0.5.0 client does by default. Never run a 0.4.0
+   follower under a 0.5.0 leader (it stops applying with "unknown flag
+   bits 0x08" and sync commits go unconfirmed), and there is no
+   downgrade of a directory once an id-carrying transaction is in it.
+   Clients last: a 0.4.0 daemon drops the id, and a 0.5.0 client's wider
+   retry rule would then write twice, so until every daemon runs 0.5.0
+   keep clients on `commit_ids: false`.
 
 ## Reading the metrics
 

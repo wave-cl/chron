@@ -979,3 +979,63 @@ fn backup_fetch_then_restore_and_verify() {
         .assert()
         .code(2);
 }
+
+#[test]
+fn append_with_a_commit_id_twice_prints_already_committed() {
+    let d = Daemon::start();
+    let id = "0123456789abcdef0123456789abcdef";
+    d.chron()
+        .args(["append", "free", "-d", "a", "-d", "b", "--commit-id", id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("committed 0..1 (next 2)"));
+    d.chron()
+        .args(["append", "free", "-d", "x", "-d", "y", "--commit-id", id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "already committed 0..1 (next 2); nothing written",
+        ));
+    d.chron()
+        .args([
+            "--json",
+            "append",
+            "free",
+            "-d",
+            "x",
+            "-d",
+            "y",
+            "--commit-id",
+            id,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"duplicate\":true"));
+    d.chron()
+        .args(["append", "free", "-d", "x", "--commit-id", "nope"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("commit id"));
+    // The file form, and the events show the id.
+    let file = d.dir.path().join("txn.json");
+    std::fs::write(
+        &file,
+        format!(
+            r#"{{"commit_id":"{id}","appends":[{{"aggregate":null,"events":[{{"payload":"p"}},{{"payload":"q"}}]}}]}}"#
+        ),
+    )
+    .unwrap();
+    d.chron()
+        .args(["commit", "-f", file.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already committed 0..1"));
+    d.chron()
+        .args(["--json", "all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "01234567-89ab-cdef-0123-456789abcdef",
+        ));
+    assert_eq!(d.db().head(), 2);
+}

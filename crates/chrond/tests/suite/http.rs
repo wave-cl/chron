@@ -489,6 +489,7 @@ async fn tail_streams_live_events_and_ends_when_the_database_is_dropped() {
             appends: vec![append(Some(agg(1)), any(), vec![new_event("live", &["t"])])],
             epoch: None,
             sync: None,
+            commit_id: Vec::new(),
         })
         .await
         .unwrap();
@@ -723,5 +724,82 @@ async fn limit_zero_is_the_maximum_and_quoted_numbers_are_expectations() {
     .await;
     assert_eq!(code, 200, "{v}");
     assert_eq!(v["events"][0]["payload"], "bin");
+    s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gateway_takes_commit_id_and_answers_duplicate() {
+    let s = Server::start_with(with_http).await;
+    let addr = s.running.as_ref().unwrap().http_addr.unwrap();
+    let hex = "0123456789abcdef0123456789abcdef";
+    let hyphenated = "01234567-89ab-cdef-0123-456789abcdef";
+    let txn = |id: &str| {
+        json!({"commit_id": id, "appends": [{"aggregate": AGG, "expect": "any", "events": [{"payload": "a"}, {"payload": "b"}]}]}).to_string()
+    };
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/commit".into(),
+        vec![],
+        Some(txn(hex)),
+    )
+    .await;
+    assert_eq!(
+        (code, v["duplicate"].as_bool(), v["first"].as_u64()),
+        (200, Some(false), Some(0))
+    );
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/commit".into(),
+        vec![],
+        Some(txn(hyphenated)),
+    )
+    .await;
+    assert_eq!(
+        (
+            code,
+            v["duplicate"].as_bool(),
+            v["first"].as_u64(),
+            v["next"].as_u64()
+        ),
+        (200, Some(true), Some(0), Some(2))
+    );
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/events?from=0&limit=10".into(),
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!(code, 200);
+    let events = v["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "nothing was written twice");
+    assert_eq!(events[0]["commit_id"], hyphenated);
+    assert!(events[1].get("commit_id").is_none());
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/commit".into(),
+        vec![],
+        Some(txn("not-an-id")),
+    )
+    .await;
+    assert_eq!((code, v["code"].as_str()), (400, Some("InvalidArgument")));
+    let other = json!({"commit_id": hex, "appends": [{"aggregate": AGG, "expect": "any", "events": [{"payload": "a"}]}]}).to_string();
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/commit".into(),
+        vec![],
+        Some(other),
+    )
+    .await;
+    assert_eq!((code, v["code"].as_str()), (400, Some("InvalidArgument")));
+    assert!(
+        v["error"].as_str().unwrap().contains("different shape"),
+        "{v}"
+    );
     s.stop().await;
 }

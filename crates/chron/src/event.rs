@@ -4,11 +4,13 @@
 //! ```text
 //! body (all big-endian)
 //!   u8   format (1)
-//!   u8   flags            bit0 FIRST_IN_TXN, bit1 LAST_IN_TXN, bit2 FREE; other bits must be 0
+//!   u8   flags            bit0 FIRST_IN_TXN, bit1 LAST_IN_TXN, bit2 FREE, bit3 COMMIT_ID;
+//!                         other bits must be 0
 //!   u64  position
 //!   [16] aggregate uuid   zero when FREE
 //!   u64  aggregate index  zero when FREE
 //!   i64  recorded_at      unix nanoseconds, one value per transaction
+//!   [16] commit id        only when COMMIT_ID is set, which needs FIRST_IN_TXN
 //!   u8   tag_count, then tag_count × (u8 len, bytes)
 //!   u32  metadata_len, bytes
 //!   u32  payload_len, bytes
@@ -24,7 +26,14 @@ pub const FLAG_FIRST_IN_TXN: u8 = 0b01;
 pub const FLAG_LAST_IN_TXN: u8 = 0b10;
 /// The event belongs to no aggregate.
 pub const FLAG_FREE: u8 = 0b100;
-const KNOWN_FLAGS: u8 = FLAG_FIRST_IN_TXN | FLAG_LAST_IN_TXN | FLAG_FREE;
+/// The event is the first of its transaction and carries the 16-byte
+/// commit id the committer gave (since 0.5.0; a 0.4.0 reader refuses it).
+pub const FLAG_COMMIT_ID: u8 = 0b1000;
+const KNOWN_FLAGS: u8 = FLAG_FIRST_IN_TXN | FLAG_LAST_IN_TXN | FLAG_FREE | FLAG_COMMIT_ID;
+/// The flags a 0.4.0 reader knows; what it refuses is a record with a
+/// commit id.
+#[cfg(test)]
+const KNOWN_FLAGS_0_4: u8 = FLAG_FIRST_IN_TXN | FLAG_LAST_IN_TXN | FLAG_FREE;
 
 /// Longest tag, in bytes.
 pub const MAX_TAG_BYTES: usize = 255;
@@ -90,8 +99,12 @@ pub struct Event {
     /// every event of one transaction.
     pub recorded_at: i64,
     /// Transaction-boundary and free-event flags: [`FLAG_FIRST_IN_TXN`],
-    /// [`FLAG_LAST_IN_TXN`], [`FLAG_FREE`].
+    /// [`FLAG_LAST_IN_TXN`], [`FLAG_FREE`], [`FLAG_COMMIT_ID`].
     pub flags: u8,
+    /// The id the committer gave the transaction, on its first event
+    /// only; `None` on the others and on transactions committed without
+    /// one.
+    pub commit_id: Option<[u8; 16]>,
     /// The tags the event carries, sorted, without duplicates.
     pub tags: Vec<Bytes>,
     /// Opaque bytes beside the payload; empty when none were given.
@@ -123,20 +136,35 @@ impl Event {
 }
 
 /// Encoded size of a body with these variable parts.
-pub(crate) fn body_len(tags: &[Bytes], metadata_len: usize, payload_len: usize) -> usize {
-    FIXED_LEN + tags.iter().map(|t| 1 + t.len()).sum::<usize>() + 4 + metadata_len + 4 + payload_len
+pub(crate) fn body_len(
+    tags: &[Bytes],
+    metadata_len: usize,
+    payload_len: usize,
+    has_id: bool,
+) -> usize {
+    FIXED_LEN
+        + if has_id { 16 } else { 0 }
+        + tags.iter().map(|t| 1 + t.len()).sum::<usize>()
+        + 4
+        + metadata_len
+        + 4
+        + payload_len
 }
 
 /// Appends the body of `ev` to `out`. The caller has checked the tag limits.
 pub(crate) fn encode_body(ev: &Event, out: &mut Vec<u8>) {
     debug_assert!(ev.tags.len() <= MAX_TAGS_PER_EVENT);
     debug_assert_eq!(ev.aggregate.is_none(), ev.flags & FLAG_FREE != 0);
+    debug_assert_eq!(ev.commit_id.is_some(), ev.flags & FLAG_COMMIT_ID != 0);
     out.push(BODY_FORMAT);
     out.push(ev.flags);
     out.extend_from_slice(&ev.position.to_be_bytes());
     out.extend_from_slice(ev.aggregate.unwrap_or(Uuid::nil()).as_bytes());
     out.extend_from_slice(&ev.index.to_be_bytes());
     out.extend_from_slice(&ev.recorded_at.to_be_bytes());
+    if let Some(id) = &ev.commit_id {
+        out.extend_from_slice(id);
+    }
     out.push(ev.tags.len() as u8);
     for t in &ev.tags {
         debug_assert!(t.len() <= MAX_TAG_BYTES);
@@ -158,6 +186,8 @@ pub(crate) enum DecodeError {
     Flags(u8),
     /// A free event carrying an aggregate or an index.
     FreeWithOwner,
+    /// A commit id on a record that does not start a transaction.
+    IdNotFirst,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -168,6 +198,9 @@ impl std::fmt::Display for DecodeError {
             DecodeError::Format(v) => write!(f, "unknown body format {v}"),
             DecodeError::Flags(v) => write!(f, "unknown flag bits {v:#04x}"),
             DecodeError::FreeWithOwner => write!(f, "free event carries an aggregate or index"),
+            DecodeError::IdNotFirst => {
+                write!(f, "commit id on a record that does not start a transaction")
+            }
         }
     }
 }
@@ -204,13 +237,19 @@ impl<'a> Cursor<'a> {
 
 /// Decodes a body. Copies the variable parts out of `body`.
 pub(crate) fn decode_body(body: &[u8]) -> Result<Event, DecodeError> {
+    decode_body_with(body, KNOWN_FLAGS)
+}
+
+/// `decode_body` for a reader that knows only `known_flags`: how an older
+/// binary sees a record.
+fn decode_body_with(body: &[u8], known_flags: u8) -> Result<Event, DecodeError> {
     let mut c = Cursor { buf: body, at: 0 };
     let format = c.u8()?;
     if format != BODY_FORMAT {
         return Err(DecodeError::Format(format));
     }
     let flags = c.u8()?;
-    if flags & !KNOWN_FLAGS != 0 {
+    if flags & !known_flags != 0 {
         return Err(DecodeError::Flags(flags));
     }
     let position = c.u64()?;
@@ -225,6 +264,14 @@ pub(crate) fn decode_body(body: &[u8]) -> Result<Event, DecodeError> {
         Some(id)
     };
     let recorded_at = c.i64()?;
+    let commit_id = if flags & FLAG_COMMIT_ID != 0 {
+        if flags & FLAG_FIRST_IN_TXN == 0 {
+            return Err(DecodeError::IdNotFirst);
+        }
+        Some(<[u8; 16]>::try_from(c.take(16)?).unwrap())
+    } else {
+        None
+    };
     let tag_count = c.u8()? as usize;
     let mut tags = Vec::with_capacity(tag_count);
     for _ in 0..tag_count {
@@ -244,6 +291,7 @@ pub(crate) fn decode_body(body: &[u8]) -> Result<Event, DecodeError> {
         index,
         recorded_at,
         flags,
+        commit_id,
         tags,
         metadata,
         payload,
@@ -261,6 +309,7 @@ mod tests {
             index: if flags & FLAG_FREE == 0 { 42 } else { 0 },
             recorded_at: -5,
             flags,
+            commit_id: (flags & FLAG_COMMIT_ID != 0).then_some([9; 16]),
             tags,
             metadata: Bytes::copy_from_slice(metadata),
             payload: Bytes::copy_from_slice(payload),
@@ -282,7 +331,7 @@ mod tests {
             b"payload bytes",
         );
         let body = encode(&ev);
-        assert_eq!(body.len(), body_len(&ev.tags, 4, 13));
+        assert_eq!(body.len(), body_len(&ev.tags, 4, 13, false));
         assert_eq!(decode_body(&body).unwrap(), ev);
     }
 
@@ -304,7 +353,7 @@ mod tests {
         );
         assert!(ev.is_free());
         let body = encode(&ev);
-        assert_eq!(body.len(), body_len(&ev.tags, 1, 1));
+        assert_eq!(body.len(), body_len(&ev.tags, 1, 1, false));
         assert_eq!(decode_body(&body).unwrap(), ev);
         let mut owned = body.clone();
         owned[10 + 15] = 1;
@@ -327,7 +376,7 @@ mod tests {
             .collect();
         let ev = sample(FLAG_LAST_IN_TXN, tags, b"", b"");
         let body = encode(&ev);
-        assert_eq!(body.len(), body_len(&ev.tags, 0, 0));
+        assert_eq!(body.len(), body_len(&ev.tags, 0, 0, false));
         assert_eq!(decode_body(&body).unwrap(), ev);
     }
 
@@ -367,8 +416,49 @@ mod tests {
     #[test]
     fn unknown_flag_bits_rejected() {
         let mut body = encode(&sample(0, vec![], b"", b""));
-        body[1] = 0b1000;
-        assert_eq!(decode_body(&body), Err(DecodeError::Flags(0b1000)));
+        body[1] = 0b1_0000;
+        assert_eq!(decode_body(&body), Err(DecodeError::Flags(0b1_0000)));
+    }
+
+    #[test]
+    fn a_commit_id_round_trips_on_a_first_record() {
+        let ev = sample(
+            FLAG_FIRST_IN_TXN | FLAG_LAST_IN_TXN | FLAG_COMMIT_ID,
+            vec![Bytes::from_static(b"t")],
+            b"m",
+            b"p",
+        );
+        assert_eq!(ev.commit_id, Some([9; 16]));
+        let body = encode(&ev);
+        assert_eq!(body.len(), body_len(&ev.tags, 1, 1, true));
+        assert_eq!(decode_body(&body).unwrap(), ev);
+        // The id sits right after recorded_at.
+        assert_eq!(&body[FIXED_LEN - 1..FIXED_LEN - 1 + 16], &[9u8; 16]);
+    }
+
+    #[test]
+    fn a_commit_id_off_a_first_record_is_rejected() {
+        let ev = sample(FLAG_FIRST_IN_TXN | FLAG_COMMIT_ID, vec![], b"", b"");
+        let mut body = encode(&ev);
+        body[1] = FLAG_COMMIT_ID | FLAG_LAST_IN_TXN;
+        assert_eq!(decode_body(&body), Err(DecodeError::IdNotFirst));
+    }
+
+    /// The proof that a 0.4.0 binary refuses a record with a commit id
+    /// rather than misreading it: its flag mask does not know the bit.
+    #[test]
+    fn an_old_reader_rejects_a_record_with_a_commit_id() {
+        let with_id = sample(FLAG_FIRST_IN_TXN | FLAG_COMMIT_ID, vec![], b"", b"p");
+        let body = encode(&with_id);
+        assert_eq!(
+            decode_body_with(&body, KNOWN_FLAGS_0_4),
+            Err(DecodeError::Flags(FLAG_FIRST_IN_TXN | FLAG_COMMIT_ID))
+        );
+        let without = sample(FLAG_FIRST_IN_TXN, vec![], b"", b"p");
+        assert_eq!(
+            decode_body_with(&encode(&without), KNOWN_FLAGS_0_4).unwrap(),
+            without
+        );
     }
 
     #[test]
@@ -390,6 +480,8 @@ mod tests {
                 FLAG_FIRST_IN_TXN,
                 FLAG_LAST_IN_TXN,
                 FLAG_FIRST_IN_TXN | FLAG_LAST_IN_TXN,
+                FLAG_FIRST_IN_TXN | FLAG_COMMIT_ID,
+                FLAG_FIRST_IN_TXN | FLAG_LAST_IN_TXN | FLAG_COMMIT_ID,
             ]);
             let tags = prop::collection::vec(
                 prop::collection::vec(any::<u8>(), 0..=MAX_TAG_BYTES).prop_map(Bytes::from),
@@ -403,18 +495,31 @@ mod tests {
                 any::<u64>(),
                 any::<u64>(),
                 any::<i64>(),
+                any::<u128>(),
                 tags,
                 blob(),
                 blob(),
             )
                 .prop_map(
-                    |(flags, free, id, index, position, recorded_at, tags, metadata, payload)| {
+                    |(
+                        flags,
+                        free,
+                        id,
+                        index,
+                        position,
+                        recorded_at,
+                        cid,
+                        tags,
+                        metadata,
+                        payload,
+                    )| {
                         Event {
                             position,
                             aggregate: (!free).then_some(Uuid::from_u128(id)),
                             index: if free { 0 } else { index },
                             recorded_at,
                             flags: flags | if free { FLAG_FREE } else { 0 },
+                            commit_id: (flags & FLAG_COMMIT_ID != 0).then_some(cid.to_be_bytes()),
                             tags,
                             metadata,
                             payload,
@@ -427,7 +532,7 @@ mod tests {
             #[test]
             fn any_event_round_trips(ev in arb_event()) {
                 let body = encode(&ev);
-                prop_assert_eq!(body.len(), body_len(&ev.tags, ev.metadata.len(), ev.payload.len()));
+                prop_assert_eq!(body.len(), body_len(&ev.tags, ev.metadata.len(), ev.payload.len(), ev.commit_id.is_some()));
                 prop_assert_eq!(decode_body(&body).unwrap(), ev);
                 prop_assert_eq!(decode_body(&body[..body.len() - 1]), Err(DecodeError::Short));
                 let mut longer = body.clone();

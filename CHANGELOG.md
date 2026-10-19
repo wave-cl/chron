@@ -6,7 +6,52 @@ crates share one version.
 
 ## Unreleased
 
-Nothing yet.
+### chron-db
+
+- Idempotent commits: `Transaction::commit_id([u8; 16])` stores the id
+  in the transaction's first record (`FLAG_COMMIT_ID`, 16 bytes after
+  `recorded_at`; `Event::commit_id`) and in a new index table `txn_id`.
+  A later commit with the same id and the same events' aggregates is
+  answered with the original positions and `Committed::duplicate`,
+  nothing written, whatever its expectations and payloads; another
+  shape is `Error::CommitIdReused`. `Db::lookup_commit`,
+  `Stats::duplicates`. Truncation and retention forget the ids of the
+  records they drop (a resend of a transaction below the floor lands
+  again); rebuild, restore and applied backups keep them. **On disk,
+  one way**: a record carrying an id is refused by 0.4.0 ("unknown flag
+  bits 0x08"); an index written by 0.5.0 opens on 0.5.0 without
+  migration.
+
+### chron-proto
+
+- `CommitRequest.commit_id` (4), `CommitResponse.duplicate` (5),
+  `Event.commit_id` (10).
+
+### chrond
+
+- Commit ids over gRPC and the gateway (`commit_id` in the transaction
+  JSON, `duplicate` in the answer, `commit_id` on events); a reused id
+  with another shape is INVALID_ARGUMENT / 400;
+  `chron_commits_total{result="duplicate"}`.
+
+### chron-client
+
+- Every commit carries a random commit id (`ClientConfig::commit_ids`,
+  default on; `CommitOptions::commit_id` to choose it) and is therefore
+  resent after `Unavailable`, `Transport`, `Fenced`, `Unconfirmed` and a
+  deadline, free appends and epoch tokens included, landing exactly
+  once; `commit_ids: false` keeps the 0.4.0 rule. Upgrade daemons before
+  clients: a 0.4.0 daemon ignores the id.
+
+### chron-cli
+
+- `append --commit-id`, `commit --commit-id` (or `"commit_id"` in the
+  file); a resend prints `already committed` (`"duplicate"` in JSON);
+  events show their `commit_id`.
+
+### tools
+
+- `chron-load` counts `duplicates`.
 
 ## 0.4.0 - 2026-10-19
 

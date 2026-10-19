@@ -14,6 +14,9 @@ message Event {
   repeated bytes tags = 7;
   bytes metadata = 8;
   bytes payload = 9;
+  // The 16-byte commit id the writer gave the transaction, on its first
+  // event only.
+  optional bytes commit_id = 10;
 }
 
 message NewEvent {
@@ -54,9 +57,17 @@ message CommitRequest {
   // landed locally but was not confirmed by a majority within the sync
   // timeout, or before the node stopped leading, is DEADLINE_EXCEEDED
   // with the metadata `chron-committed-first` and `chron-committed-next`:
-  // it is on this node's disk and replicates unless the node dies; do not
-  // resend it blindly.
+  // it is on this node's disk and replicates unless the node dies. Resend
+  // it with the same commit_id, or check before resending it without one.
   optional bool sync = 3;
+  // Sixteen bytes chosen by the writer, or empty. A later commit with the
+  // same id and the same events' aggregates is answered with the first
+  // one's positions and `duplicate = true`, nothing written, whatever its
+  // expectations and payloads; the same id on another shape is
+  // INVALID_ARGUMENT. Stored in the transaction's first record (a 0.4.0
+  // daemon cannot read it). Ids of transactions dropped by retention or
+  // truncation are forgotten.
+  bytes commit_id = 4;
 }
 
 enum Role {
@@ -84,6 +95,9 @@ message CommitResponse {
   uint64 last = 2;
   uint64 next = 3;
   repeated AppendResult appends = 4;
+  // The commit_id was seen before: these are the positions of the earlier
+  // landing and nothing was written now.
+  bool duplicate = 5;
 }
 
 // For every finite read, `limit` 0 means "to the end". Forward, `from` is

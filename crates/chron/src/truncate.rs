@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::db::Inner;
 use crate::error::{Error, Result};
 use crate::event::FLAG_FIRST_IN_TXN;
-use crate::index::{AGG_INDEX, AGG_LEN, HEAD_KEY, META, POS, TAG};
+use crate::index::{AGG_INDEX, AGG_LEN, HEAD_KEY, META, POS, TAG, TXN_ID};
 use crate::recover::{Item, Records};
 use crate::segment::{self, SegmentWriter};
 
@@ -67,6 +67,7 @@ pub(crate) fn truncate(inner: &Inner, to: u64) -> Result<Truncated> {
     let mut agg_keys: Vec<(Uuid, u64)> = Vec::new();
     let mut agg_len: std::collections::HashMap<Uuid, u64> = std::collections::HashMap::new();
     let mut tag_keys: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut ids: Vec<[u8; 16]> = Vec::new();
     let mut boundary_checked = false;
     for (base, path) in listed.iter().filter(|(b, _)| *b >= loc.base) {
         let mut records = Records::open(path, *base, inner.opts.max_record_bytes)?;
@@ -89,6 +90,9 @@ pub(crate) fn truncate(inner: &Inner, to: u64) -> Result<Truncated> {
                         boundary_checked = true;
                     }
                     positions.push(r.position);
+                    if let Some(id) = r.event.commit_id {
+                        ids.push(id);
+                    }
                     if let Some(id) = r.event.aggregate {
                         agg_keys.push((id, r.event.index));
                         agg_len
@@ -138,6 +142,11 @@ pub(crate) fn truncate(inner: &Inner, to: u64) -> Result<Truncated> {
         }
         for (t, p) in &tag_keys {
             tag.remove((t.as_slice(), *p))?;
+        }
+        // The cut transactions' ids go with them: a resend lands again.
+        let mut txn_ids = txn.open_table(TXN_ID)?;
+        for id in &ids {
+            txn_ids.remove(id)?;
         }
         txn.open_table(META)?.insert(HEAD_KEY, to)?;
     }
