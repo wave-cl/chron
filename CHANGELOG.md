@@ -6,7 +6,35 @@ crates share one version.
 
 ## Unreleased
 
+### chron-proto
+
+- `Follow`: replication with acknowledgments (a `FollowRequest` stream
+  of `open` then `applied` messages, chunks back); `CommitRequest.sync`;
+  `ReplicationChunk.epoch_base`; `InfoResponse` gains
+  `majority_applied`, `followers` and `sync_commit`; the metadata keys
+  `chron-committed-first` and `chron-committed-next` on a sync commit
+  answered `DEADLINE_EXCEEDED`.
+
 ### chrond
+
+- Synchronous replication: with peers a commit is acknowledged only once
+  a majority durably holds it (`--sync-commit majority`, the default;
+  `off` for the old behaviour; `--sync-timeout`, the lease ttl by
+  default). Followers report applied heads through `Follow` and fall
+  back to `Replicate` on a leader without it. A commit not confirmed in
+  time, or before the node stopped leading, answers `DEADLINE_EXCEEDED`
+  "unconfirmed" with the positions it landed at. Only configured peers
+  at least as durable as the leader count. A follower adopts the
+  leader's epoch only once it holds what that epoch's leader held at its
+  election, and a candidate claims the lowest epoch among its databases,
+  so an elected leader holds every confirmed write; with peers a start
+  no longer raises a lagging database's epoch. Metrics
+  `chron_sync_commit_wait_seconds`, `chron_sync_commit_timeouts_total`,
+  `chron_majority_applied`, `chron_follower_applied_head`,
+  `chron_follower_counted`, `chron_sync_commit`; `commit_duration`
+  includes the wait; `chron_commits_total{result="unconfirmed"}`. The
+  gateway takes `?sync=` and answers 504 with `committed_first` and
+  `committed_next`.
 
 - Failover review fixes: a campaign asks for pre-votes first, so a lost
   or refused campaign (a forced promotion of a lagging node included)
@@ -44,6 +72,10 @@ crates share one version.
 
 ### chron-client
 
+- `CommitOptions` and `Client::commit_with` (an epoch token and a sync
+  choice), `ClientConfig::sync_commit`, `ClientError::Unconfirmed`
+  (never retried), the `Info` fields `majority_applied`, `followers` and
+  `sync_commit`, `FollowerStatus`, and the daemon-to-daemon `follow`.
 - `connect_any` uses a seed that leads itself and otherwise believes a
   named leader only once it confirms it leads, with bounded probes and
   one search at a time; `ClientConfig::failover_timeout` (30 s)
@@ -54,6 +86,10 @@ crates share one version.
 
 ### chron-cli
 
+- `chron append` and `chron commit` take `--sync` or `--async`; an
+  unconfirmed commit prints the positions it landed at; `chron info`
+  shows the sync default, the majority-applied position and one line per
+  follower.
 - `chron discover` asks every address of `--addr` and prints one line
   per node; a list with mixed schemes is a usage error; "no leader"
   exits 2. The JSON `commit` path refuses an expectation on a free
@@ -61,6 +97,9 @@ crates share one version.
 
 ### tools
 
+- `chron-load --sync` / `--async`; the report counts `unconfirmed`
+  commits; the kill test runs in both modes and asserts that no
+  acknowledged write is lost in sync mode.
 - `chron-load` kill mode: a kill is counted only when it happened, waits
   until every other node is a connected follower, keeps the leader's
   address as the `--pid` key, treats only not-the-leader, unreachable

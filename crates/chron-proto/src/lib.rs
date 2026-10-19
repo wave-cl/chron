@@ -26,6 +26,12 @@ pub const POSITION_HEADER: &str = "chron-position";
 pub const FLOOR_HEADER: &str = "chron-floor";
 /// On an `OUT_OF_RANGE` for a position past the head: the head.
 pub const HEAD_HEADER: &str = "chron-head";
+/// On a `DEADLINE_EXCEEDED` from `Commit` with `sync`: the first position
+/// of the transaction, which landed locally but was not confirmed by a
+/// majority in time.
+pub const COMMITTED_FIRST_HEADER: &str = "chron-committed-first";
+/// On the same status: the head after that transaction.
+pub const COMMITTED_NEXT_HEADER: &str = "chron-committed-next";
 /// Request metadata naming the database a call is for; absent means
 /// [`DEFAULT_DATABASE`].
 pub const DATABASE_HEADER: &str = "chron-db";

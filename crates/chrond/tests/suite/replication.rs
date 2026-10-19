@@ -70,6 +70,7 @@ async fn replica_refuses_writes_and_apply_but_backs_up_and_retains() {
         .commit(pb::CommitRequest {
             appends: vec![append(Some(agg(1)), any(), vec![new_event("x", &[])])],
             epoch: None,
+            sync: None,
         })
         .await
         .unwrap_err();
@@ -178,6 +179,7 @@ async fn promotion_bumps_the_epoch_fences_the_old_leader_and_the_old_leader_rejo
         .commit(pb::CommitRequest {
             appends: vec![append(Some(agg(1)), any(), vec![new_event("late", &[])])],
             epoch: None,
+            sync: None,
         })
         .await
         .unwrap_err();
@@ -284,6 +286,7 @@ async fn fencing_token_on_commit() {
     let req = |epoch: Option<u64>| pb::CommitRequest {
         appends: vec![append(Some(agg(1)), any(), vec![new_event("x", &[])])],
         epoch,
+        sync: None,
     };
     s.client.commit(req(None)).await.unwrap();
     s.client.commit(req(Some(0))).await.unwrap();

@@ -80,6 +80,7 @@ async fn the_endpoint_reports_calls_commits_and_gauges() {
         .commit(pb::CommitRequest {
             appends: vec![append(Some(agg(1)), exact(7), vec![new_event("x", &[])])],
             epoch: None,
+            sync: None,
         })
         .await
         .unwrap_err();

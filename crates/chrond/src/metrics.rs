@@ -43,6 +43,7 @@ pub const METHODS: &[(&str, bool)] = &[
     ("/chron.v1.Chron/RequestVote", false),
     ("/chron.v1.Chron/Discover", false),
     ("/chron.v1.Chron/Fingerprints", false),
+    ("/chron.v1.Chron/Follow", true),
     ("/grpc.health.v1.Health/Check", false),
     ("/grpc.health.v1.Health/Watch", true),
 ];
@@ -95,6 +96,12 @@ pub fn commit_result(r: &Result<chron::Committed, tonic::Status>) -> &'static st
                 "conflict"
             }
             tonic::Code::FailedPrecondition => "refused",
+            tonic::Code::DeadlineExceeded
+                if s.metadata()
+                    .contains_key(chron_proto::COMMITTED_NEXT_HEADER) =>
+            {
+                "unconfirmed"
+            }
             tonic::Code::InvalidArgument => "invalid",
             tonic::Code::ResourceExhausted => "too_large",
             _ => "error",
@@ -119,6 +126,10 @@ pub struct Metrics {
     pub leader_changes: IntCounter,
     /// Heartbeats a peer did not answer, by peer.
     pub heartbeat_failures: IntCounterVec,
+    /// Time from the local commit to a majority's confirmation.
+    pub sync_wait: HistogramVec,
+    /// Sync commits answered "unconfirmed", by reason.
+    pub sync_timeouts: IntCounterVec,
     start_time: IntGauge,
 }
 
@@ -158,13 +169,23 @@ impl Metrics {
         );
         let commits = counter(
             "chron_commits_total",
-            "Commit calls by result: ok, conflict, refused, invalid, too_large, error",
+            "Commit calls by result: ok, conflict, refused, unconfirmed, invalid, too_large, error",
             &["db", "result"],
         );
         let commit_duration = histogram(
             "chron_commit_duration_seconds",
-            "Commit duration including the write gate and the fsync",
+            "Commit duration including the write gate, the fsync and, for sync commits, the wait for a majority",
             &["db"],
+        );
+        let sync_wait = histogram(
+            "chron_sync_commit_wait_seconds",
+            "time from the local commit to a majority's confirmation, for sync commits that were confirmed",
+            &["db"],
+        );
+        let sync_timeouts = counter(
+            "chron_sync_commit_timeouts_total",
+            "sync commits answered unconfirmed: timeout, or role_change",
+            &["db", "reason"],
         );
         let replication_errors = counter(
             "chron_replication_errors_total",
@@ -223,6 +244,8 @@ impl Metrics {
             Box::new(elections.clone()),
             Box::new(leader_changes.clone()),
             Box::new(heartbeat_failures.clone()),
+            Box::new(sync_wait.clone()),
+            Box::new(sync_timeouts.clone()),
             Box::new(build_info),
             Box::new(start_time.clone()),
         ] {
@@ -241,6 +264,8 @@ impl Metrics {
             elections,
             leader_changes,
             heartbeat_failures,
+            sync_wait,
+            sync_timeouts,
             start_time,
         })
     }
@@ -295,6 +320,10 @@ struct NodeCollector {
     leader_known: IntGauge,
     voted_epoch: IntGauge,
     peers: IntGauge,
+    sync_commit: IntGauge,
+    majority_applied: IntGaugeVec,
+    follower_applied: IntGaugeVec,
+    follower_counted: IntGaugeVec,
     events: IntCounterVec,
     transactions: IntCounterVec,
     batches: IntCounterVec,
@@ -359,6 +388,26 @@ impl NodeCollector {
             voted_epoch: IntGauge::new("chron_voted_epoch", "the epoch of the last vote given")
                 .expect("valid metric"),
             peers: IntGauge::new("chron_peers", "peers configured").expect("valid metric"),
+            sync_commit: IntGauge::new(
+                "chron_sync_commit",
+                "1 when commits wait for a majority by default",
+            )
+            .expect("valid metric"),
+            majority_applied: gauge(
+                "chron_majority_applied",
+                "the highest position a majority durably holds (leaders with peers)",
+                &["db"],
+            ),
+            follower_applied: gauge(
+                "chron_follower_applied_head",
+                "the position a follower last reported applied (leaders with peers)",
+                &["db", "peer"],
+            ),
+            follower_counted: gauge(
+                "chron_follower_counted",
+                "1 when the follower's acknowledgments count toward the majority",
+                &["db", "peer"],
+            ),
             events: counter(
                 "chron_events_committed_total",
                 "events landed, by the daemon or by replication",
@@ -405,6 +454,10 @@ impl NodeCollector {
             &self.leader_known,
             &self.voted_epoch,
             &self.peers,
+            &self.sync_commit,
+            &self.majority_applied,
+            &self.follower_applied,
+            &self.follower_counted,
             &self.events,
             &self.transactions,
             &self.batches,
@@ -425,9 +478,13 @@ impl NodeCollector {
             &self.replica_connected,
             &self.leader_head,
             &self.lag,
+            &self.majority_applied,
+            &self.follower_applied,
+            &self.follower_counted,
         ] {
             g.reset();
         }
+        self.sync_commit.set(node.wants_sync(None) as i64);
         self.lease_remaining
             .set(node.lease_remaining().unwrap_or_default().as_secs_f64());
         self.leader_known.set(
@@ -476,6 +533,19 @@ impl NodeCollector {
                 self.fenced_by
                     .with_label_values(&[db])
                     .set(node.fenced_by().unwrap_or(0) as i64);
+            }
+            if role == Role::Leader && node.cluster.is_some() {
+                self.majority_applied
+                    .with_label_values(&[db])
+                    .set(dbn.sync.majority() as i64);
+                for f in dbn.sync.snapshot() {
+                    self.follower_applied
+                        .with_label_values(&[db, &f.peer])
+                        .set(f.applied as i64);
+                    self.follower_counted
+                        .with_label_values(&[db, &f.peer])
+                        .set(f.counted as i64);
+                }
             }
             if role == Role::Replica {
                 let st = dbn.replica_status();

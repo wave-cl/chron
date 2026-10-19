@@ -41,6 +41,159 @@ impl ChronService {
     fn db<T>(&self, req: &Request<T>) -> Result<Arc<DbNode>, Status> {
         self.node.resolve(req.metadata())
     }
+
+    /// Whether a replica at `from` can follow this database: not past
+    /// the head, not below the floor, and with the same record before
+    /// `from` when it sent a fingerprint.
+    async fn admit_replica(
+        &self,
+        dbn: &DbNode,
+        from: u64,
+        last_fingerprint: Option<u32>,
+    ) -> Result<(), Status> {
+        let db = dbn.db.clone();
+        let head = db.head();
+        if from > head {
+            let m = format!(
+                "diverged: the replica is at {from}, this database at {head}; reset the replica from a backup of this database"
+            );
+            self.node.warn_diverged(&m);
+            return Err(self.node.refuse(m));
+        }
+        let floor = db.floor();
+        if from < floor {
+            return Err(codec::status(chron::Error::BelowFloor {
+                position: from,
+                floor,
+            }));
+        }
+        if let Some(theirs) = last_fingerprint
+            && from > 0
+        {
+            if from == floor {
+                tracing::warn!(
+                    from,
+                    "a replica starts at the floor; the record before it is gone, so its fingerprint cannot be checked"
+                );
+            } else {
+                let ours = blocking(&db, "fingerprint", move |db| db.fingerprint(from - 1)).await?;
+                if ours != Some(theirs) {
+                    let m = format!(
+                        "diverged: the histories differ before position {from}; reset the replica from a backup of this database"
+                    );
+                    self.node.warn_diverged(&m);
+                    return Err(self.node.refuse(m));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Streams whole-transaction chunks from `from` until the follower goes
+/// away, `cancel` fires, the role is lost or the database goes. With
+/// `open_chunk` the first item is an empty chunk at `from` carrying the
+/// epoch and its base, so a follower that is already caught up can adopt
+/// the epoch at once.
+fn spawn_chunk_stream(
+    node: Arc<Node>,
+    dbn: Arc<DbNode>,
+    from: u64,
+    cancel: CancellationToken,
+    open_chunk: bool,
+) -> mpsc::Receiver<Result<pb::ReplicationChunk, Status>> {
+    let (tx, rx) = mpsc::channel(4);
+    let db = dbn.db.clone();
+    let mut role = node.watch_role();
+    let limit = node.max_message_bytes;
+    let max_bytes = limit / 2;
+    tokio::spawn(async move {
+        let mut cursor = from;
+        if open_chunk {
+            let item = pb::ReplicationChunk {
+                db_id: db.id().as_bytes().to_vec(),
+                from: cursor,
+                to: cursor,
+                frames: Vec::new(),
+                head: db.head(),
+                epoch: db.epoch(),
+                epoch_base: dbn.epoch_base.load(std::sync::atomic::Ordering::Acquire),
+            };
+            if tx.send(Ok(item)).await.is_err() {
+                return;
+            }
+        }
+        loop {
+            let db2 = db.clone();
+            let chunk = tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = tx.send(Err(gone(&node))).await;
+                    return;
+                }
+                r = role_lost(&mut role, true) => {
+                    let _ = tx.send(Err(ended(Some(r)))).await;
+                    return;
+                }
+                _ = tx.closed() => return,
+                c = tokio::task::spawn_blocking(move || db2.replication_chunk(cursor, CHUNK, max_bytes)) => c,
+            };
+            let chunk = match chunk {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    let _ = tx.send(Err(codec::status(e))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(codec::join("replicate", e))).await;
+                    return;
+                }
+            };
+            match chunk {
+                Some(c) => {
+                    // 16 bytes of identity and a few varints ride along.
+                    if c.frames.len() + 64 > limit {
+                        let _ = tx
+                            .send(Err(Status::resource_exhausted(format!(
+                                "the transaction at {}..{} is {} bytes, above the message limit of {limit}; raise --max-message-bytes on both nodes",
+                                c.from,
+                                c.to,
+                                c.frames.len()
+                            ))))
+                            .await;
+                        return;
+                    }
+                    let item = pb::ReplicationChunk {
+                        db_id: db.id().as_bytes().to_vec(),
+                        from: c.from,
+                        to: c.to,
+                        frames: c.frames,
+                        head: db.head(),
+                        epoch: db.epoch(),
+                        epoch_base: dbn.epoch_base.load(std::sync::atomic::Ordering::Acquire),
+                    };
+                    cursor = c.to;
+                    if tx.send(Ok(item)).await.is_err() {
+                        return;
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            let _ = tx.send(Err(gone(&node))).await;
+                            return;
+                        }
+                        r = role_lost(&mut role, true) => {
+                            let _ = tx.send(Err(ended(Some(r)))).await;
+                            return;
+                        }
+                        _ = tx.closed() => return,
+                        _ = db.wait_for_async(cursor + 1) => {}
+                    }
+                }
+            }
+        }
+    });
+    rx
 }
 
 /// Streams a finite read: an async task pages through the library on the
@@ -107,15 +260,8 @@ impl Chron for ChronService {
     ) -> Result<Response<pb::CommitResponse>, Status> {
         let dbn = self.db(&req)?;
         let r = req.into_inner();
-        let node = self.node.clone();
-        let name = dbn.name.clone();
-        let start = std::time::Instant::now();
-        let result =
-            tokio::task::spawn_blocking(move || node.commit_guarded(&dbn, r.appends, r.epoch))
-                .await
-                .map_err(|e| codec::join("commit", e))?;
-        self.node.metrics.commit(&name, start, &result);
-        Ok(Response::new(codec::committed(result?)))
+        let committed = ops::commit(&self.node, dbn, r.appends, r.epoch, r.sync).await?;
+        Ok(Response::new(codec::committed(committed)))
     }
 
     type ReadAggregateStream = EventStream;
@@ -298,117 +444,96 @@ impl Chron for ChronService {
             return Err(s);
         }
         let r = req.into_inner();
-        let db = dbn.db.clone();
-        let from = r.from_position;
-        let head = db.head();
-        if from > head {
-            let m = format!(
-                "diverged: the replica is at {from}, this database at {head}; reset the replica from a backup of this database"
-            );
-            self.node.warn_diverged(&m);
-            return Err(self.node.refuse(m));
-        }
-        let floor = db.floor();
-        if from < floor {
-            return Err(Status::out_of_range(format!(
-                "position {from} is below the floor {floor}; restore the replica from a full backup"
-            )));
-        }
-        if let Some(theirs) = r.last_fingerprint
-            && from > 0
+        self.admit_replica(&dbn, r.from_position, r.last_fingerprint)
+            .await?;
+        let rx = spawn_chunk_stream(
+            self.node.clone(),
+            dbn.clone(),
+            r.from_position,
+            dbn.cancel.child_token(),
+            false,
+        );
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    type FollowStream = ChunkStream;
+
+    /// Replicate with acknowledgments: the first message opens the
+    /// stream, every later one reports an applied head, which the
+    /// leader counts toward the majority sync commits wait for.
+    async fn follow(
+        &self,
+        req: Request<tonic::Streaming<pb::FollowRequest>>,
+    ) -> Result<Response<Self::FollowStream>, Status> {
+        self.node.require_admin(req.metadata())?;
+        #[cfg(feature = "test-util")]
+        if self
+            .node
+            .refuse_follow
+            .load(std::sync::atomic::Ordering::Relaxed)
         {
-            if from == floor {
-                tracing::warn!(
-                    from,
-                    "a replica starts at the floor; the record before it is gone, so its fingerprint cannot be checked"
-                );
-            } else {
-                let ours = blocking(&db, "fingerprint", move |db| db.fingerprint(from - 1)).await?;
-                if ours != Some(theirs) {
-                    let m = format!(
-                        "diverged: the histories differ before position {from}; reset the replica from a backup of this database"
-                    );
-                    self.node.warn_diverged(&m);
-                    return Err(self.node.refuse(m));
-                }
-            }
+            return Err(Status::unimplemented("Follow is not in this version"));
         }
-        let (tx, rx) = mpsc::channel(4);
-        let node = self.node.clone();
-        let cancel = dbn.cancel.clone();
-        let mut role = self.node.watch_role();
-        let limit = node.max_message_bytes;
-        let max_bytes = limit / 2;
+        let dbn = self.db(&req)?;
+        if let Some(s) = self.node.write_refusal() {
+            return Err(s);
+        }
+        let mut inbound = req.into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(10), inbound.message())
+            .await
+            .map_err(|_| Status::invalid_argument("no `open` message within 10 s"))??;
+        let open = match first {
+            Some(pb::FollowRequest {
+                msg: Some(pb::follow_request::Msg::Open(o)),
+            }) => o,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "the first Follow message must be `open`",
+                ));
+            }
+        };
+        self.admit_replica(&dbn, open.from_position, open.last_fingerprint)
+            .await?;
+        let leader_durable = self.node.db_opts.fsync == chron::Fsync::Always;
+        let is_peer = self
+            .node
+            .cluster
+            .as_ref()
+            .is_some_and(|c| c.peers.contains(&open.peer_addr));
+        let counted = is_peer && (open.durable || !leader_durable);
+        if is_peer && !counted {
+            tracing::warn!(peer = %open.peer_addr, database = %dbn.name, "the follower applies without fsync; its acknowledgments do not count toward the majority");
+        } else if !is_peer {
+            tracing::info!(peer = %open.peer_addr, database = %dbn.name, "not a configured peer; its acknowledgments are recorded, not counted");
+        }
+        let id = dbn.sync.attach(&open.peer_addr, open.durable, counted);
+        let stream_cancel = dbn.cancel.child_token();
+        let rx = spawn_chunk_stream(
+            self.node.clone(),
+            dbn.clone(),
+            open.from_position,
+            stream_cancel.clone(),
+            true,
+        );
+        let peer = open.peer_addr;
+        let dbn2 = dbn.clone();
         tokio::spawn(async move {
-            let mut cursor = from;
             loop {
-                let db2 = db.clone();
-                let chunk = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        let _ = tx.send(Err(gone(&node))).await;
-                        return;
-                    }
-                    r = role_lost(&mut role, true) => {
-                        let _ = tx.send(Err(ended(Some(r)))).await;
-                        return;
-                    }
-                    _ = tx.closed() => return,
-                    c = tokio::task::spawn_blocking(move || db2.replication_chunk(cursor, CHUNK, max_bytes)) => c,
+                let m = tokio::select! {
+                    _ = stream_cancel.cancelled() => break,
+                    m = inbound.message() => m,
                 };
-                let chunk = match chunk {
-                    Ok(Ok(c)) => c,
-                    Ok(Err(e)) => {
-                        let _ = tx.send(Err(codec::status(e))).await;
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(codec::join("replicate", e))).await;
-                        return;
-                    }
-                };
-                match chunk {
-                    Some(c) => {
-                        // 16 bytes of identity and a few varints ride along.
-                        if c.frames.len() + 64 > limit {
-                            let _ = tx
-                                .send(Err(Status::resource_exhausted(format!(
-                                    "the transaction at {}..{} is {} bytes, above the message limit of {limit}; raise --max-message-bytes on both nodes",
-                                    c.from,
-                                    c.to,
-                                    c.frames.len()
-                                ))))
-                                .await;
-                            return;
-                        }
-                        let item = pb::ReplicationChunk {
-                            db_id: db.id().as_bytes().to_vec(),
-                            from: c.from,
-                            to: c.to,
-                            frames: c.frames,
-                            head: db.head(),
-                            epoch: db.epoch(),
-                        };
-                        cursor = c.to;
-                        if tx.send(Ok(item)).await.is_err() {
-                            return;
-                        }
-                    }
-                    None => {
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                let _ = tx.send(Err(gone(&node))).await;
-                                return;
-                            }
-                            r = role_lost(&mut role, true) => {
-                                let _ = tx.send(Err(ended(Some(r)))).await;
-                                return;
-                            }
-                            _ = tx.closed() => return,
-                            _ = db.wait_for_async(cursor + 1) => {}
-                        }
-                    }
+                match m {
+                    Ok(Some(pb::FollowRequest {
+                        msg: Some(pb::follow_request::Msg::Applied(a)),
+                    })) => dbn2.sync.record(&peer, id, a.head, dbn2.db.head()),
+                    // A second `open`, an empty message, an error or the
+                    // end of the inbound stream all end the follow.
+                    _ => break,
                 }
             }
+            dbn2.sync.detach(&peer, id);
+            stream_cancel.cancel();
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }

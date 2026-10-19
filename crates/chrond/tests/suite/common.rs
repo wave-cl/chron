@@ -266,6 +266,7 @@ pub async fn fill(client: &mut ChronClient<Channel>, aggregate: Uuid, n: usize) 
                     vec![new_event(&format!("e{i}"), &[])],
                 )],
                 epoch: None,
+                sync: None,
             })
             .await
             .unwrap();

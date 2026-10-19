@@ -220,6 +220,10 @@ pub fn info_json(i: &pb::InfoResponse) -> Value {
         "fenced_by": i.fenced_by,
         "leader_addr": i.leader_addr, "lease_remaining_ms": i.lease_remaining_ms,
         "peers": i.peers, "voted_epoch": i.voted_epoch,
+        "majority_applied": i.majority_applied, "sync_commit": i.sync_commit,
+        "followers": i.followers.iter().map(|f| json!({
+            "peer": f.peer, "applied": f.applied, "durable": f.durable, "counted": f.counted,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -237,6 +241,7 @@ pub fn retained_json(r: &Retained) -> Value {
 /// The HTTP status a gRPC code becomes.
 pub fn http_status(code: Code) -> StatusCode {
     match code {
+        Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
         Code::InvalidArgument => StatusCode::BAD_REQUEST,
         Code::Unauthenticated => StatusCode::UNAUTHORIZED,
         Code::PermissionDenied => StatusCode::FORBIDDEN,
@@ -275,6 +280,8 @@ pub fn error_json(s: &Status) -> Value {
         (chron_proto::POSITION_HEADER, "position"),
         (chron_proto::FLOOR_HEADER, "floor"),
         (chron_proto::HEAD_HEADER, "head"),
+        (chron_proto::COMMITTED_FIRST_HEADER, "committed_first"),
+        (chron_proto::COMMITTED_NEXT_HEADER, "committed_next"),
     ] {
         if let Some(n) = num(key) {
             obj.insert(name.into(), json!(n));

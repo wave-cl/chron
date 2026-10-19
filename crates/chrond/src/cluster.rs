@@ -326,7 +326,9 @@ pub async fn campaign(node: &Arc<Node>, forced: bool) -> Result<(u64, u64), Stat
         return Err(node.refuse(format!("heard {addr} (epoch {e}) within the lease")));
     }
     let epoch = node.floor_epoch() + 1;
-    let data_epoch = node.data_epoch();
+    // The lowest epoch among the databases: a candidate claims an epoch
+    // only when every database holds what that epoch's leader held.
+    let data_epoch = node.vote_epoch();
     let heads: Vec<pb::DatabaseHead> = node
         .databases()
         .iter()

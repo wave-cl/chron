@@ -9,7 +9,7 @@ use crate::common::*;
 
 /// One HTTP/1.1 request; returns the status code and the body (parsed
 /// as JSON when it is).
-fn http(
+pub(crate) fn http(
     addr: std::net::SocketAddr,
     method: &str,
     path: &str,
@@ -59,7 +59,7 @@ fn http(
     (code, value, text)
 }
 
-async fn call(
+pub(crate) async fn call(
     addr: std::net::SocketAddr,
     method: &'static str,
     path: String,
@@ -488,6 +488,7 @@ async fn tail_streams_live_events_and_ends_when_the_database_is_dropped() {
         .commit(chron_proto::v1::CommitRequest {
             appends: vec![append(Some(agg(1)), any(), vec![new_event("live", &["t"])])],
             epoch: None,
+            sync: None,
         })
         .await
         .unwrap();

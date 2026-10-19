@@ -77,6 +77,20 @@ pub enum ClientError {
     /// named a reachable leader.
     #[error("no leader: {0}")]
     NoLeader(String),
+    /// A sync commit landed on the leader's disk but a majority did not
+    /// confirm it in time (or the node stopped leading first). It is at
+    /// `first..next` there and replicates unless the node dies. Never
+    /// retried by the client: a resend could write it twice. Resolve
+    /// with an exact expectation on the aggregate, or a read.
+    #[error("unconfirmed: committed locally at {first} (next {next}) but {message}")]
+    Unconfirmed {
+        /// The transaction's first position on the leader.
+        first: u64,
+        /// The head after it.
+        next: u64,
+        /// The daemon's message.
+        message: String,
+    },
     /// A message or transaction above the daemon's limit.
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
@@ -138,6 +152,18 @@ impl From<Status> for ClientError {
             Code::NotFound => ClientError::NotFound(s.message().to_string()),
             Code::AlreadyExists => ClientError::AlreadyExists(s.message().to_string()),
             Code::Unauthenticated => ClientError::Unauthenticated(s.message().to_string()),
+            Code::DeadlineExceeded
+                if let (Some(first), Some(next)) = (
+                    header::<u64>(&s, chron_proto::COMMITTED_FIRST_HEADER),
+                    header::<u64>(&s, chron_proto::COMMITTED_NEXT_HEADER),
+                ) =>
+            {
+                ClientError::Unconfirmed {
+                    first,
+                    next,
+                    message: s.message().to_string(),
+                }
+            }
             Code::Unavailable => ClientError::Unavailable(s.message().to_string()),
             Code::ResourceExhausted => ClientError::ResourceExhausted(s.message().to_string()),
             // The daemon going away mid-call: the HTTP/2 GOAWAY of a

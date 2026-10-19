@@ -66,6 +66,7 @@ async fn tls_serves_and_a_plaintext_client_is_refused() {
         .commit(pb::CommitRequest {
             appends: vec![append(Some(agg(1)), new(), vec![new_event("tls", &[])])],
             epoch: None,
+            sync: None,
         })
         .await
         .unwrap();
@@ -138,6 +139,7 @@ async fn token_missing_or_wrong_is_unauthenticated() {
         .commit(pb::CommitRequest {
             appends: vec![append(Some(agg(1)), new(), vec![new_event("ok", &[])])],
             epoch: None,
+            sync: None,
         })
         .await
         .unwrap();
@@ -209,6 +211,7 @@ async fn oversized_message_is_refused_and_nothing_written() {
         .commit(pb::CommitRequest {
             appends: vec![append(Some(agg(1)), any(), vec![big])],
             epoch: None,
+            sync: None,
         })
         .await
         .unwrap_err();
@@ -360,6 +363,7 @@ async fn admin_calls_need_the_admin_token_when_one_is_set() {
     let commit = || pb::CommitRequest {
         appends: vec![append(Some(agg(1)), any(), vec![new_event("x", &[])])],
         epoch: None,
+        sync: None,
     };
     let mut user = with_token(channel.clone(), "s3cret");
     user.commit(commit()).await.unwrap();

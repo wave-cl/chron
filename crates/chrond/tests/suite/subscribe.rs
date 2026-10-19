@@ -79,6 +79,7 @@ async fn subscribe_tag_filters_and_from_past_head_waits() {
                 ],
             )],
             epoch: None,
+            sync: None,
         })
         .await
         .unwrap();

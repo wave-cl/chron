@@ -51,13 +51,22 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
     }
     if !i.peers.is_empty() {
         human.push_str(&format!(
-            "\nleader {}  lease_remaining {}  voted_epoch {}\npeers {}",
+            "\nleader {}  lease_remaining {}  voted_epoch {}\npeers {}\nsync_commit {}  majority_applied {}",
             i.leader_addr.as_deref().unwrap_or("none"),
             i.lease_remaining
                 .map_or("-".to_string(), |d| format!("{} ms", d.as_millis())),
             i.voted_epoch.map_or("-".to_string(), |e| e.to_string()),
-            i.peers.join(",")
+            i.peers.join(","),
+            if i.sync_commit { "majority" } else { "off" },
+            i.majority_applied
+                .map_or("-".to_string(), |m| m.to_string())
         ));
+        for f in &i.followers {
+            human.push_str(&format!(
+                "\nfollower {}  applied {}  durable {}  counted {}",
+                f.peer, f.applied, f.durable, f.counted
+            ));
+        }
     }
     print_value(
         format,
@@ -73,6 +82,10 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
             "fenced_by": i.fenced_by,
             "leader_addr": i.leader_addr, "lease_remaining_ms": i.lease_remaining.map(|d| d.as_millis() as u64),
             "peers": i.peers, "voted_epoch": i.voted_epoch,
+            "sync_commit": i.sync_commit, "majority_applied": i.majority_applied,
+            "followers": i.followers.iter().map(|f| json!({
+                "peer": f.peer, "applied": f.applied, "durable": f.durable, "counted": f.counted,
+            })).collect::<Vec<_>>(),
         }),
     );
     Ok(())

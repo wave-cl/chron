@@ -55,6 +55,12 @@ struct Cli {
     /// restarted daemon's new pid is found), for each node of the group.
     #[arg(long = "pid", value_name = "ADDR=PID|FILE")]
     pid: Vec<String>,
+    /// Wait for a majority of the group on every commit.
+    #[arg(long, conflicts_with = "async")]
+    sync: bool,
+    /// Return once a commit is on the leader's disk.
+    #[arg(long = "async")]
+    r#async: bool,
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -143,13 +149,18 @@ async fn main() -> anyhow::Result<()> {
         } else {
             Some(killer(&cli.pid)?)
         },
+        sync: match (cli.sync, cli.r#async) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        },
     })
     .await?;
     if cli.json {
         println!("{}", report.to_json());
     } else {
         println!(
-            "transactions {}  events {}  conflicts {}  errors {}\nreads {} ({} events)  subscribed {}  backups {}  retentions {}\ncommit p50 {:.2} ms  p99 {:.2} ms\nfinal head {}  replica head {:?}\nkills {}  lost acks {}  failover errors {}",
+            "transactions {}  events {}  conflicts {}  errors {}\nreads {} ({} events)  subscribed {}  backups {}  retentions {}\ncommit p50 {:.2} ms  p99 {:.2} ms\nfinal head {}  replica head {:?}\nkills {}  lost acks {}  failover errors {}  unconfirmed {}",
             report.transactions,
             report.events,
             report.conflicts,
@@ -165,7 +176,8 @@ async fn main() -> anyhow::Result<()> {
             report.replica_head,
             report.kills,
             report.lost_acks,
-            report.failover_errors
+            report.failover_errors,
+            report.unconfirmed
         );
         for v in &report.violations {
             println!("VIOLATION: {v}");

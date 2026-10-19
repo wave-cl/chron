@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chron_client::{ChunkStream, Client, ClientConfig, ClientError, Role as WireRole};
+use chron_client::{ChunkStream, Client, ClientConfig, ClientError, FollowAcks, Role as WireRole};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -83,12 +83,23 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| e.to_string())
 }
 
+/// An accepted replication stream and, with peers, the side to report
+/// applied heads on.
+pub struct Following {
+    pub stream: ChunkStream,
+    pub acks: Option<FollowAcks>,
+}
+
 /// Connects to the leader and checks this database can follow the
 /// leader's database of the same name: same identity (an empty database
 /// adopts the leader's), an epoch no newer than the leader's, a head no
 /// further, and the same record before it. Nothing is written here until
-/// the leader has accepted the stream. Returns the open chunk stream.
-pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<ChunkStream, CheckError> {
+/// the leader has accepted the stream. With peers the stream is a
+/// `Follow` (acknowledged); a leader without it gets a plain
+/// `Replicate`. The epoch is not adopted here: a chunk carries the head
+/// the leader had when it took its epoch, and the follower adopts the
+/// epoch once it holds that much.
+pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<Following, CheckError> {
     let up = node
         .upstream()
         .ok_or_else(|| CheckError::Refused("no leader configured".into()))?;
@@ -162,33 +173,64 @@ pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<ChunkSt
     } else {
         None
     };
-    let stream = client
-        .replicate(head, last_fingerprint)
-        .await
-        .map_err(|e| match &e {
-            ClientError::Fenced { message, .. } if message.starts_with("diverged") => {
-                CheckError::Diverged {
-                    message: format!("{addr}: {message}"),
-                    leader_head: info.head,
-                    leader_floor: info.floor,
-                }
+    let diverged = |e: ClientError| match &e {
+        ClientError::Fenced { message, .. } if message.starts_with("diverged") => {
+            CheckError::Diverged {
+                message: format!("{addr}: {message}"),
+                leader_head: info.head,
+                leader_floor: info.floor,
             }
-            _ => unreachable(addr, e),
-        })?;
+        }
+        _ => unreachable(addr, e),
+    };
+    let following = match &node.cluster {
+        Some(cfg) => {
+            let durable = node.db_opts.fsync == chron::Fsync::Always;
+            match client
+                .follow(head, last_fingerprint, cfg.advertise.clone(), durable)
+                .await
+            {
+                Ok((stream, acks)) => Following {
+                    stream,
+                    acks: Some(acks),
+                },
+                Err(ClientError::Status(s)) if s.code() == tonic::Code::Unimplemented => {
+                    tracing::warn!(leader = %addr, "the leader runs a version without Follow; replicating without acknowledgments, so this node does not count toward its sync commits");
+                    Following {
+                        stream: client
+                            .replicate(head, last_fingerprint)
+                            .await
+                            .map_err(diverged)?,
+                        acks: None,
+                    }
+                }
+                Err(e) => return Err(diverged(e)),
+            }
+        }
+        None => Following {
+            stream: client
+                .replicate(head, last_fingerprint)
+                .await
+                .map_err(diverged)?,
+            acks: None,
+        },
+    };
     if id != leader_id {
         let db = db.clone();
         blocking(move || db.adopt_id(leader_id))
             .await
             .map_err(CheckError::Refused)?;
     }
-    if epoch < info.epoch {
+    // A manual replica has no elections to keep the epoch honest for;
+    // it adopts the leader's at connect as before.
+    if epoch < info.epoch && node.cluster.is_none() {
         let db = db.clone();
         let e = info.epoch;
         blocking(move || db.set_epoch(e))
             .await
             .map_err(CheckError::Refused)?;
     }
-    Ok(stream)
+    Ok(following)
 }
 
 /// A diverged copy cuts itself back to the history it shares with the
@@ -408,7 +450,7 @@ impl Puller {
 
 /// Pulls `dbn` from `initial` (or reconnects first, when it is `None`)
 /// until stopped. On exit the database is recorded as disconnected.
-pub fn spawn(node: Arc<Node>, dbn: Arc<DbNode>, initial: Option<ChunkStream>) -> Puller {
+pub fn spawn(node: Arc<Node>, dbn: Arc<DbNode>, initial: Option<Following>) -> Puller {
     let cancel = dbn.cancel.child_token();
     let task_cancel = cancel.clone();
     let handle = tokio::spawn(async move {
@@ -421,7 +463,7 @@ pub fn spawn(node: Arc<Node>, dbn: Arc<DbNode>, initial: Option<ChunkStream>) ->
 async fn pull(
     node: &Arc<Node>,
     dbn: &Arc<DbNode>,
-    initial: Option<ChunkStream>,
+    initial: Option<Following>,
     cancel: &CancellationToken,
 ) {
     let mut stream = initial;
@@ -497,9 +539,12 @@ pub fn record_error(node: &Node, dbn: &DbNode, e: String) {
 async fn tail(
     node: &Arc<Node>,
     dbn: &Arc<DbNode>,
-    mut stream: ChunkStream,
+    following: Following,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
+    let Following { mut stream, acks } = following;
+    #[cfg(feature = "test-util")]
+    let mut hold = node.hold_apply.subscribe();
     loop {
         let msg = tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
@@ -519,18 +564,45 @@ async fn tail(
                 c.epoch
             ));
         }
-        if c.epoch > ours {
+        // A manual replica adopts the epoch before applying, as before;
+        // a group member only once it holds what the leader held at its
+        // election (below), so its epoch says what it has.
+        if c.epoch > ours && node.cluster.is_none() {
             let db = db.clone();
             let e = c.epoch;
             blocking(move || db.set_epoch(e)).await?;
         }
+        #[cfg(feature = "test-util")]
+        {
+            let _ = tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                r = hold.wait_for(|h| !*h) => r.map(|_| ()),
+            };
+        }
         let to = c.chunk.to;
-        let chunk = c.chunk;
-        let new_head = blocking(move || db.apply_chunk(&chunk)).await?;
-        if new_head != to {
+        let empty = c.chunk.from == c.chunk.to;
+        let new_head = if empty {
+            // The empty chunk that opens a Follow: nothing to apply.
+            db.head()
+        } else {
+            let chunk = c.chunk;
+            let db = db.clone();
+            blocking(move || db.apply_chunk(&chunk)).await?
+        };
+        if !empty && new_head != to {
             return Err(format!(
                 "applied a chunk to {to} but the head is {new_head}"
             ));
+        }
+        if c.epoch > db.epoch() && node.cluster.is_some() && new_head >= c.epoch_base {
+            let db = db.clone();
+            let e = c.epoch;
+            blocking(move || db.set_epoch(e)).await?;
+        }
+        if let Some(acks) = &acks {
+            acks.applied(new_head)
+                .await
+                .map_err(|_| "the leader stopped reading acknowledgments".to_string())?;
         }
         dbn.record_replica(|r| r.leader_head = Some(c.head));
         node.metrics
@@ -606,7 +678,7 @@ async fn discover(node: &Arc<Node>) -> Result<(), String> {
                     .await
                     .map_err(|e| format!("open task: {e}"))?
                     .map_err(|e| format!("cannot create the database {name}: {e}"))?;
-                let dbn = DbNode::new(name.clone(), db, &node.cancel);
+                let dbn = DbNode::new(name.clone(), db, node);
                 node.insert(dbn.clone());
                 tracing::info!(database = %name, "created to mirror the leader");
                 dbn

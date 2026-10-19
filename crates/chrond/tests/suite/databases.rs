@@ -18,6 +18,7 @@ async fn commit_in(c: &mut DbClient, payload: &str) -> u64 {
             vec![new_event(payload, &["t"])],
         )],
         epoch: None,
+        sync: None,
     })
     .await
     .unwrap()
@@ -398,6 +399,7 @@ async fn promotion_raises_every_database() {
         .commit(pb::CommitRequest {
             appends: vec![append(Some(agg(1)), any(), vec![new_event("stale", &[])])],
             epoch: Some(2),
+            sync: None,
         })
         .await
         .unwrap_err();
@@ -407,6 +409,7 @@ async fn promotion_raises_every_database() {
         .commit(pb::CommitRequest {
             appends: vec![append(Some(agg(1)), any(), vec![new_event("fresh", &[])])],
             epoch: Some(3),
+            sync: None,
         })
         .await
         .unwrap();
@@ -427,6 +430,7 @@ async fn promotion_raises_every_database() {
         .commit(pb::CommitRequest {
             appends: vec![append(Some(agg(1)), any(), vec![new_event("late", &[])])],
             epoch: None,
+            sync: None,
         })
         .await
         .unwrap_err();
@@ -531,6 +535,7 @@ async fn a_replica_mirrors_every_database_and_discovers_new_ones() {
             .commit(pb::CommitRequest {
                 appends: vec![append(Some(agg(1)), any(), vec![new_event("x", &[])])],
                 epoch: None,
+                sync: None
             })
             .await
             .unwrap_err()

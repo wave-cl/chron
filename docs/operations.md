@@ -57,10 +57,12 @@ The leader died:
    retry on their own for `failover_timeout` (30 s) under the rule the
    README states (a commit that may have landed is resent only with an
    exact or `new` expectation); others repoint.
-2. Writes the dead leader acknowledged after the last transaction the
-   new leader had pulled are lost: the replication lag at that moment
-   (`chron_replication_lag_events`; `chron-load --kill-leader-every`
-   measures it on your traffic). Tell the owners of that window.
+2. With `--sync-commit majority` (the default) nothing acknowledged is
+   lost; writers that received "unconfirmed" must check before resending
+   (an exact expectation, or a read). With `off`, writes the dead leader
+   acknowledged after the last transaction the new leader had pulled are
+   lost: the replication lag at that moment (`chron_replication_lag_events`;
+   `chron-load --kill-leader-every` measures it on your traffic).
 3. Start the old node again with the same flags. It comes up as a
    candidate, hears the leader and follows it. If it took writes nobody
    replicated, it cuts itself back to the shared history (the log says
@@ -132,11 +134,30 @@ so only file contents change.
 4. `chron_replica_connected` is back to 1 on every replica and
    `chron_replication_errors_total` stops rising.
 
+## Sync commits time out
+
+`chron_sync_commit_timeouts_total` rising, `chron_commits_total
+{result="unconfirmed"}` on the leader, writers seeing "unconfirmed".
+
+1. `chron --addr $LEADER info`: `majority_applied` against `head`, and
+   one `follower` line each: which peer lags (`applied`), which is
+   missing (not attached: check `chron status` there), which is
+   `counted false` (a `--no-fsync` follower of an fsync leader, or a
+   node outside `--peer`), which runs a version without `Follow`.
+2. `chron_follower_applied_head{peer}` over time shows a slow follower;
+   `chron_replica_connected` on it shows a broken link.
+3. The escape hatch while fixing it: `--sync-commit off` on the leader,
+   or `--async` per request, with the loss window that implies.
+
 ## Upgrading
 
 1. Read the CHANGELOG for wire or disk changes.
-2. Replicas first: restart each, then `status --max-lag 0`.
-3. The leader: restart it (writes pause while it is down; replicas
+2. Followers first: restart each, then `status --max-lag 0`. A leader on
+   0.4.0 confirms sync commits only through followers on 0.4.0 (older
+   ones replicate but never report), so until a majority of followers
+   run the new version, run the leader with `--sync-commit off` or expect
+   "unconfirmed".
+3. The leader last: restart it (writes pause while it is down; replicas
    reconnect), or promote a replica, upgrade the old leader and rejoin it.
 4. `chron_build_info{version}` on every node shows the new version.
 
@@ -153,6 +174,8 @@ PromQL:
 - Group commit effectiveness: `rate(chron_transactions_committed_total[5m]) / rate(chron_commit_batches_total[5m])`
 - Gateway error ratio: `sum by (route, status) (rate(chron_http_requests_total{status=~"5.."}[5m]))`
 - Leader changes: `increase(chron_leader_changes_total[1h])`
+- Sync wait p99: `histogram_quantile(0.99, sum by (le) (rate(chron_sync_commit_wait_seconds_bucket[5m])))`
+- Confirmation lag on the leader: `chron_head - chron_majority_applied`
 - Lease health on the leader: `min_over_time(chron_lease_remaining_seconds[5m])`
 
 Alerts worth having:
@@ -163,4 +186,5 @@ Alerts worth having:
 - `chron_role{role="candidate"} == 1` for 30 s, or `chron_leader_known == 0`
   on every node (no leader).
 - `sum(chron_role{role="leader"}) != 1` across a group for 30 s.
+- `increase(chron_sync_commit_timeouts_total[5m]) > 0`.
 - A sudden drop in `chron_streams_open{method="/chron.v1.Chron/Subscribe"}`.

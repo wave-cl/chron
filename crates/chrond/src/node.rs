@@ -91,6 +91,15 @@ pub struct Upstream {
     pub max_message_bytes: usize,
 }
 
+/// When a leader with peers acknowledges a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncCommit {
+    /// Once it is on the leader's disk.
+    Off,
+    /// Once a majority of the group durably holds it.
+    Majority,
+}
+
 /// The peers of a node started with `--peer`, and how to reach them.
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
@@ -103,6 +112,11 @@ pub struct ClusterConfig {
     pub max_message_bytes: usize,
     /// How long a majority acknowledgment lets a leader accept writes.
     pub lease_ttl: Duration,
+    /// The daemon's default for commits without a `sync` flag.
+    pub sync_commit: SyncCommit,
+    /// How long a sync commit waits for a majority before it answers
+    /// "unconfirmed".
+    pub sync_timeout: Duration,
 }
 
 impl ClusterConfig {
@@ -161,17 +175,26 @@ pub struct DbNode {
     /// resetting itself); every live stream on the database ends when it
     /// changes, since positions from there on are rewritten.
     pub reset: watch::Sender<Option<u64>>,
+    /// On a leader: the followers' applied positions and the majority.
+    pub sync: crate::sync::SyncState,
+    /// The head this database had when the node took its epoch, sent
+    /// with every chunk so a follower adopts the epoch only once it
+    /// holds that much.
+    pub epoch_base: std::sync::atomic::AtomicU64,
 }
 
 impl DbNode {
-    pub fn new(name: String, db: Db, parent: &CancellationToken) -> Arc<DbNode> {
+    pub fn new(name: String, db: Db, node: &Node) -> Arc<DbNode> {
+        let quorum = node.cluster.as_ref().map_or(1, |c| c.quorum());
         Arc::new(DbNode {
             name,
             db,
             replica: Mutex::new(ReplicaStatus::default()),
             puller: tokio::sync::Mutex::new(None),
-            cancel: parent.child_token(),
+            cancel: node.cancel.child_token(),
             reset: watch::Sender::new(None),
+            sync: crate::sync::SyncState::new(quorum),
+            epoch_base: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -232,6 +255,13 @@ pub struct Node {
     /// that a follower cut off from the leader cannot unseat it).
     #[cfg(feature = "test-util")]
     pub skip_recency_check: std::sync::atomic::AtomicBool,
+    /// While true, this follower applies no chunk (its acknowledgments
+    /// stop) without its pullers stopping.
+    #[cfg(feature = "test-util")]
+    pub hold_apply: watch::Sender<bool>,
+    /// Answer Follow with UNIMPLEMENTED, as a daemon before 0.4.0 does.
+    #[cfg(feature = "test-util")]
+    pub refuse_follow: std::sync::atomic::AtomicBool,
     /// How every database is opened.
     pub db_opts: chron::Options,
     databases: RwLock<HashMap<String, Arc<DbNode>>>,
@@ -284,6 +314,10 @@ impl Node {
             partition: Mutex::new(HashSet::new()),
             #[cfg(feature = "test-util")]
             skip_recency_check: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-util")]
+            hold_apply: watch::Sender::new(false),
+            #[cfg(feature = "test-util")]
+            refuse_follow: std::sync::atomic::AtomicBool::new(false),
             db_opts,
             databases: RwLock::new(HashMap::new()),
             admin_ops: tokio::sync::Mutex::new(()),
@@ -865,6 +899,33 @@ impl Node {
         Ok(())
     }
 
+    /// Whether a commit waits for a majority: never without peers (a
+    /// lone node is its own majority), else the request's choice or the
+    /// daemon's default.
+    pub fn wants_sync(&self, request: Option<bool>) -> bool {
+        self.cluster
+            .as_ref()
+            .is_some_and(|c| request.unwrap_or(c.sync_commit == SyncCommit::Majority))
+    }
+
+    /// How long a sync commit waits before answering "unconfirmed".
+    pub fn sync_timeout(&self) -> Duration {
+        self.cluster
+            .as_ref()
+            .map_or(Duration::ZERO, |c| c.sync_timeout)
+    }
+
+    /// The epoch a candidate claims: the lowest among its databases, so
+    /// it claims an epoch only when every database has caught up to
+    /// what that epoch's leader held at its election.
+    pub fn vote_epoch(&self) -> u64 {
+        self.databases()
+            .iter()
+            .map(|d| d.db.epoch())
+            .min()
+            .unwrap_or(0)
+    }
+
     /// The highest epoch among the databases: the daemon's data epoch.
     pub fn data_epoch(&self) -> u64 {
         self.databases()
@@ -926,6 +987,9 @@ impl Node {
         self.set_role(Role::Leader);
         for d in self.databases() {
             d.record_replica(|r| r.connected = false);
+            d.epoch_base
+                .store(d.db.head(), std::sync::atomic::Ordering::Release);
+            d.sync.reset();
         }
         tracing::info!(epoch, "promoted to leader");
         Ok((epoch, self.default_db().db.head()))
@@ -970,6 +1034,8 @@ mod tests {
             tls: None,
             max_message_bytes: 1 << 20,
             lease_ttl: Duration::from_secs(1),
+            sync_commit: SyncCommit::Majority,
+            sync_timeout: Duration::from_secs(1),
         };
         let make = |cluster: Option<ClusterConfig>| {
             let cancel = CancellationToken::new();
@@ -986,7 +1052,7 @@ mod tests {
                 cancel.clone(),
             );
             let db = node.open_database("default").unwrap();
-            node.insert(DbNode::new("default".into(), db, &cancel));
+            node.insert(DbNode::new("default".into(), db, &node));
             node.set_role(Role::Leader);
             node
         };
@@ -1012,6 +1078,8 @@ mod tests {
             tls: None,
             max_message_bytes: 1,
             lease_ttl: Duration::from_secs(1),
+            sync_commit: SyncCommit::Majority,
+            sync_timeout: Duration::from_secs(1),
         };
         assert_eq!(c(0).quorum(), 1);
         assert_eq!(c(1).quorum(), 2);

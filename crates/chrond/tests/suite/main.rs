@@ -12,3 +12,4 @@ mod replication;
 mod round5;
 mod security;
 mod subscribe;
+mod sync_commit;

@@ -58,6 +58,9 @@ pub struct Config {
     /// the kill at positions past every other node's head then.
     pub kill_every: Option<Duration>,
     pub killer: Option<Killer>,
+    /// Wait for a majority (`Some(true)`), do not (`Some(false)`), or
+    /// take the daemon's default (`None`).
+    pub sync: Option<bool>,
 }
 
 impl Config {
@@ -99,6 +102,9 @@ pub struct Report {
     /// Calls that failed while a leader was being replaced (kill mode):
     /// expected, counted, not violations.
     pub failover_errors: u64,
+    /// Sync commits the leader could not get confirmed in time: landed
+    /// locally, not acknowledged to the writer, not counted as acks.
+    pub unconfirmed: u64,
     /// Every invariant that failed, with where and what.
     pub violations: Vec<String>,
 }
@@ -116,7 +122,7 @@ impl Report {
             "retentions": self.retentions, "commit_p50_ms": self.commit_p50_ms,
             "commit_p99_ms": self.commit_p99_ms, "final_head": self.final_head,
             "replica_head": self.replica_head, "kills": self.kills, "lost_acks": self.lost_acks,
-            "failover_errors": self.failover_errors,
+            "failover_errors": self.failover_errors, "unconfirmed": self.unconfirmed,
             "violations": self.violations, "ok": self.ok(),
         })
     }
@@ -161,6 +167,7 @@ struct Shared {
     kill_mode: bool,
     kills: AtomicU64,
     failover_errors: AtomicU64,
+    unconfirmed: AtomicU64,
     /// Kill mode: every acknowledged write as (position, payload hash,
     /// when).
     acks: std::sync::Mutex<Vec<(u64, u64, Instant)>>,
@@ -304,6 +311,7 @@ fn client_config(cfg: &Config) -> ClientConfig {
         database: cfg.database.clone(),
         connect_timeout: Duration::from_secs(2),
         request_timeout: Some(Duration::from_secs(30)),
+        sync_commit: cfg.sync,
         ..ClientConfig::default()
     }
 }
@@ -367,6 +375,12 @@ async fn writer(cfg: Config, client: Client, shared: Arc<Shared>, w: usize) {
                 }
                 lens.insert(agg, (len + n, Instant::now()));
                 seq += 1;
+            }
+            Err(ClientError::Unconfirmed { .. }) => {
+                // Landed on the leader, unconfirmed: not acknowledged, so
+                // not an ack to check; the length is read again.
+                shared.unconfirmed.fetch_add(1, Ordering::Relaxed);
+                lens.remove(&agg);
             }
             Err(ClientError::Conflict { actual, .. }) => {
                 shared.conflicts.fetch_add(1, Ordering::Relaxed);
@@ -775,6 +789,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         kill_mode: cfg.kill_mode(),
         kills: AtomicU64::new(0),
         failover_errors: AtomicU64::new(0),
+        unconfirmed: AtomicU64::new(0),
         acks: std::sync::Mutex::new(Vec::new()),
         kill_log: std::sync::Mutex::new(Vec::new()),
     });
@@ -914,6 +929,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         kills: shared.kills.load(Ordering::Relaxed),
         lost_acks,
         failover_errors: shared.failover_errors.load(Ordering::Relaxed),
+        unconfirmed: shared.unconfirmed.load(Ordering::Relaxed),
         violations: shared
             .violations
             .lock()

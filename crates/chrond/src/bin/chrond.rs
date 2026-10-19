@@ -133,9 +133,25 @@ struct Cli {
     /// Seconds a majority's acknowledgment lets the leader accept writes.
     #[arg(long, env = "CHROND_LEASE_TTL", default_value_t = 10.0)]
     lease_ttl: f64,
+    /// With --peer: acknowledge a commit once a majority of the group
+    /// durably holds it (majority), or once it is on this node's disk
+    /// (off). Per request: CommitRequest.sync, ?sync=, chron append
+    /// --sync/--async.
+    #[arg(long, env = "CHROND_SYNC_COMMIT", value_enum, default_value_t = SyncArg::Majority)]
+    sync_commit: SyncArg,
+    /// Seconds a sync commit waits for a majority before answering
+    /// "unconfirmed" (default: the lease ttl).
+    #[arg(long, env = "CHROND_SYNC_TIMEOUT")]
+    sync_timeout: Option<f64>,
     /// Log lines as human text or one JSON object per line.
     #[arg(long, env = "CHROND_LOG_FORMAT", value_enum, default_value_t = chrond::logging::LogFormat::Text)]
     log_format: chrond::logging::LogFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SyncArg {
+    Off,
+    Majority,
 }
 
 fn read(path: &PathBuf, what: &str) -> anyhow::Result<Vec<u8>> {
@@ -208,6 +224,13 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     opts.advertise = cli.advertise;
     opts.lease_ttl = std::time::Duration::from_secs_f64(cli.lease_ttl.max(0.0));
+    opts.sync_commit = match cli.sync_commit {
+        SyncArg::Off => chrond::SyncCommit::Off,
+        SyncArg::Majority => chrond::SyncCommit::Majority,
+    };
+    opts.sync_timeout = cli
+        .sync_timeout
+        .map(|s| std::time::Duration::from_secs_f64(s.max(0.0)));
     opts.max_message_bytes = cli.max_message_bytes;
     opts.request_timeout = cli.request_timeout.map(std::time::Duration::from_secs);
     opts.concurrency_per_connection = cli.concurrency_per_connection;

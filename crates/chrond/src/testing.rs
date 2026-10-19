@@ -137,6 +137,11 @@ pub fn free_port() -> u16 {
 
 impl Cluster {
     pub async fn start(n: usize, ttl: Duration) -> Cluster {
+        Self::start_with(n, ttl, |_| {}).await
+    }
+
+    /// `start` with `f` adjusting every node's options.
+    pub async fn start_with(n: usize, ttl: Duration, f: impl Fn(&mut Options)) -> Cluster {
         let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
         let mut cluster = Cluster {
             nodes: Vec::new(),
@@ -150,9 +155,36 @@ impl Cluster {
             });
         }
         for i in 0..n {
-            cluster.restart(i).await;
+            cluster.restart_with(i, &f).await;
         }
         cluster
+    }
+
+    /// Holds (or releases) every apply on node `i`: its acknowledgments
+    /// stop without its pullers stopping.
+    pub fn hold_apply(&self, i: usize, held: bool) {
+        self.node(i).hold_apply.send_replace(held);
+    }
+
+    /// The followers node `i` sees on `default`, when it leads.
+    pub fn followers(&self, i: usize) -> Vec<chron_proto::v1::FollowerStatus> {
+        self.node(i).default_db().sync.snapshot()
+    }
+
+    /// The majority-applied position node `i` has for `default`.
+    pub fn majority_applied(&self, i: usize) -> u64 {
+        self.node(i).default_db().sync.majority()
+    }
+
+    /// A client with no request timeout, for watching a commit pend.
+    pub async fn client_patient(&self, i: usize) -> chron_client::Client {
+        let config = chron_client::ClientConfig {
+            connect_timeout: Duration::from_millis(500),
+            ..Default::default()
+        };
+        chron_client::Client::connect(self.addr(i), config)
+            .await
+            .expect("connect")
     }
 
     /// The options node `i` starts with: its directory and port, every
@@ -165,6 +197,12 @@ impl Cluster {
         );
         o.fsync = false;
         o.lease_ttl = self.ttl;
+        // Databases created on the leader show up on followers within a
+        // second, not the ten of the default.
+        o.discover_interval = Duration::from_secs(1);
+        // Below the 2 s request timeout of `client`, above the time a
+        // follower takes to attach after an election.
+        o.sync_timeout = Some(Duration::from_millis(1500));
         o.peers = self
             .nodes
             .iter()
@@ -402,5 +440,23 @@ impl Node {
     /// `chron_elections_total` as a number, for tests.
     pub fn metrics_elections(&self) -> u64 {
         self.metrics.elections.get()
+    }
+}
+
+impl Node {
+    /// `chron_sync_commit_wait_seconds` observations on `default`.
+    pub fn metrics_sync_waits(&self) -> u64 {
+        self.metrics
+            .sync_wait
+            .with_label_values(&["default"])
+            .get_sample_count()
+    }
+
+    /// `chron_sync_commit_timeouts_total{reason}` on `default`.
+    pub fn metrics_sync_timeouts(&self, reason: &str) -> u64 {
+        self.metrics
+            .sync_timeouts
+            .with_label_values(&["default", reason])
+            .get()
     }
 }

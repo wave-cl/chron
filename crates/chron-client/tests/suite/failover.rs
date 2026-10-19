@@ -133,3 +133,70 @@ async fn no_leader_is_an_error_that_names_every_seed() {
     free(&client, "healed").await.unwrap();
     c.stop_all().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unconfirmed_commit_is_not_retried() {
+    let mut c = Cluster::start_with(3, TTL, |o| {
+        o.sync_timeout = Some(Duration::from_millis(300))
+    })
+    .await;
+    let l = c.wait_for_leader(SOON).await;
+    let others: Vec<usize> = (0..3).filter(|i| *i != l).collect();
+    for i in &others {
+        c.wait_following(*i, l, SOON).await;
+    }
+    c.wait("followers attached", SOON, || c.followers(l).len() == 2)
+        .await;
+    for i in &others {
+        c.hold_apply(*i, true);
+    }
+    let seeds: Vec<String> = (0..3).map(|i| c.addr(i)).collect();
+    let client = Client::connect_any(seeds, config()).await.unwrap();
+    let id = chron_client::Uuid::from_u128(3);
+    let head_before = c.node(l).default_db().db.head();
+    let r = client
+        .append(
+            id,
+            chron_client::Expected::Exact(0),
+            vec![NewEvent::new("once")],
+        )
+        .await;
+    assert!(
+        matches!(
+            r,
+            Err(ClientError::Unconfirmed {
+                first: 0,
+                next: 1,
+                ..
+            })
+        ),
+        "{r:?}"
+    );
+    assert_eq!(
+        c.node(l).default_db().db.head(),
+        head_before + 1,
+        "landed once, not retried"
+    );
+    let r = client
+        .commit_with(
+            free_txn("async"),
+            chron_client::CommitOptions {
+                epoch: None,
+                sync: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.first, head_before + 1);
+    for i in &others {
+        c.hold_apply(*i, false);
+    }
+    c.wait_heads(head_before + 2, SOON).await;
+    c.stop_all().await;
+}
+
+fn free_txn(payload: &str) -> Transaction {
+    let mut t = Transaction::new();
+    t.append_free(vec![NewEvent::new(payload.to_string())]);
+    t
+}

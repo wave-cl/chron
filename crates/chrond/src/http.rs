@@ -228,6 +228,8 @@ async fn page(dbn: &DbNode, read: Read, q: ReadQuery) -> Result<Json<Value>> {
 #[derive(Deserialize, Default)]
 struct CommitQuery {
     epoch: Option<u64>,
+    /// Absent: the daemon's `--sync-commit`.
+    sync: Option<bool>,
 }
 
 async fn commit(
@@ -240,14 +242,8 @@ async fn commit(
     let Query(q) = q.map_err(bad)?;
     let Json(txn) = body.map_err(json_rejection)?;
     let appends = appends_from_json(txn)?;
-    let node = st.node.clone();
-    let name = dbn.name.clone();
-    let start = Instant::now();
-    let result = tokio::task::spawn_blocking(move || node.commit_guarded(&dbn, appends, q.epoch))
-        .await
-        .map_err(|e| ApiError(crate::codec::join("commit", e)))?;
-    st.node.metrics.commit(&name, start, &result);
-    Ok(Json(committed_json(&result?)))
+    let committed = ops::commit(&st.node, dbn, appends, q.epoch, q.sync).await?;
+    Ok(Json(committed_json(&committed)))
 }
 
 fn json_rejection(r: axum::extract::rejection::JsonRejection) -> ApiError {

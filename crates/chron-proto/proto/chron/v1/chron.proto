@@ -45,9 +45,18 @@ message CommitRequest {
   repeated Append appends = 1;
   // Fencing token: the epoch the writer last saw in Info. Absent: no
   // check. Stale, or newer than the daemon's epoch, is FAILED_PRECONDITION
-  // with the metadata `chron-epoch` carrying the daemon's epoch; a newer
-  // one also fences the daemon.
+  // with the metadata `chron-epoch` carrying the daemon's epoch; without
+  // peers a newer one also fences the daemon.
   optional uint64 epoch = 2;
+  // Absent: the daemon's --sync-commit. true: acknowledge only once a
+  // majority of the group durably holds the transaction; false: once it
+  // is on this node's disk. Ignored without peers. A transaction that
+  // landed locally but was not confirmed by a majority within the sync
+  // timeout, or before the node stopped leading, is DEADLINE_EXCEEDED
+  // with the metadata `chron-committed-first` and `chron-committed-next`:
+  // it is on this node's disk and replicates unless the node dies; do not
+  // resend it blindly.
+  optional bool sync = 3;
 }
 
 enum Role {
@@ -154,6 +163,47 @@ message InfoResponse {
   repeated string peers = 19;
   // The epoch of the vote this node last gave, if any.
   optional uint64 voted_epoch = 20;
+  // On a leader with peers: the highest position a majority durably
+  // holds (sync commits are acknowledged at or past it).
+  optional uint64 majority_applied = 21;
+  // On a leader with peers: every follower attached through Follow.
+  repeated FollowerStatus followers = 22;
+  // Whether the daemon acknowledges commits only once a majority holds
+  // them (--sync-commit majority).
+  bool sync_commit = 23;
+}
+
+// One follower as the leader sees it.
+message FollowerStatus {
+  string peer = 1;
+  // The position it last reported applied.
+  uint64 applied = 2;
+  // Whether it syncs what it applies to disk.
+  bool durable = 3;
+  // Whether its acknowledgments count toward the majority (a configured
+  // peer, at least as durable as the leader).
+  bool counted = 4;
+}
+
+// The first message of Follow: like Replicate, plus who follows and how
+// durably it applies.
+message FollowOpen {
+  uint64 from_position = 1;
+  optional uint32 last_fingerprint = 2;
+  // The follower's advertised address (--advertise).
+  string peer_addr = 3;
+  // Whether the follower fsyncs what it applies.
+  bool durable = 4;
+}
+
+// The follower applied everything below `head`, durably when it said so.
+message FollowApplied { uint64 head = 1; }
+
+message FollowRequest {
+  oneof msg {
+    FollowOpen open = 1;
+    FollowApplied applied = 2;
+  }
 }
 
 // A leader with peers tells each of them, every third of the lease, that
@@ -283,6 +333,11 @@ message ReplicationChunk {
   uint64 from = 2;
   uint64 to = 3;
   bytes frames = 4;
+  // The leader's head when it took `epoch`: a follower adopts `epoch`
+  // once its own head reaches it, so a node at an epoch holds everything
+  // that epoch's leader held at its election. 0 from a leader that was
+  // not elected in this process.
+  uint64 epoch_base = 7;
   uint64 head = 5;
   uint64 epoch = 6;
 }
@@ -346,4 +401,9 @@ service Chron {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc Discover(DiscoverRequest) returns (DiscoverResponse);
   rpc Fingerprints(FingerprintsRequest) returns (FingerprintsResponse);
+  // Replicate with acknowledgments: the follower opens with `open`, the
+  // leader streams chunks as Replicate does, and the follower reports
+  // each applied head so the leader can confirm sync commits. An admin
+  // call; UNIMPLEMENTED on a daemon before 0.4.0.
+  rpc Follow(stream FollowRequest) returns (stream ReplicationChunk);
 }

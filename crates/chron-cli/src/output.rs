@@ -165,6 +165,14 @@ pub fn render_error(e: &anyhow::Error) -> String {
             ClientError::Fenced { message, epoch } => {
                 format!("FailedPrecondition: {message} (daemon epoch {epoch})")
             }
+            ClientError::Unconfirmed {
+                first,
+                next,
+                message,
+            } => format!(
+                "Unconfirmed: committed locally at {first}..{} but {message}",
+                next - 1
+            ),
             ClientError::Unauthenticated(m) => {
                 format!("Unauthenticated: {m}; set --token or CHRON_TOKEN")
             }

@@ -38,6 +38,7 @@ async fn a_short_run_finds_no_violation() {
         seed: 7,
         kill_every: None,
         killer: None,
+        sync: None,
     })
     .await
     .unwrap();
@@ -55,8 +56,8 @@ async fn a_short_run_finds_no_violation() {
 }
 
 /// A three-node group whose leader is killed every few seconds and
-/// restarted two seconds later: no violation, and every lost
-/// acknowledgment is explained by a kill.
+/// restarted two seconds later, in both commit modes: no violation, and
+/// in sync mode no acknowledged write is lost at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_with_the_leader_killed_finds_no_violation() {
     use chrond::testing::Cluster;
@@ -64,62 +65,71 @@ async fn a_run_with_the_leader_killed_finds_no_violation() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
-    let cluster = std::sync::Arc::new(tokio::sync::Mutex::new(
-        Cluster::start(3, Duration::from_secs(1)).await,
-    ));
-    let addrs: Vec<String> = {
-        let c = cluster.lock().await;
-        c.wait_for_leader(Duration::from_secs(6)).await;
-        (0..3).map(|i| c.addr(i)).collect()
-    };
-    let killer: chron_load::Killer = {
-        let cluster = cluster.clone();
-        std::sync::Arc::new(move |addr: String| {
+    for (mode, sync) in [("sync", Some(true)), ("async", Some(false))] {
+        let cluster = std::sync::Arc::new(tokio::sync::Mutex::new(
+            Cluster::start(3, Duration::from_secs(1)).await,
+        ));
+        let addrs: Vec<String> = {
+            let c = cluster.lock().await;
+            c.wait_for_leader(Duration::from_secs(6)).await;
+            (0..3).map(|i| c.addr(i)).collect()
+        };
+        let killer: chron_load::Killer = {
             let cluster = cluster.clone();
-            Box::pin(async move {
-                let i = {
-                    let mut c = cluster.lock().await;
-                    let Some(i) = (0..3).find(|i| c.addr(*i) == addr) else {
-                        return false;
-                    };
-                    c.stop(i).await;
-                    i
-                };
+            std::sync::Arc::new(move |addr: String| {
                 let cluster = cluster.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    cluster.lock().await.restart(i).await;
-                });
-                true
+                Box::pin(async move {
+                    let i = {
+                        let mut c = cluster.lock().await;
+                        let Some(i) = (0..3).find(|i| c.addr(*i) == addr) else {
+                            return false;
+                        };
+                        c.stop(i).await;
+                        i
+                    };
+                    let cluster = cluster.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        cluster.lock().await.restart(i).await;
+                    });
+                    true
+                })
             })
+        };
+        let report = chron_load::run(chron_load::Config {
+            addr: addrs.join(","),
+            replica: None,
+            token: None,
+            database: None,
+            duration: Duration::from_secs(secs),
+            writers: 4,
+            readers: 2,
+            subscribers: 1,
+            aggregates: 8,
+            events_per_txn: 2,
+            payload_bytes: 120,
+            backup_dir: None,
+            backup_every: None,
+            retain_every: None,
+            seed: 11,
+            kill_every: Some(Duration::from_secs(6)),
+            killer: Some(killer),
+            sync,
         })
-    };
-    let report = chron_load::run(chron_load::Config {
-        addr: addrs.join(","),
-        replica: None,
-        token: None,
-        database: None,
-        duration: Duration::from_secs(secs),
-        writers: 4,
-        readers: 2,
-        subscribers: 1,
-        aggregates: 8,
-        events_per_txn: 2,
-        payload_bytes: 120,
-        backup_dir: None,
-        backup_every: None,
-        retain_every: None,
-        seed: 11,
-        kill_every: Some(Duration::from_secs(6)),
-        killer: Some(killer),
-    })
-    .await
-    .unwrap();
-    eprintln!("{}", report.to_json());
-    assert!(report.kills >= 2, "{report:?}");
-    assert!(report.transactions > 100, "{report:?}");
-    assert!(report.ok(), "{:#?}", report.violations);
-    // Wait for the last restart before tearing down.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    cluster.lock().await.stop_all().await;
+        .await
+        .unwrap();
+        eprintln!("{mode}: {}", report.to_json());
+        assert!(report.kills >= 2, "{mode}: {report:?}");
+        assert!(report.transactions > 100, "{mode}: {report:?}");
+        assert!(report.ok(), "{mode}: {:#?}", report.violations);
+        if mode == "sync" {
+            assert_eq!(
+                report.lost_acks, 0,
+                "{mode}: an acknowledged write was lost"
+            );
+        }
+        // Wait for the last restart before tearing down.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        cluster.lock().await.stop_all().await;
+    }
 }

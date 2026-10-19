@@ -913,3 +913,27 @@ fn a_comma_list_of_addresses_finds_the_leader_and_discover_names_it() {
         .stderr(predicate::str::contains("no leader"));
     rt.block_on(c.stop_all());
 }
+
+#[test]
+fn append_sync_and_async_flags() {
+    let d = Daemon::start();
+    d.chron()
+        .args(["append", "free", "-d", "a", "--sync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("committed 0"));
+    d.chron()
+        .args(["append", "free", "-d", "b", "--async"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("committed 1"));
+    d.chron()
+        .args(["append", "free", "-d", "c", "--sync", "--async"])
+        .assert()
+        .code(2);
+    d.chron()
+        .args(["info"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("head 2"));
+}

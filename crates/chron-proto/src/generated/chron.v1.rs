@@ -70,10 +70,20 @@ pub struct CommitRequest {
     pub appends: ::prost::alloc::vec::Vec<Append>,
     /// Fencing token: the epoch the writer last saw in Info. Absent: no
     /// check. Stale, or newer than the daemon's epoch, is FAILED_PRECONDITION
-    /// with the metadata `chron-epoch` carrying the daemon's epoch; a newer
-    /// one also fences the daemon.
+    /// with the metadata `chron-epoch` carrying the daemon's epoch; without
+    /// peers a newer one also fences the daemon.
     #[prost(uint64, optional, tag = "2")]
     pub epoch: ::core::option::Option<u64>,
+    /// Absent: the daemon's --sync-commit. true: acknowledge only once a
+    /// majority of the group durably holds the transaction; false: once it
+    /// is on this node's disk. Ignored without peers. A transaction that
+    /// landed locally but was not confirmed by a majority within the sync
+    /// timeout, or before the node stopped leading, is DEADLINE_EXCEEDED
+    /// with the metadata `chron-committed-first` and `chron-committed-next`:
+    /// it is on this node's disk and replicates unless the node dies; do not
+    /// resend it blindly.
+    #[prost(bool, optional, tag = "3")]
+    pub sync: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AppendResult {
@@ -179,7 +189,7 @@ pub struct Options {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InfoRequest {}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InfoResponse {
     #[prost(string, tag = "1")]
     pub path: ::prost::alloc::string::String,
@@ -229,6 +239,69 @@ pub struct InfoResponse {
     /// The epoch of the vote this node last gave, if any.
     #[prost(uint64, optional, tag = "20")]
     pub voted_epoch: ::core::option::Option<u64>,
+    /// On a leader with peers: the highest position a majority durably
+    /// holds (sync commits are acknowledged at or past it).
+    #[prost(uint64, optional, tag = "21")]
+    pub majority_applied: ::core::option::Option<u64>,
+    /// On a leader with peers: every follower attached through Follow.
+    #[prost(message, repeated, tag = "22")]
+    pub followers: ::prost::alloc::vec::Vec<FollowerStatus>,
+    /// Whether the daemon acknowledges commits only once a majority holds
+    /// them (--sync-commit majority).
+    #[prost(bool, tag = "23")]
+    pub sync_commit: bool,
+}
+/// One follower as the leader sees it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FollowerStatus {
+    #[prost(string, tag = "1")]
+    pub peer: ::prost::alloc::string::String,
+    /// The position it last reported applied.
+    #[prost(uint64, tag = "2")]
+    pub applied: u64,
+    /// Whether it syncs what it applies to disk.
+    #[prost(bool, tag = "3")]
+    pub durable: bool,
+    /// Whether its acknowledgments count toward the majority (a configured
+    /// peer, at least as durable as the leader).
+    #[prost(bool, tag = "4")]
+    pub counted: bool,
+}
+/// The first message of Follow: like Replicate, plus who follows and how
+/// durably it applies.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FollowOpen {
+    #[prost(uint64, tag = "1")]
+    pub from_position: u64,
+    #[prost(uint32, optional, tag = "2")]
+    pub last_fingerprint: ::core::option::Option<u32>,
+    /// The follower's advertised address (--advertise).
+    #[prost(string, tag = "3")]
+    pub peer_addr: ::prost::alloc::string::String,
+    /// Whether the follower fsyncs what it applies.
+    #[prost(bool, tag = "4")]
+    pub durable: bool,
+}
+/// The follower applied everything below `head`, durably when it said so.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FollowApplied {
+    #[prost(uint64, tag = "1")]
+    pub head: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FollowRequest {
+    #[prost(oneof = "follow_request::Msg", tags = "1, 2")]
+    pub msg: ::core::option::Option<follow_request::Msg>,
+}
+/// Nested message and enum types in `FollowRequest`.
+pub mod follow_request {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Msg {
+        #[prost(message, tag = "1")]
+        Open(super::FollowOpen),
+        #[prost(message, tag = "2")]
+        Applied(super::FollowApplied),
+    }
 }
 /// A leader with peers tells each of them, every third of the lease, that
 /// it leads under `epoch`. An admin call.
@@ -434,6 +507,12 @@ pub struct ReplicationChunk {
     pub to: u64,
     #[prost(bytes = "vec", tag = "4")]
     pub frames: ::prost::alloc::vec::Vec<u8>,
+    /// The leader's head when it took `epoch`: a follower adopts `epoch`
+    /// once its own head reaches it, so a node at an epoch holds everything
+    /// that epoch's leader held at its election. 0 from a leader that was
+    /// not elected in this process.
+    #[prost(uint64, tag = "7")]
+    pub epoch_base: u64,
     #[prost(uint64, tag = "5")]
     pub head: u64,
     #[prost(uint64, tag = "6")]
@@ -1082,6 +1161,31 @@ pub mod chron_client {
                 .insert(GrpcMethod::new("chron.v1.Chron", "Fingerprints"));
             self.inner.unary(req, path, codec).await
         }
+        /// Replicate with acknowledgments: the follower opens with `open`, the
+        /// leader streams chunks as Replicate does, and the follower reports
+        /// each applied head so the leader can confirm sync commits. An admin
+        /// call; UNIMPLEMENTED on a daemon before 0.4.0.
+        pub async fn follow(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::FollowRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ReplicationChunk>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/chron.v1.Chron/Follow");
+            let mut req = request.into_streaming_request();
+            req.extensions_mut().insert(GrpcMethod::new("chron.v1.Chron", "Follow"));
+            self.inner.streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1242,6 +1346,20 @@ pub mod chron_server {
             tonic::Response<super::FingerprintsResponse>,
             tonic::Status,
         >;
+        /// Server streaming response type for the Follow method.
+        type FollowStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::ReplicationChunk, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Replicate with acknowledgments: the follower opens with `open`, the
+        /// leader streams chunks as Replicate does, and the follower reports
+        /// each applied head so the leader can confirm sync commits. An admin
+        /// call; UNIMPLEMENTED on a daemon before 0.4.0.
+        async fn follow(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::FollowRequest>>,
+        ) -> std::result::Result<tonic::Response<Self::FollowStream>, tonic::Status>;
     }
     /// Every database of one daemon over one service. A call names its
     /// database with the metadata `chron-db: <name>` (`[a-z0-9_-]{1,64}`);
@@ -2305,6 +2423,52 @@ pub mod chron_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/Follow" => {
+                    #[allow(non_camel_case_types)]
+                    struct FollowSvc<T: Chron>(pub Arc<T>);
+                    impl<T: Chron> tonic::server::StreamingService<super::FollowRequest>
+                    for FollowSvc<T> {
+                        type Response = super::ReplicationChunk;
+                        type ResponseStream = T::FollowStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::FollowRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::follow(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FollowSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

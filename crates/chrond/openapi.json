@@ -315,6 +315,36 @@
               "integer",
               "null"
             ]
+          },
+          "majority_applied": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "On a leader with peers: the highest position a majority durably holds."
+          },
+          "followers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "peer": {
+                  "type": "string"
+                },
+                "applied": {
+                  "type": "integer"
+                },
+                "durable": {
+                  "type": "boolean"
+                },
+                "counted": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "sync_commit": {
+            "type": "boolean"
           }
         }
       },
@@ -393,7 +423,7 @@
           },
           "code": {
             "type": "string",
-            "description": "the gRPC code's name: InvalidArgument (400), Unauthenticated (401), PermissionDenied (403), NotFound (404), AlreadyExists or FailedPrecondition (409), Unimplemented (405), ResourceExhausted (413), OutOfRange (416), Unavailable (503), Internal (500). A 408 from --request-timeout has no body: the request's outcome is unknown (a commit may still land)."
+            "description": "the gRPC code's name: InvalidArgument (400), Unauthenticated (401), PermissionDenied (403), NotFound (404), AlreadyExists or FailedPrecondition (409), Unimplemented (405), ResourceExhausted (413), OutOfRange (416), Unavailable (503), DeadlineExceeded (504, a sync commit not confirmed in time), Internal (500). A 408 from --request-timeout has no body: the request's outcome is unknown (a commit may still land)."
           },
           "actual_length": {
             "type": "integer"
@@ -420,6 +450,14 @@
               "epoch"
             ],
             "description": "On a 409 FailedPrecondition: an append's expectation failed (actual_length, aggregate) or the node's role or epoch refused the write (epoch)."
+          },
+          "committed_first": {
+            "type": "integer",
+            "description": "On a 504: the first position the transaction landed at locally."
+          },
+          "committed_next": {
+            "type": "integer",
+            "description": "On a 504: the head after that transaction."
           }
         }
       }
@@ -474,6 +512,15 @@
             "schema": {
               "type": "integer"
             }
+          },
+          {
+            "name": "sync",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "true: answer once a majority of the group durably holds the transaction; false: once it is on this node's disk; absent: the daemon's --sync-commit. Ignored without peers. A transaction that landed locally but was not confirmed in time is 504 with committed_first and committed_next: it stays on this node and replicates unless the node dies; do not resend it blindly."
           }
         ],
         "requestBody": {

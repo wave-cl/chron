@@ -248,7 +248,8 @@ chrond --data-dir DIR --listen 0.0.0.0:4242 [--no-fsync] [--verify-all-segments]
        [--log-format text|json] [--discover-interval SECS]
        [--replicate-from http://leader:4242 [--replicate-token SECRET | --replicate-token-file FILE]
         [--replicate-ca ca.pem] [--replicate-cert c.pem --replicate-key c.key] [--replicate-domain NAME]]
-       [--peer http://b:4242 --peer http://c:4242 [--advertise http://a:4242] [--lease-ttl SECS]]
+       [--peer http://b:4242 --peer http://c:4242 [--advertise http://a:4242] [--lease-ttl SECS]
+        [--sync-commit off|majority] [--sync-timeout SECS]]
        [--promote]
 ```
 
@@ -259,7 +260,8 @@ Flags fall back to environment variables: `CHRON_DATA_DIR`,
 `CHROND_KEEPALIVE_INTERVAL`, `CHROND_KEEPALIVE_TIMEOUT`,
 `CHROND_METRICS_LISTEN`, `CHROND_HTTP_LISTEN`, `CHROND_LOG_FORMAT`,
 `CHROND_DISCOVER_INTERVAL`, `CHROND_PEERS` (a comma list),
-`CHROND_ADVERTISE`, `CHROND_LEASE_TTL`,
+`CHROND_ADVERTISE`, `CHROND_LEASE_TTL`, `CHROND_SYNC_COMMIT`,
+`CHROND_SYNC_TIMEOUT`,
 `CHRON_REPLICATE_FROM`, `CHRON_REPLICATE_TOKEN`, `CHRON_REPLICATE_TOKEN_FILE`,
 `CHROND_REPLICATE_CA` / `_CERT` / `_KEY` / `_DOMAIN`. Logging follows
 `CHROND_LOG` (an `EnvFilter`, default `info`) on stderr, one line per call
@@ -291,7 +293,9 @@ are `INVALID_ARGUMENT`; positions past the head or below the floor are
 `OUT_OF_RANGE` with `chron-position` and `chron-head` or `chron-floor`;
 a missing token is `UNAUTHENTICATED`, a missing admin token
 `PERMISSION_DENIED`, a transaction above the message limit
-`RESOURCE_EXHAUSTED`.
+`RESOURCE_EXHAUSTED`; a sync commit that landed locally but was not
+confirmed by a majority in time is `DEADLINE_EXCEEDED` with
+`chron-committed-first` and `chron-committed-next`.
 
 Plaintext and open by default; off a loopback address without a token or
 TLS the daemon logs a warning. With `--tls-client-ca` only clients
@@ -529,15 +533,58 @@ re-election at a higher epoch. With peers a writer's epoch token cannot
 fence the leader: an epoch above the leader's is refused like any wrong
 one.
 
-A leader acknowledges a write once it is on its own disk, not once a
-peer has it, so writes acknowledged by a dead leader after the last
-transaction its successor had pulled are **lost**: the replication lag
-at the moment of death (`chron_replication_lag_events` on the followers
-measures the exposure; the most up-to-date follower is the one elected).
-A leader cut off rather than dead adds up to one lease of writes to
-that, plus the commits that had passed the lease check an instant before
-it expired. Writes acknowledged by the leader that replaces it are never
-lost. An old leader that took such writes comes back as a replica
+#### Synchronous replication
+
+With peers a leader acknowledges a commit only once a **majority** of
+the group durably holds it (`--sync-commit majority`, the default), so a
+leader's death loses nothing a client was told succeeded. Followers
+replicate through `Follow`, a `Replicate` with a return channel: after
+every transaction a follower fsyncs (the daemon's fsync mode), it reports
+the position it applied, and the leader keeps, per database, the highest
+position at least a majority of copies (itself included) hold. A commit
+lands on the leader's disk as before, then waits for that position to
+pass its own, at most `--sync-timeout` (the lease ttl by default: a
+majority that cannot apply within a lease cannot keep the lease either).
+When the wait ends without confirmation, because the followers are slow
+or gone or because the node stopped leading, the answer is
+`DEADLINE_EXCEEDED` "unconfirmed" with the positions the transaction
+landed at: it is on the leader's disk and replicates unless that node
+dies, so it must not be resent blindly; check with an exact expectation
+(a resend then conflicts) or a read. The client never retries it.
+
+A request chooses for itself (`CommitRequest.sync`, `?sync=` on the
+gateway, `chron append --sync` / `--async`, `Client::commit_with`); the
+daemon's default applies otherwise; a node without peers is its own
+majority and ignores the flag. Only configured peers count, and only
+when at least as durable as the leader: a `--no-fsync` follower's
+reports do not confirm anything for a leader that fsyncs (the leader
+logs it, `chron info` shows `counted false`), while a `--no-fsync` leader
+counts any follower. An elected leader holds every confirmed write: a
+vote goes only to a candidate at least as up to date as the voter, a
+candidate claims an epoch only once every one of its databases holds
+what that epoch's leader held at its election (`epoch_base` rides on
+every chunk, and a follower adopts the epoch only when its head reaches
+it), and any majority shares a node with the majority that confirmed the
+write. `commit_duration` now includes the wait;
+`chron_sync_commit_wait_seconds` measures the replication part alone,
+`chron_sync_commit_timeouts_total{reason}` the unconfirmed answers,
+`chron_majority_applied`, `chron_follower_applied_head{peer}` and
+`chron_follower_counted{peer}` the leader's view, `chron_sync_commit`
+the default. Mixed versions: a follower from before 0.4.0 never reports,
+so upgrade followers first and the leader last, or run the leader with
+`--sync-commit off` until they are; a 0.4.0 follower of an older leader
+replicates without reports. Manual `--replicate-from` replicas are
+unchanged.
+
+With `--sync-commit off` (or `sync=false`) a leader acknowledges a write
+once it is on its own disk, so writes acknowledged by a dead leader
+after the last transaction its successor had pulled are **lost**: the
+replication lag at the moment of death (`chron_replication_lag_events`
+on the followers measures the exposure; the most up-to-date follower is
+the one elected). A leader cut off rather than dead adds up to one lease
+of writes to that, plus the commits that had passed the lease check an
+instant before it expired. Writes acknowledged by the leader that
+replaces it are never lost. An old leader that took such writes comes back as a replica
 whose history parts from the leader's: it finds the shared prefix by
 comparing stored record fingerprints (`Fingerprints`), writes the tail
 it is about to drop to `diverged-<epoch>-<from>-<head>.chronbak` in its
@@ -583,12 +630,14 @@ or an expired lease. The metrics are `chron_role{role="candidate"}`,
   next open; the caller retries from the head the error reports.
 - Per-database options (fsync, record limit) are daemon-wide, and
   `default` cannot be dropped.
-- A failover group loses the writes a dead leader acknowledged after the
-  last transaction its successor had pulled: acknowledgment does not
-  wait for a peer. The old leader keeps them in a `diverged-*.chronbak`
-  file when it rejoins. Synchronous replication (an acknowledgment only
-  once a majority holds the write) and more than one leader at a time
-  (sharding) are not in this version.
+- With `--sync-commit off`, or `sync=false` on a request, a failover
+  group loses the writes a dead leader acknowledged after the last
+  transaction its successor had pulled; the old leader keeps them in a
+  `diverged-*.chronbak` file when it rejoins. With `majority` a
+  `--no-fsync` follower's reports do not count for a leader that fsyncs,
+  and a group where fewer than a majority of followers run 0.4.0 cannot
+  confirm sync commits. More than one leader at a time (sharding) is not
+  in this version.
 - Failover relies on each node's monotonic clock advancing at the same
   rate and while the process is running. A machine suspended and resumed
   keeps the lease it held, since the clock did not advance meanwhile,

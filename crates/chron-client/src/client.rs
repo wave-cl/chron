@@ -71,6 +71,21 @@ pub struct ClientConfig {
     /// one to two lease ttls (10 s each by default), so the default is
     /// 30 s. See [`Client::commit`] for which failures are retried.
     pub failover_timeout: Duration,
+    /// Whether commits wait for a majority of a failover group (`Some(
+    /// true)`), return once on the leader's disk (`Some(false)`), or
+    /// follow the daemon's `--sync-commit` (`None`, the default). A
+    /// daemon without peers ignores it.
+    pub sync_commit: Option<bool>,
+}
+
+/// Per-commit choices.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitOptions {
+    /// The epoch the daemon must be at (a fencing token).
+    pub epoch: Option<u64>,
+    /// Wait for a majority, or not; `None` is the client's
+    /// [`ClientConfig::sync_commit`], then the daemon's default.
+    pub sync: Option<bool>,
 }
 
 impl Default for ClientConfig {
@@ -84,6 +99,7 @@ impl Default for ClientConfig {
             max_message_bytes: 64 * 1024 * 1024,
             database: None,
             failover_timeout: Duration::from_secs(30),
+            sync_commit: None,
         }
     }
 }
@@ -192,6 +208,47 @@ pub struct Info {
     pub peers: Vec<String>,
     /// The epoch of the vote the daemon last gave.
     pub voted_epoch: Option<u64>,
+    /// On a leader with peers: the highest position a majority durably
+    /// holds.
+    pub majority_applied: Option<u64>,
+    /// On a leader with peers: the followers attached through `Follow`.
+    pub followers: Vec<FollowerStatus>,
+    /// Whether the daemon waits for a majority by default.
+    pub sync_commit: bool,
+}
+
+/// One follower as the leader sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FollowerStatus {
+    /// Its advertised address.
+    pub peer: String,
+    /// The position it last reported applied.
+    pub applied: u64,
+    /// Whether it syncs what it applies to disk.
+    pub durable: bool,
+    /// Whether its acknowledgments count toward the majority.
+    pub counted: bool,
+}
+
+/// The acknowledgment side of a [`Client::follow`] stream.
+#[derive(Clone)]
+pub struct FollowAcks(tokio::sync::mpsc::Sender<pb::FollowRequest>);
+
+impl FollowAcks {
+    /// Reports that everything below `head` is applied (durably, when
+    /// the stream was opened as durable). Fails once the leader stopped
+    /// reading.
+    pub async fn applied(&self, head: u64) -> Result<(), ClientError> {
+        self.0
+            .send(pb::FollowRequest {
+                msg: Some(pb::follow_request::Msg::Applied(pb::FollowApplied { head })),
+            })
+            .await
+            .map_err(|_| {
+                ClientError::Unavailable("the leader stopped reading acknowledgments".into())
+            })
+    }
 }
 
 /// What `promote` returns: the new leader's epoch and head.
@@ -257,6 +314,9 @@ pub struct ReplicationChunk {
     pub head: u64,
     /// The leader's epoch when the chunk was cut.
     pub epoch: u64,
+    /// The leader's head when it took `epoch`; a follower adopts the
+    /// epoch once its head reaches it.
+    pub epoch_base: u64,
 }
 
 /// A stream of replication chunks.
@@ -669,7 +729,22 @@ impl Client {
     /// events the error is returned and the caller decides. A timed-out
     /// call is never retried.
     pub async fn commit(&self, txn: Transaction) -> Result<Committed, ClientError> {
-        self.commit_inner(txn, None).await
+        self.commit_with(txn, CommitOptions::default()).await
+    }
+
+    /// [`commit`](Client::commit) with an epoch token and a sync choice.
+    /// A sync commit that a majority did not confirm in time fails with
+    /// [`ClientError::Unconfirmed`] and is never retried.
+    pub async fn commit_with(
+        &self,
+        txn: Transaction,
+        options: CommitOptions,
+    ) -> Result<Committed, ClientError> {
+        let options = CommitOptions {
+            sync: options.sync.or(self.config.sync_commit),
+            ..options
+        };
+        self.commit_inner(txn, options).await
     }
 
     /// Like [`commit`](Client::commit), carrying the epoch the writer
@@ -679,14 +754,22 @@ impl Client {
         txn: Transaction,
         epoch: u64,
     ) -> Result<Committed, ClientError> {
-        self.commit_inner(txn, Some(epoch)).await
+        self.commit_with(
+            txn,
+            CommitOptions {
+                epoch: Some(epoch),
+                sync: None,
+            },
+        )
+        .await
     }
 
     async fn commit_inner(
         &self,
         txn: Transaction,
-        epoch: Option<u64>,
+        options: CommitOptions,
     ) -> Result<Committed, ClientError> {
+        let epoch = options.epoch;
         let appends = txn.into_appends();
         let expectations: Vec<(Option<Uuid>, Expected)> =
             appends.iter().map(|a| (a.aggregate, a.expected)).collect();
@@ -694,7 +777,7 @@ impl Client {
             .into_iter()
             .map(|a| convert::append_to_wire(a.aggregate, a.expected, a.events))
             .collect();
-        let mut last = match self.commit_once(&wire, epoch, &expectations).await {
+        let mut last = match self.commit_once(&wire, options, &expectations).await {
             Err(e) if self.retryable(&e, epoch, &expectations) => e,
             other => return other,
         };
@@ -710,7 +793,7 @@ impl Client {
                 Err(e) => search_failed = Some(e),
                 Ok(_) => {
                     search_failed = None;
-                    match self.commit_once(&wire, epoch, &expectations).await {
+                    match self.commit_once(&wire, options, &expectations).await {
                         Err(e) if self.retryable(&e, epoch, &expectations) => last = e,
                         other => return other,
                     }
@@ -729,14 +812,15 @@ impl Client {
     async fn commit_once(
         &self,
         wire: &[pb::Append],
-        epoch: Option<u64>,
+        options: CommitOptions,
         expectations: &[(Option<Uuid>, Expected)],
     ) -> Result<Committed, ClientError> {
         let resp = self
             .rpc()
             .commit(pb::CommitRequest {
                 appends: wire.to_vec(),
-                epoch,
+                epoch: options.epoch,
+                sync: options.sync,
             })
             .await
             .map_err(|s| match ClientError::from(s) {
@@ -1034,7 +1118,51 @@ impl Client {
             lease_remaining: i.lease_remaining_ms.map(Duration::from_millis),
             peers: i.peers,
             voted_epoch: i.voted_epoch,
+            majority_applied: i.majority_applied,
+            followers: i
+                .followers
+                .into_iter()
+                .map(|f| FollowerStatus {
+                    peer: f.peer,
+                    applied: f.applied,
+                    durable: f.durable,
+                    counted: f.counted,
+                })
+                .collect(),
+            sync_commit: i.sync_commit,
         })
+    }
+
+    /// Replication with acknowledgments (daemon to daemon): the stream of
+    /// chunks and the side to report applied heads on. `peer_addr` is the
+    /// follower's advertised address, `durable` whether it fsyncs what it
+    /// applies. An admin call; a daemon before 0.4.0 answers
+    /// `Unimplemented`.
+    #[doc(hidden)]
+    pub async fn follow(
+        &self,
+        from: u64,
+        last_fingerprint: Option<u32>,
+        peer_addr: String,
+        durable: bool,
+    ) -> Result<(ChunkStream, FollowAcks), ClientError> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<pb::FollowRequest>(16);
+        tx.send(pb::FollowRequest {
+            msg: Some(pb::follow_request::Msg::Open(pb::FollowOpen {
+                from_position: from,
+                last_fingerprint,
+                peer_addr,
+                durable,
+            })),
+        })
+        .await
+        .map_err(|_| ClientError::Unavailable("the follow channel closed".into()))?;
+        let stream = self
+            .admin()
+            .follow(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await?
+            .into_inner();
+        Ok((chunks(stream), FollowAcks(tx)))
     }
 
     /// Who leads, as the daemon knows it. Open to any token.
@@ -1169,19 +1297,7 @@ impl Client {
             })
             .await?
             .into_inner();
-        Ok(Box::pin(stream.map(|item| {
-            let c = item?;
-            Ok(ReplicationChunk {
-                db_id: Uuid::from_slice(&c.db_id).ok(),
-                chunk: chron::Chunk {
-                    from: c.from,
-                    to: c.to,
-                    frames: c.frames,
-                },
-                head: c.head,
-                epoch: c.epoch,
-            })
-        })))
+        Ok(chunks(stream))
     }
 
     /// Creates the empty database `name` on the daemon (the leader). An
@@ -1231,6 +1347,24 @@ impl Client {
             .into_inner();
         Ok(r.status() == ServingStatus::Serving)
     }
+}
+
+/// Wire chunks as library chunks.
+fn chunks(stream: tonic::Streaming<pb::ReplicationChunk>) -> ChunkStream {
+    Box::pin(stream.map(|item| {
+        let c = item?;
+        Ok(ReplicationChunk {
+            db_id: Uuid::from_slice(&c.db_id).ok(),
+            chunk: chron::Chunk {
+                from: c.from,
+                to: c.to,
+                frames: c.frames,
+            },
+            head: c.head,
+            epoch: c.epoch,
+            epoch_base: c.epoch_base,
+        })
+    }))
 }
 
 fn database_info(d: pb::DatabaseInfo) -> Result<DatabaseInfo, ClientError> {

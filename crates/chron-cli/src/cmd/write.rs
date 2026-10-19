@@ -34,19 +34,32 @@ pub struct AppendArgs {
     /// The epoch the daemon must be at (a fencing token).
     #[arg(long)]
     epoch: Option<u64>,
+    /// Wait until a majority of the failover group holds the commit
+    /// (the daemon's default with --sync-commit majority).
+    #[arg(long, conflicts_with = "async")]
+    sync: bool,
+    /// Return once the commit is on the leader's disk.
+    #[arg(long = "async")]
+    r#async: bool,
+}
+
+/// `--sync`, `--async` or the daemon's default.
+fn sync_choice(sync: bool, r#async: bool) -> Option<bool> {
+    match (sync, r#async) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
 }
 
 async fn send(
     conn: &Conn,
     format: Format,
     txn: Transaction,
-    epoch: Option<u64>,
+    options: chron_client::CommitOptions,
 ) -> anyhow::Result<()> {
     let c = client::connect(conn).await?;
-    let committed = match epoch {
-        Some(e) => c.commit_with_epoch(txn, e).await?,
-        None => c.commit(txn).await?,
-    };
+    let committed = c.commit_with(txn, options).await?;
     print_commit(format, &committed);
     Ok(())
 }
@@ -84,7 +97,16 @@ pub async fn append(conn: &Conn, format: Format, a: AppendArgs) -> anyhow::Resul
         Some(id) => txn.append(id, expected, events),
         None => txn.append_free(events),
     };
-    send(conn, format, txn, a.epoch).await
+    send(
+        conn,
+        format,
+        txn,
+        chron_client::CommitOptions {
+            epoch: a.epoch,
+            sync: sync_choice(a.sync, a.r#async),
+        },
+    )
+    .await
 }
 
 #[derive(Args, Debug)]
@@ -100,6 +122,12 @@ pub struct CommitArgs {
     /// The epoch the daemon must be at (a fencing token).
     #[arg(long)]
     epoch: Option<u64>,
+    /// Wait until a majority of the failover group holds the commit.
+    #[arg(long, conflicts_with = "async")]
+    sync: bool,
+    /// Return once the commit is on the leader's disk.
+    #[arg(long = "async")]
+    r#async: bool,
 }
 
 #[derive(Deserialize)]
@@ -202,5 +230,14 @@ pub async fn commit(conn: &Conn, format: Format, a: CommitArgs) -> anyhow::Resul
             None => txn.append_free(events),
         };
     }
-    send(conn, format, txn, a.epoch).await
+    send(
+        conn,
+        format,
+        txn,
+        chron_client::CommitOptions {
+            epoch: a.epoch,
+            sync: sync_choice(a.sync, a.r#async),
+        },
+    )
+    .await
 }

@@ -16,6 +16,7 @@ mod ops;
 mod replica;
 mod rpc_metrics;
 mod service;
+mod sync;
 #[cfg(feature = "test-util")]
 pub mod testing;
 mod trace;
@@ -37,6 +38,7 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 
+pub use crate::node::SyncCommit;
 use crate::node::{
     ClusterConfig, DbNode, FENCED_MARKER, Node, PROMOTED_MARKER, REPLICA_MARKER, Role, Upstream,
 };
@@ -113,6 +115,16 @@ pub struct Options {
     /// run the same value; a follower waits out the longer of its own
     /// and its leader's.
     pub lease_ttl: Duration,
+    /// With peers: whether a commit is acknowledged only once a majority
+    /// of the group durably holds it (the default) or once it is on this
+    /// node's disk. A request's `sync` flag overrides it. Without peers
+    /// every commit is local.
+    pub sync_commit: SyncCommit,
+    /// How long a sync commit waits for a majority before it answers
+    /// DEADLINE_EXCEEDED "unconfirmed"; `None` is the lease ttl. A
+    /// majority that cannot apply within a lease cannot keep the lease
+    /// either, so longer waits only wait for the step-down.
+    pub sync_timeout: Option<Duration>,
     /// Peers this node neither calls nor answers from the start (a
     /// simulated partition for tests).
     #[cfg(feature = "test-util")]
@@ -166,6 +178,8 @@ impl Options {
             peers: Vec::new(),
             advertise: None,
             lease_ttl: Duration::from_secs(10),
+            sync_commit: SyncCommit::Majority,
+            sync_timeout: None,
             #[cfg(feature = "test-util")]
             partition: Vec::new(),
         }
@@ -273,6 +287,17 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         if opts.peers.contains(&advertise) {
             anyhow::bail!("--peer lists this node's own address {advertise}");
         }
+        let sync_timeout = opts.sync_timeout.unwrap_or(opts.lease_ttl);
+        if sync_timeout.is_zero() {
+            anyhow::bail!("--sync-timeout 0 would answer every sync commit as unconfirmed");
+        }
+        if let Some(t) = opts.request_timeout
+            && t <= sync_timeout
+        {
+            anyhow::bail!(
+                "--request-timeout ({t:?}) must exceed --sync-timeout ({sync_timeout:?}), or sync commits end as request timeouts with no answer"
+            );
+        }
         Some(ClusterConfig {
             peers: opts.peers.clone(),
             advertise: advertise.clone(),
@@ -280,6 +305,8 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
             tls: opts.replicate_tls.clone(),
             max_message_bytes: opts.max_message_bytes,
             lease_ttl: opts.lease_ttl,
+            sync_commit: opts.sync_commit,
+            sync_timeout,
         })
     };
     let cancel = CancellationToken::new();
@@ -419,7 +446,7 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         }
     }
     let names: Vec<String> = node.databases().iter().map(|d| d.name.clone()).collect();
-    tracing::info!(%local_addr, metrics = ?metrics_addr, http = ?http_addr, data_dir = %opts.data_dir.display(), databases = %names.join(","), head = db.head(), role = ?node.role(), epoch = db.epoch(), peers = %opts.peers.join(","), "listening");
+    tracing::info!(%local_addr, metrics = ?metrics_addr, http = ?http_addr, data_dir = %opts.data_dir.display(), databases = %names.join(","), head = db.head(), role = ?node.role(), epoch = db.epoch(), peers = %opts.peers.join(","), sync_commit = ?opts.sync_commit, "listening");
     Ok(Running {
         local_addr,
         metrics_addr,
@@ -510,7 +537,7 @@ async fn open_all(node: &Arc<Node>) -> anyhow::Result<()> {
                     node.database_dir(&name).display()
                 )
             })?;
-        node.insert(DbNode::new(name, db, &node.cancel));
+        node.insert(DbNode::new(name, db, node));
     }
     let max = node
         .databases()
@@ -519,6 +546,12 @@ async fn open_all(node: &Arc<Node>) -> anyhow::Result<()> {
         .max()
         .unwrap_or(0);
     for d in node.databases() {
+        if d.db.epoch() < max && node.cluster.is_some() {
+            // With peers a database's epoch says what it holds; raising it
+            // would let the node claim an epoch it has not caught up to.
+            tracing::info!(database = %d.name, epoch = d.db.epoch(), daemon = max, "a database behind the daemon's epoch; it catches up by replication");
+            continue;
+        }
         if d.db.epoch() < max {
             tracing::warn!(database = %d.name, from = d.db.epoch(), to = max, "raising a lagging epoch to the daemon's");
             let db = d.db.clone();

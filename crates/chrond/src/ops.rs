@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use chron::{Db, Event, Uuid};
+use chron::{Committed, Db, Event, Uuid};
 use chron_proto::v1 as pb;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -188,6 +188,60 @@ pub fn subscribe(
     ReceiverStream::new(rx)
 }
 
+/// The whole commit: the guarded write on the blocking pool, then, when
+/// sync is in effect, the wait for a majority to hold it. Observes the
+/// commit metrics; `commit_duration` therefore includes the wait.
+pub async fn commit(
+    node: &Arc<Node>,
+    dbn: Arc<DbNode>,
+    appends: Vec<pb::Append>,
+    epoch: Option<u64>,
+    sync: Option<bool>,
+) -> Result<Committed, Status> {
+    let start = std::time::Instant::now();
+    let n = node.clone();
+    let d = dbn.clone();
+    let mut result = tokio::task::spawn_blocking(move || n.commit_guarded(&d, appends, epoch))
+        .await
+        .map_err(|e| codec::join("commit", e))?;
+    if let Ok(c) = &result
+        && node.wants_sync(sync)
+    {
+        let timeout = node.sync_timeout();
+        result = match crate::sync::wait_majority(node, &dbn, c.next, timeout).await {
+            crate::sync::Waited::Confirmed(d) => {
+                node.metrics
+                    .sync_wait
+                    .with_label_values(&[&dbn.name])
+                    .observe(d.as_secs_f64());
+                result
+            }
+            crate::sync::Waited::TimedOut => {
+                node.metrics
+                    .sync_timeouts
+                    .with_label_values(&[&dbn.name, "timeout"])
+                    .inc();
+                Err(crate::sync::unconfirmed(
+                    c,
+                    &format!("no majority confirmed it within {timeout:?}"),
+                ))
+            }
+            crate::sync::Waited::RoleLost(r) => {
+                node.metrics
+                    .sync_timeouts
+                    .with_label_values(&[&dbn.name, "role_change"])
+                    .inc();
+                Err(crate::sync::unconfirmed(
+                    c,
+                    &format!("this node stopped leading ({r:?}) before a majority confirmed it"),
+                ))
+            }
+        };
+    }
+    node.metrics.commit(&dbn.name, start, &result);
+    result
+}
+
 /// What `Info` reports about one database.
 pub async fn info(node: &Node, dbn: &DbNode) -> Result<pb::InfoResponse, Status> {
     let info = blocking(&dbn.db, "info", |db| db.info()).await?;
@@ -221,6 +275,14 @@ pub async fn info(node: &Node, dbn: &DbNode) -> Result<pb::InfoResponse, Status>
             .as_ref()
             .map_or_else(Vec::new, |c| c.peers.clone()),
         voted_epoch: node.lease().voted.map(|(e, _)| e),
+        majority_applied: (role == Role::Leader && node.cluster.is_some())
+            .then(|| dbn.sync.majority()),
+        followers: if role == Role::Leader && node.cluster.is_some() {
+            dbn.sync.snapshot()
+        } else {
+            Vec::new()
+        },
+        sync_commit: node.wants_sync(None),
         replica_connected: is_replica && replica.connected,
         leader_head: replica.leader_head.filter(|_| is_replica),
         last_replication_error: replica
@@ -261,7 +323,7 @@ pub async fn create_database(node: Arc<Node>, name: String) -> Result<Arc<DbNode
     .await
     .map_err(|e| codec::join("create_database", e))?
     .map_err(codec::status)?;
-    let dbn = DbNode::new(name.clone(), db, &node.cancel);
+    let dbn = DbNode::new(name.clone(), db, &node);
     node.insert(dbn.clone());
     tracing::info!(database = %name, "database created");
     Ok(dbn)
