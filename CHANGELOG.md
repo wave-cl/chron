@@ -73,6 +73,12 @@ crates share one version.
   JSON, `duplicate` in the answer, `commit_id` on events); a reused id
   with another shape is INVALID_ARGUMENT / 400;
   `chron_commits_total{result="duplicate"}`.
+- A follower lands the chunks that arrived while it was applying the
+  previous one as one batch (one segment sync, one index commit, one
+  report), instead of one batch per leader batch. The commit and
+  replication phases are traced under `chrond::timing` at `trace`
+  level, and `docs/operations.md` has the measured breakdown of a
+  three-node sync commit.
 
 ### chron-client
 

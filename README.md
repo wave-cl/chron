@@ -98,12 +98,12 @@ Tags are stored sorted and deduplicated.
   transaction and the second expectation is checked after the first append.
 - **Durability.** Under `Fsync::Always` (the default) a committed
   transaction survives power loss: its segment bytes are fdatasync'd
-  before it is acknowledged, one sync per batch. The index commit is
-  made durable every `Options::index_checkpoint_batches` batches (256)
-  or `index_checkpoint_interval` (1 s), on close, and by every
-  maintenance write (retention, truncation, epoch, identity), so a batch
-  costs one fsync rather than two; `index_checkpoint_batches(1)` is the
-  0.4 rule. Under `Fsync::Never` a committed transaction survives a
+  (`F_FULLFSYNC` on macOS) before it is acknowledged, one sync per
+  batch. The index commit is made durable every
+  `Options::index_checkpoint_batches` batches (256) or
+  `index_checkpoint_interval` (1 s), on close, and by every maintenance
+  write (retention, truncation, epoch, identity), so a batch costs one
+  fsync rather than two; `index_checkpoint_batches(1)` is the 0.4 rule. Under `Fsync::Never` a committed transaction survives a
   process crash; `flush()` (also run on drop) makes it durable.
 - **Recovery.** Event bytes go to append-only segment files and the indexes
   to one redb file; the segment is the source of truth once synced, the

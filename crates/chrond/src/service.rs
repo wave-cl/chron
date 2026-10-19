@@ -174,6 +174,7 @@ fn spawn_chunk_stream(
                 return;
             }
         }
+        let mut woke = std::time::Instant::now();
         loop {
             let db2 = db.clone();
             let chunk = tokio::select! {
@@ -188,6 +189,7 @@ fn spawn_chunk_stream(
                 _ = tx.closed() => return,
                 c = tokio::task::spawn_blocking(move || db2.replication_chunk(cursor, CHUNK, max_bytes)) => c,
             };
+            let cut = std::time::Instant::now();
             let chunk = match chunk {
                 Ok(Ok(c)) => c,
                 Ok(Err(e)) => {
@@ -226,6 +228,19 @@ fn spawn_chunk_stream(
                     if tx.send(Ok(item)).await.is_err() {
                         return;
                     }
+                    // Timing of the replication path (see
+                    // docs/operations.md, "Where a sync commit's time
+                    // goes"): from the head moving to the chunk being
+                    // handed to the stream.
+                    tracing::trace!(
+                        target: "chrond::timing",
+                        database = %dbn.name,
+                        to = cursor,
+                        cut_us = cut.duration_since(woke).as_micros() as u64,
+                        send_us = cut.elapsed().as_micros() as u64,
+                        "chunk sent"
+                    );
+                    woke = std::time::Instant::now();
                 }
                 None => {
                     tokio::select! {
@@ -240,6 +255,7 @@ fn spawn_chunk_stream(
                         _ = tx.closed() => return,
                         _ = db.wait_for_async(cursor + 1) => {}
                     }
+                    woke = std::time::Instant::now();
                 }
             }
         }
@@ -577,6 +593,7 @@ impl Chron for ChronService {
                     Ok(Some(pb::FollowRequest {
                         msg: Some(pb::follow_request::Msg::Applied(a)),
                     })) => {
+                        tracing::trace!(target: "chrond::timing", peer = %peer, head = a.head, "ack received");
                         let members = node2.members();
                         let self_counted = node2
                             .cluster

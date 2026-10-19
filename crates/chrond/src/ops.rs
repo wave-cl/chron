@@ -210,6 +210,7 @@ pub async fn commit(
         tokio::task::spawn_blocking(move || n.commit_guarded(&d, appends, epoch, commit_id))
             .await
             .map_err(|e| codec::join("commit", e))?;
+    let landed = std::time::Instant::now();
     if let Ok(c) = &result
         && node.wants_sync(sync)
     {
@@ -220,6 +221,16 @@ pub async fn commit(
                     .sync_wait
                     .with_label_values(&[&dbn.name])
                     .observe(d.as_secs_f64());
+                // Timing of the commit path (see docs/operations.md,
+                // "Where a sync commit's time goes").
+                tracing::trace!(
+                    target: "chrond::timing",
+                    database = %dbn.name,
+                    next = c.next,
+                    land_us = landed.duration_since(start).as_micros() as u64,
+                    wait_us = d.as_micros() as u64,
+                    "leader commit"
+                );
                 result
             }
             crate::sync::Waited::TimedOut => {

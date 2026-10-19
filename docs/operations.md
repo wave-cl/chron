@@ -256,3 +256,54 @@ Alerts worth having:
 - `sum(chron_role{role="leader"}) != 1` across a group for 30 s.
 - `increase(chron_sync_commit_timeouts_total[5m]) > 0`.
 - A sudden drop in `chron_streams_open{method="/chron.v1.Chron/Subscribe"}`.
+
+## Where a sync commit's time goes
+
+Measured on one Mac with three release daemons on one SSD, fsync on,
+`scripts/e2e-load.sh --nodes 3`, 2 events of 200 bytes per transaction.
+A flush (`F_FULLFSYNC`, which is what Rust's `sync_data` is on macOS: a
+flush of the device's write cache, serialised across every process
+using the device) costs 3.8 ms alone and 5 to 6 ms on average once the
+three daemons share the device, with a p90 of 9 to 10 ms.
+
+One writer, one commit in flight: p50 13.3 ms.
+
+| phase | p50 |
+|---|---|
+| leader: segment write, flush, index commit | 4.5 ms |
+| chunk cut and sent, received by a waiting follower | 0.3 ms |
+| follower: segment write, flush, index commit, report | 5.6 ms |
+| report to the waiter waking, response to the client | 1 ms |
+
+Four writers, one commit in flight each: p50 28 ms.
+
+| phase | p50 | note |
+|---|---|---|
+| leader: waiting for the batch in flight, then own land | 11 ms | the writer is serial; a commit arriving mid-batch waits for it |
+| chunk cut and sent | 0.1 ms | p90 4 ms: the cut reads the segment while the next batch flushes it |
+| chunk waiting at the follower | 4 ms | the follower is still flushing the previous chunk 4 rounds in 5; a free follower receives it in 0.07 ms |
+| follower: segment write, flush, index commit, report | 8 to 12 ms | the flush is slower under the three daemons' contention |
+| report to the waiter waking, response to the client | 1 ms | |
+
+So a commit pays one flush per node plus, under load, one queued batch
+on the leader and one queued chunk on the follower: the serial writer
+on each node is what the latency is made of, and nothing on the path
+waits for anything else. What is a property of the rig: the three
+daemons share one device, which makes every flush slower and its
+spread wider; on separate disks the follower phase is the single-node
+figure. A follower lands every chunk that arrived while it was busy as
+one batch, so a follower that fell behind catches up with one flush per
+round rather than one per leader batch; in steady state at these
+loads it rarely has more than one waiting.
+
+The phases are traced at `trace` level under the target
+`chrond::timing`: `CHROND_LOG=info,chrond::timing=trace` logs `leader
+commit` (`land_us`, `wait_us`), `chunk sent` (`cut_us`, `send_us`),
+`ack received` and `follower round` (`idle_us`, `apply_us`, `ack_us`,
+`merged`); the three daemons on one machine share a clock, so the
+timestamps line up across logs. Write those logs somewhere other than
+the data volume (a pipe, or a RAM disk): a line written to a file on
+the volume being flushed blocks the worker thread that writes it for
+the rest of the flush, and a woken task parked on that worker waits
+with it, which shows up as a few milliseconds attributed to whichever
+phase logged last.

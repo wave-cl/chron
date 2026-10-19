@@ -442,3 +442,55 @@ async fn a_follower_lands_a_chunk_as_one_batch() {
     replica.stop().await;
     leader.stop().await;
 }
+
+/// Chunks that arrive while a follower is busy (here: held) are landed
+/// with the one it is about to apply, as one batch: twenty leader
+/// batches become one or two follower batches and as many segment syncs,
+/// instead of twenty. Without the coalescing every chunk lands alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_lands_the_chunks_that_arrived_meanwhile_together() {
+    let mut leader = Server::start_with(|o| o.fsync = true).await;
+    let replica = Server::start_with({
+        let addr = leader.addr();
+        move |o| {
+            o.fsync = true;
+            o.replicate_from = Some(addr);
+        }
+    })
+    .await;
+    fill(&mut leader.client, agg(1), 1).await;
+    let replica_client = replica.client.clone();
+    wait_until("the replica to attach", || {
+        let mut c = replica_client.clone();
+        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == 1 }
+    })
+    .await;
+    let running = replica.running.as_ref().unwrap();
+    running.node.hold_apply.send_replace(true);
+    // Sequential commits: one leader batch, hence one chunk, each.
+    fill(&mut leader.client, agg(1), 20).await;
+    let before = running.db.stats();
+    // Let the chunks reach the follower's stream before it is released.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    running.node.hold_apply.send_replace(false);
+    let replica_client = replica.client.clone();
+    wait_until("the replica to catch up", || {
+        let mut c = replica_client.clone();
+        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == 21 }
+    })
+    .await;
+    let after = running.db.stats();
+    assert_eq!(after.transactions - before.transactions, 20);
+    let batches = after.batches - before.batches;
+    assert!(
+        batches <= 3,
+        "the held chunks land together: {batches} batches"
+    );
+    assert_eq!(
+        after.fsyncs - before.fsyncs,
+        batches,
+        "one segment sync per batch"
+    );
+    replica.stop().await;
+    leader.stop().await;
+}

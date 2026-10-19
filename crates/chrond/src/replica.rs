@@ -838,12 +838,21 @@ async fn tail(
     let Following { mut stream, acks } = following;
     #[cfg(feature = "test-util")]
     let mut hold = node.hold_apply.subscribe();
+    // A chunk taken from the stream but not merged into the one being
+    // applied: it opens the next round.
+    let mut pending: Option<Result<chron_client::ReplicationChunk, ClientError>> = None;
+    let mut last_round_end = std::time::Instant::now();
     loop {
-        let msg = tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
-            m = stream.next() => m,
+        let msg = match pending.take() {
+            Some(m) => Some(m),
+            None => tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                m = stream.next() => m,
+            },
         };
-        let c = msg
+        let received = std::time::Instant::now();
+        let idle_us = received.duration_since(last_round_end).as_micros() as u64;
+        let mut c = msg
             .ok_or_else(|| "the leader closed the stream".to_string())?
             .map_err(|e| format!("the leader's stream failed: {e}"))?;
         let db = dbn.db.clone();
@@ -872,8 +881,41 @@ async fn tail(
                 r = hold.wait_for(|h| !*h) => r.map(|_| ()),
             };
         }
+        // Chunks that arrived while this one waited (for the previous
+        // apply, or the hold) are landed with it as one batch: one
+        // segment sync and one index commit per round of what the leader
+        // sent, not one per leader batch. Only contiguous chunks under
+        // the same identity and epoch merge; anything else, or an error,
+        // opens the next round.
+        let mut merged = 0u64;
+        while c.chunk.from != c.chunk.to {
+            let Some(next) = ready_chunk(&mut stream) else {
+                break;
+            };
+            match next {
+                Ok(n)
+                    if n.db_id == c.db_id
+                        && n.epoch == c.epoch
+                        && n.epoch_base == c.epoch_base
+                        && n.chunk.from == c.chunk.to
+                        && n.chunk.from != n.chunk.to
+                        && c.chunk.frames.len() + n.chunk.frames.len()
+                            <= node.max_message_bytes =>
+                {
+                    c.chunk.to = n.chunk.to;
+                    c.chunk.frames.extend_from_slice(&n.chunk.frames);
+                    c.head = c.head.max(n.head);
+                    merged += 1;
+                }
+                other => {
+                    pending = Some(other);
+                    break;
+                }
+            }
+        }
+        let from = c.chunk.from;
         let to = c.chunk.to;
-        let empty = c.chunk.from == c.chunk.to;
+        let empty = from == to;
         let new_head = if empty {
             // The empty chunk that opens a Follow: nothing to apply.
             db.head()
@@ -892,19 +934,50 @@ async fn tail(
             let e = c.epoch;
             blocking(move || db.set_epoch(e)).await?;
         }
+        let applied = std::time::Instant::now();
         if let Some(acks) = &acks {
             acks.applied(new_head)
                 .await
                 .map_err(|_| "the leader stopped reading acknowledgments".to_string())?;
         }
+        last_round_end = std::time::Instant::now();
+        // Timing of the replication path (see docs/operations.md, "Where
+        // a sync commit's time goes"): how long this follower waited for
+        // the chunk, applied it (segment write, fsync, index commit) and
+        // reported it.
+        tracing::trace!(
+            target: "chrond::timing",
+            database = %dbn.name,
+            from,
+            to,
+            merged,
+            idle_us,
+            apply_us = applied.duration_since(received).as_micros() as u64,
+            ack_us = last_round_end.duration_since(applied).as_micros() as u64,
+            "follower round"
+        );
         dbn.record_replica(|r| r.leader_head = Some(c.head));
         node.metrics
             .chunks_applied
             .with_label_values(&[&dbn.name])
-            .inc();
+            .inc_by(1 + merged);
         if !node.role().follows() {
             return Ok(());
         }
+    }
+}
+
+/// The next chunk if the stream already holds one; `None` when it would
+/// have to wait. A single poll with a waker that wakes nothing: the next
+/// real await registers its own.
+fn ready_chunk(
+    stream: &mut ChunkStream,
+) -> Option<Result<chron_client::ReplicationChunk, ClientError>> {
+    use std::task::{Context, Poll, Waker};
+    let mut cx = Context::from_waker(Waker::noop());
+    match stream.as_mut().poll_next(&mut cx) {
+        Poll::Ready(item) => item,
+        Poll::Pending => None,
     }
 }
 
