@@ -330,9 +330,9 @@ proptest! {
                 }
                 Op::Resend(j) => {
                     let j = *j as usize;
-                    if let Some(Some((resolved, landed))) = sent.get(j) {
+                    if let Some(Some((resolved, landed))) = sent.get(j).cloned() {
                         let mut txn = handle.transaction();
-                        send(&mut txn, resolved);
+                        send(&mut txn, &resolved);
                         txn.commit_id(commit_id(j));
                         let kept = landed.filter(|(first, _)| *first >= model.floor);
                         match kept {
@@ -342,12 +342,15 @@ proptest! {
                                 prop_assert_eq!((c.first, c.last, c.duplicate), (first, last, true));
                             }
                             // Never landed, or forgotten below the floor: a
-                            // fresh transaction with the old expectations.
+                            // fresh transaction with the old expectations;
+                            // once it lands, the id is landed for the next
+                            // resend.
                             None => {
-                                let predicted = model.txn(resolved);
+                                let predicted = model.txn(&resolved);
                                 match (txn.commit(), predicted) {
                                     (Ok(c), Ok((first, last))) => {
                                         prop_assert_eq!((c.first, c.last, c.duplicate), (first, last, false));
+                                        sent[j] = Some((resolved, Some((first, last))));
                                     }
                                     (Err(Error::ExpectedLength { aggregate, expected, actual }), Err((a, e, cur))) => {
                                         prop_assert_eq!((aggregate, expected, actual), (a, e, cur));
