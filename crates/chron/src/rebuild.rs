@@ -1,19 +1,16 @@
 //! Rebuilding the index from the segment files alone.
 
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use bytes::Bytes;
+use redb::Durability;
 use uuid::Uuid;
 
 use crate::db::{Layout, Lock};
 use crate::error::{Error, Result};
-use crate::index::{
-    AGG_INDEX, AGG_LEN, DB_ID_KEY, FLOOR_KEY, HEAD_KEY, Index, META, META_BYTES, POS, TAG, TXN_ID,
-};
+use crate::index::{DB_ID_KEY, FLOOR_KEY, HEAD_KEY, Index, META, META_BYTES};
 use crate::options::{Fsync, Options};
-use crate::recover::{Item, Records};
+use crate::recover::{FLUSH_EVERY, Item, Records, Replayer, later_record_exists};
 use crate::segment;
 
 /// What [`Db::rebuild_index`](crate::Db::rebuild_index) found.
@@ -39,53 +36,6 @@ pub struct Rebuilt {
     /// (`false`: the next open mints a fresh one, and replicas of the old
     /// identity will refuse it).
     pub identity_kept: bool,
-}
-
-/// Records committed under the current flush, bound for the index.
-struct Entry {
-    position: u64,
-    base: u64,
-    offset: u64,
-    frame_len: u32,
-    aggregate: Option<Uuid>,
-    index: u64,
-    tags: Vec<Bytes>,
-}
-
-const FLUSH_EVERY: usize = 50_000;
-
-fn flush(
-    index: &Index,
-    batch: &mut Vec<Entry>,
-    txn_ids: &mut Vec<([u8; 16], u64, u64)>,
-    lens: &HashMap<Uuid, u64>,
-    touched: &mut HashSet<Uuid>,
-) -> Result<()> {
-    let txn = index.begin_write()?;
-    {
-        let mut pos = txn.open_table(POS)?;
-        let mut agg_index = txn.open_table(AGG_INDEX)?;
-        let mut tag = txn.open_table(TAG)?;
-        let mut agg_len = txn.open_table(AGG_LEN)?;
-        let mut ids = txn.open_table(TXN_ID)?;
-        for (id, first, next) in txn_ids.drain(..) {
-            ids.insert(&id, (first, next))?;
-        }
-        for e in batch.drain(..) {
-            pos.insert(e.position, (e.base, e.offset, e.frame_len))?;
-            if let Some(id) = &e.aggregate {
-                agg_index.insert((id.as_bytes(), e.index), e.position)?;
-            }
-            for t in &e.tags {
-                tag.insert((t.as_ref(), e.position), ())?;
-            }
-        }
-        for id in touched.drain() {
-            agg_len.insert(id.as_bytes(), lens[&id])?;
-        }
-    }
-    txn.commit()?;
-    Ok(())
 }
 
 fn validated_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
@@ -138,37 +88,6 @@ pub(crate) fn rebuild_seeded(
     rebuild_from(path, opts, IdSource::Given(id), lens)
 }
 
-/// Whether a crc-valid record carrying a position at or past `after`
-/// exists anywhere in the file from `offset` on: damage inside committed
-/// data rather than a torn tail.
-fn later_record_exists(path: &Path, offset: u64, after: u64) -> Result<bool> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = fs::File::open(path).map_err(|e| Error::io(path, "open", e))?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|e| Error::io(path, "seek", e))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)
-        .map_err(|e| Error::io(path, "read", e))?;
-    let frame = segment::FRAME_LEN;
-    for i in 0..buf.len().saturating_sub(frame) {
-        let body_len = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap()) as usize;
-        if body_len == 0 || i + frame + body_len > buf.len() {
-            continue;
-        }
-        let crc = u32::from_be_bytes(buf[i + 4..i + 8].try_into().unwrap());
-        let body = &buf[i + frame..i + frame + body_len];
-        if crc32fast::hash(body) != crc {
-            continue;
-        }
-        if let Ok(ev) = crate::event::decode_body(body)
-            && ev.position >= after
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn rebuild_from(
     path: &Path,
     _opts: &Options,
@@ -208,17 +127,12 @@ fn rebuild_from(
     let identity_kept = id.is_some();
 
     let index = Index::create(&tmp, Fsync::Never)?;
-    let mut lens: HashMap<Uuid, u64> = HashMap::new();
-    let mut touched: HashSet<Uuid> = HashSet::new();
-    let mut batch: Vec<Entry> = Vec::new();
-    let mut txn_ids: Vec<([u8; 16], u64, u64)> = Vec::new();
-    let mut open_txn: Vec<Entry> = Vec::new();
-    let mut open_id: Option<[u8; 16]> = None;
-    let mut pending: HashMap<Uuid, u64> = HashMap::new();
     let floor = segments.first().map_or(0, |(b, _)| *b);
+    // An aggregate first seen above a floor may start at any index: its
+    // earlier events were dropped.
+    let mut replayer = Replayer::new(floor, floor > 0);
+    let mut unknown = |_: &Uuid| Ok(None);
     let mut next_base = floor;
-    let mut head = floor;
-    let mut decoded = 0u64;
     let mut tail_bytes_dropped = 0u64;
     let mut tail_reason = None;
     let last = segments.len().saturating_sub(1);
@@ -234,70 +148,13 @@ fn rebuild_from(
         // The fixed frame bound, not the configured record limit: a limit
         // lowered since the data was written must not read as damage.
         let mut records = Records::open(seg_path, *base, u32::MAX as usize)?;
-        let mut last_complete_end = segment::HEADER_LEN;
+        replayer.begin_segment();
         loop {
             match records.next()? {
                 Item::Record(r) => {
-                    decoded += 1;
-                    let ev = &r.event;
-                    if ev.is_first_in_txn() != open_txn.is_empty() {
-                        let what = if open_txn.is_empty() {
-                            "record without FIRST_IN_TXN starts a transaction"
-                        } else {
-                            "record with FIRST_IN_TXN inside an open transaction"
-                        };
-                        return Err(Error::corrupt(seg_path, r.offset, what));
-                    }
-                    let agg_index = if let Some(id) = ev.aggregate {
-                        // An aggregate first seen above a floor may start at
-                        // any index: its earlier events were dropped.
-                        let cur = pending
-                            .get(&id)
-                            .copied()
-                            .or_else(|| lens.get(&id).copied())
-                            .unwrap_or(if floor > 0 { ev.index } else { 0 });
-                        if ev.index != cur {
-                            return Err(Error::corrupt(
-                                seg_path,
-                                r.offset,
-                                format!(
-                                    "aggregate {id} index {} where {cur} was expected",
-                                    ev.index
-                                ),
-                            ));
-                        }
-                        pending.insert(id, cur + 1);
-                        cur
-                    } else {
-                        0
-                    };
-                    let last_in_txn = ev.is_last_in_txn();
-                    if ev.is_first_in_txn() {
-                        open_id = ev.commit_id;
-                    }
-                    open_txn.push(Entry {
-                        position: r.position,
-                        base: *base,
-                        offset: r.offset,
-                        frame_len: r.frame_len,
-                        aggregate: ev.aggregate,
-                        index: agg_index,
-                        tags: r.event.tags,
-                    });
-                    if last_in_txn {
-                        head = r.position + 1;
-                        last_complete_end = r.offset + u64::from(r.frame_len);
-                        if let Some(id) = open_id.take() {
-                            txn_ids.push((id, open_txn[0].position, head));
-                        }
-                        batch.append(&mut open_txn);
-                        for (id, len) in pending.drain() {
-                            lens.insert(id, len);
-                            touched.insert(id);
-                        }
-                        if batch.len() >= FLUSH_EVERY {
-                            flush(&index, &mut batch, &mut txn_ids, &lens, &mut touched)?;
-                        }
+                    replayer.record(r, *base, seg_path, &mut unknown)?;
+                    if replayer.batch.len() >= FLUSH_EVERY {
+                        replayer.flush(&index, Durability::None)?;
                     }
                 }
                 Item::Tail {
@@ -309,14 +166,14 @@ fn rebuild_from(
                         if !clean {
                             return Err(Error::corrupt(seg_path, offset, reason));
                         }
-                        if !open_txn.is_empty() {
+                        if replayer.open_txn() {
                             return Err(Error::corrupt(
                                 seg_path,
                                 offset,
                                 "transaction still open at the end of a segment that is not the last",
                             ));
                         }
-                    } else if !clean || !open_txn.is_empty() {
+                    } else if !clean || replayer.open_txn() {
                         // A torn tail is cut; damage with committed records
                         // after it is not.
                         if later_record_exists(seg_path, offset, records.reached())? {
@@ -329,7 +186,7 @@ fn rebuild_from(
                         let file_len = fs::metadata(seg_path)
                             .map_err(|e| Error::io(seg_path, "metadata", e))?
                             .len();
-                        tail_bytes_dropped = file_len.saturating_sub(last_complete_end);
+                        tail_bytes_dropped = file_len.saturating_sub(replayer.last_complete_end);
                         tail_reason = Some(if clean {
                             "transaction open at the end of the file".to_string()
                         } else {
@@ -342,22 +199,22 @@ fn rebuild_from(
             }
         }
     }
-    let dropped = decoded - (head - floor);
-    drop(open_txn);
-    drop(pending);
+    let head = replayer.head;
+    let dropped = replayer.decoded - (head - floor);
 
     // Seeded lengths stand for events below the floor. An aggregate with
     // survivors counted its true length (indices are absolute); one whose
     // events were all dropped has only the seed.
     for (id, len) in seed {
-        let entry = lens.entry(id).or_insert(0);
+        let entry = replayer.lens.entry(id).or_insert(0);
         if len > *entry {
             *entry = len;
         }
     }
-    touched.extend(lens.keys().copied());
-    flush(&index, &mut batch, &mut txn_ids, &lens, &mut touched)?;
+    let all: Vec<Uuid> = replayer.lens.keys().copied().collect();
+    replayer.touched.extend(all);
     let txn = index.begin_write_durable()?;
+    replayer.flush_into(&txn)?;
     {
         let mut meta = txn.open_table(META)?;
         meta.insert(HEAD_KEY, head)?;
@@ -396,6 +253,7 @@ mod tests {
     use super::*;
     use crate::event::{self, Event, FLAG_FIRST_IN_TXN, FLAG_LAST_IN_TXN};
     use crate::segment::SegmentWriter;
+    use bytes::Bytes;
 
     /// Writes one segment of hand-made records: `(position, aggregate,
     /// index, flags)`.

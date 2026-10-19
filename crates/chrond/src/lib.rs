@@ -70,6 +70,16 @@ pub struct Options {
     pub promote: bool,
     /// The database's record limit; `None` for the library's default.
     pub max_record_bytes: Option<usize>,
+    /// Transactions one group-commit batch may land; `None` for the
+    /// library's default (64).
+    pub group_commit_max_txns: Option<usize>,
+    /// Bytes at which a batch stops growing; `None` for the library's
+    /// default (4 MiB).
+    pub group_commit_max_bytes: Option<usize>,
+    /// Batches between durable index commits under fsync; `None` for
+    /// the library's default (256). `1` makes every batch's index
+    /// commit durable: two fsyncs per batch, the pre-0.5 behaviour.
+    pub index_checkpoint_batches: Option<usize>,
     /// Serve TLS; `None` is plaintext.
     pub tls: Option<Tls>,
     /// Every `chron.v1.Chron` call must carry `authorization: Bearer
@@ -163,6 +173,9 @@ impl Options {
             replicate_tls: None,
             promote: false,
             max_record_bytes: None,
+            group_commit_max_txns: None,
+            group_commit_max_bytes: None,
+            index_checkpoint_batches: None,
             tls: None,
             token: None,
             admin_token: None,
@@ -220,6 +233,15 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         .verify_all_segments(opts.verify_all_segments);
     if let Some(n) = opts.max_record_bytes {
         db_opts = db_opts.max_record_bytes(n);
+    }
+    if let Some(n) = opts.group_commit_max_txns {
+        db_opts = db_opts.group_commit_max_txns(n);
+    }
+    if let Some(n) = opts.group_commit_max_bytes {
+        db_opts = db_opts.group_commit_max_bytes(n);
+    }
+    if let Some(n) = opts.index_checkpoint_batches {
+        db_opts = db_opts.index_checkpoint_batches(n);
     }
     if opts.token.as_deref() == Some("") || opts.admin_token.as_deref() == Some("") {
         anyhow::bail!("the token is empty");

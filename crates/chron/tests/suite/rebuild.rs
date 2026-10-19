@@ -186,3 +186,37 @@ fn rebuild_of_an_empty_directory_gives_head_zero() {
     fill(&db, agg(1), 1);
     assert_eq!(db.head(), 1);
 }
+
+/// A database whose index lags its data: rebuilding from the segments
+/// and recovering on open agree.
+#[test]
+fn rebuild_of_a_lagging_index_db_matches_recovery() {
+    let d = tmp();
+    let db = open_with(d.path(), durable());
+    fill(&db, agg(1), 4);
+    db.flush().unwrap();
+    let stale = snapshot_index(d.path());
+    for i in 0..6 {
+        let mut t = db.transaction();
+        t.append(
+            agg(1 + i % 2),
+            Expected::Any,
+            vec![tagged("x", &["t"]), ev("y")],
+        );
+        t.commit().unwrap();
+    }
+    drop(db);
+    restore_index(d.path(), &stale);
+    let recovered = {
+        let db = open_with(d.path(), durable().verify_all_segments(true));
+        snapshot(&db)
+    };
+    fs::remove_file(d.path().join("index.redb")).unwrap();
+    let r = Db::rebuild_index(d.path(), &durable()).unwrap();
+    assert_eq!((r.head, r.dropped), (16, 0));
+    let rebuilt = {
+        let db = open_with(d.path(), durable().verify_all_segments(true));
+        snapshot(&db)
+    };
+    assert_eq!(rebuilt, recovered);
+}

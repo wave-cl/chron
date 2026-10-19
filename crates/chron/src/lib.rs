@@ -11,11 +11,17 @@
 //! or one tag's slice of it, live.
 //!
 //! On disk, event bytes go to append-only segment files and every index to
-//! one redb file. **The redb commit is the commit point**: the segment bytes
-//! are written (and under [`Fsync::Always`] synced) first, then one redb
-//! transaction records their positions and advances the head. On open,
-//! anything in the segment files at or past the committed head was never
-//! acknowledged and is truncated.
+//! one redb file. **The segment is the source of truth once synced; the
+//! redb commit is the commit point in memory.** A batch's bytes are
+//! written (and under [`Fsync::Always`] synced) first, then one redb
+//! transaction records their positions and advances the head; that
+//! transaction reaches the disk every [`Options::index_checkpoint_batches`]
+//! batches or [`Options::index_checkpoint_interval`], on close, and on
+//! every maintenance write. On open, complete transactions the segments
+//! hold past the durable index are replayed into it and a torn trailing
+//! transaction is cut; a transaction that was written and synced but
+//! whose result its committer never received is therefore kept, as
+//! [`Db::rebuild_index`] has always done.
 
 #![deny(missing_docs)]
 
@@ -36,7 +42,7 @@ mod txn;
 
 pub use backup::{BackupKind, BackupMeta, inspect_backup, restore_backup, restore_backup_from};
 pub use bytes::Bytes;
-pub use db::{Db, EventIter, Info, Stats, WriterHold};
+pub use db::{Db, EventIter, FSYNC_BUCKET_BOUNDS, Info, Stats, WriterHold};
 pub use error::{Error, Result};
 pub use event::{
     Event, FLAG_COMMIT_ID, FLAG_FIRST_IN_TXN, FLAG_FREE, FLAG_LAST_IN_TXN, MAX_TAG_BYTES,

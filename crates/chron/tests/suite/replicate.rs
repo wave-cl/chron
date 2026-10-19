@@ -304,3 +304,55 @@ fn fingerprint_matches_a_restored_backup_and_differs_after_a_divergent_write() {
     );
     assert!(src.fingerprint(head).unwrap().is_some());
 }
+
+/// A chunk lands as one batch on the destination: one segment sync and
+/// one index commit for every transaction it carries.
+#[test]
+fn a_chunk_lands_as_one_batch() {
+    let d = tmp();
+    let src = open(d.path().join("src"));
+    write_some(&src, 0, 20);
+    let dst = open_with(
+        d.path().join("dst"),
+        opts()
+            .fsync(chron::Fsync::Always)
+            .index_checkpoint_batches(1),
+    );
+    dst.adopt_id(src.id()).unwrap();
+    let chunk = src.replication_chunk(0, 1000, usize::MAX).unwrap().unwrap();
+    let before = dst.stats();
+    assert_eq!(dst.apply_chunk(&chunk).unwrap(), src.head());
+    let after = dst.stats();
+    assert_eq!(after.batches - before.batches, 1, "one batch");
+    assert_eq!(after.fsyncs - before.fsyncs, 1, "one segment sync");
+    assert_eq!(after.index_checkpoints - before.index_checkpoints, 1);
+    assert_eq!(after.transactions - before.transactions, 20);
+    assert_eq!(after.events - before.events, src.head());
+    assert_eq!(snapshot(&dst), snapshot(&src));
+    drop(dst);
+    let dst = open_with(d.path().join("dst"), opts().verify_all_segments(true));
+    assert_eq!(snapshot(&dst), snapshot(&src));
+}
+
+/// A destination with a small segment limit still rolls inside a chunk:
+/// several batches, never more than one transaction over the limit.
+#[test]
+fn a_chunk_still_rolls_at_the_segment_limit() {
+    let d = tmp();
+    let src = open(d.path().join("src"));
+    write_some(&src, 0, 40);
+    let dst = open_with(d.path().join("dst"), small());
+    dst.adopt_id(src.id()).unwrap();
+    let chunk = src.replication_chunk(0, 1000, usize::MAX).unwrap().unwrap();
+    dst.apply_chunk(&chunk).unwrap();
+    assert!(dst.stats().batches > 1, "the segment limit split the chunk");
+    let segs = segments(&d.path().join("dst"));
+    assert!(segs.len() > 3);
+    for s in &segs[..segs.len() - 1] {
+        assert!(
+            file_len(s) < 300 + 400,
+            "{s:?} overshoots by at most one transaction"
+        );
+    }
+    assert_eq!(snapshot(&dst), snapshot(&src));
+}

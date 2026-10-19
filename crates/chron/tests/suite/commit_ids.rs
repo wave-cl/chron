@@ -440,8 +440,10 @@ fn rebuild_restore_and_applied_increments_keep_the_ids() {
     assert_eq!(r.head(), c2.next);
 }
 
+/// A synced transaction the index does not know is replayed on open,
+/// its id included: a resend after the replay is a duplicate.
 #[test]
-fn a_write_without_commit_leaves_no_id_behind() {
+fn a_replayed_transaction_keeps_its_id() {
     let d = tmp();
     let db = open_with(d.path(), opts().fsync(Fsync::Always));
     fill(&db, agg(1), 2);
@@ -451,10 +453,12 @@ fn a_write_without_commit_leaves_no_id_behind() {
     db.debug_write_without_commit(t).unwrap();
     drop(db);
     let db = open_with(d.path(), opts().fsync(Fsync::Always));
-    assert_eq!(db.lookup_commit(id(9)).unwrap(), None);
+    assert_eq!(db.head(), 3);
+    assert_eq!(db.lookup_commit(id(9)).unwrap(), Some((2, 3)));
     let c = one(&db, id(9), agg(1), Expected::Exact(2), "real").unwrap();
-    assert!(!c.duplicate);
-    assert_eq!(c.first, 2);
+    assert!(c.duplicate);
+    assert_eq!((c.first, c.next), (2, 3));
+    assert_eq!(db.head(), 3);
 }
 
 #[test]

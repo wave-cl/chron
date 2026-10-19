@@ -63,3 +63,26 @@ fn text_logs_are_not_json_and_a_bad_format_is_usage() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn group_commit_and_checkpoint_flags_take_at_least_one() {
+    for flag in [
+        "--group-commit-max-txns",
+        "--group-commit-max-bytes",
+        "--index-checkpoint-batches",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_chrond"))
+            .arg("--data-dir")
+            .arg(dir.path().join("data"))
+            .args(["--listen", "127.0.0.1:0", flag, "0"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{flag}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("1..") || err.contains("not in"),
+            "{flag}: {err}"
+        );
+    }
+}

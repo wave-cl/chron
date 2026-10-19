@@ -8,6 +8,18 @@ crates share one version.
 
 ### chron-db
 
+- One fsync per batch: the index commit is made durable every
+  `Options::index_checkpoint_batches` (256) or
+  `index_checkpoint_interval` (1 s), on close and on every maintenance
+  write, instead of with every batch; on open, complete transactions the
+  segments hold past the durable index are replayed into it (across
+  segment rolls; a torn trailing transaction is cut), and `truncate_to`
+  records its intent before cutting so a crash in between is finished
+  on open. A transaction that was written and synced but whose commit
+  result never reached its committer is now kept rather than cut.
+  Replication chunks and applied backups land as one batch (one segment
+  sync, one index commit) instead of one per transaction. `Stats` gains
+  `index_checkpoints` and `fsync_buckets`; `FSYNC_BUCKET_BOUNDS`.
 - Idempotent commits: `Transaction::commit_id([u8; 16])` stores the id
   in the transaction's first record (`FLAG_COMMIT_ID`, 16 bytes after
   `recorded_at`; `Event::commit_id`) and in a new index table `txn_id`.
@@ -29,6 +41,10 @@ crates share one version.
 
 ### chrond
 
+- `--group-commit-max-txns`, `--group-commit-max-bytes`,
+  `--index-checkpoint-batches` (env `CHROND_…`); the `chron_fsync_seconds`
+  histogram and `chron_index_checkpoints_total`; commit and sync-wait
+  histograms bucketed from 100 µs.
 - Commit ids over gRPC and the gateway (`commit_id` in the transaction
   JSON, `duplicate` in the answer, `commit_id` on events); a reused id
   with another shape is INVALID_ARGUMENT / 400;
@@ -51,6 +67,14 @@ crates share one version.
 
 ### tools
 
+- `chron-load --in-flight N` keeps N commits per writer in flight on
+  distinct aggregates; the report carries `wall_s`,
+  `transactions_per_s`, `events_per_s`, `writers`, `in_flight` and the
+  leader's `fsync`; its tests take `CHRON_LOAD_FSYNC=1` and
+  `CHRON_LOAD_IN_FLIGHT=N`. `scripts/e2e-load.sh` runs release daemons
+  under it and prints throughput, p50, p99 and fsyncs per transaction;
+  CI's new `bench` job runs the criterion benches and that load and
+  writes the numbers to the run's summary.
 - `chron-load` counts `duplicates`.
 
 ## 0.4.0 - 2026-10-19

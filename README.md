@@ -97,22 +97,34 @@ Tags are stored sorted and deduplicated.
   aggregate has exactly `n` events; the same aggregate may appear twice in a
   transaction and the second expectation is checked after the first append.
 - **Durability.** Under `Fsync::Always` (the default) a committed
-  transaction survives power loss. Under `Fsync::Never` it survives a
-  process crash; `flush()` (also run on drop) makes it durable, and every
-  maintenance write (retention, epoch, identity) syncs what it depends on.
+  transaction survives power loss: its segment bytes are fdatasync'd
+  before it is acknowledged, one sync per batch. The index commit is
+  made durable every `Options::index_checkpoint_batches` batches (256)
+  or `index_checkpoint_interval` (1 s), on close, and by every
+  maintenance write (retention, truncation, epoch, identity), so a batch
+  costs one fsync rather than two; `index_checkpoint_batches(1)` is the
+  0.4 rule. Under `Fsync::Never` a committed transaction survives a
+  process crash; `flush()` (also run on drop) makes it durable.
 - **Recovery.** Event bytes go to append-only segment files and the indexes
-  to one redb file; the redb commit is the commit point. On open, anything
-  in the segments past the committed head was never acknowledged and is
-  truncated; a failed commit truncates its own bytes at once. Damage inside
-  committed data is `Error::Corrupt`; index and data disagreeing is
-  `Error::Inconsistent`; neither is repaired silently.
+  to one redb file; the segment is the source of truth once synced, the
+  redb commit the commit point in memory. On open, complete transactions
+  the segments hold past the durable index are replayed into it (the
+  index may lag the data, never lead it) and a torn trailing transaction
+  is cut; a failed commit truncates its own bytes at once. A transaction
+  that was written and synced but whose result its committer never
+  received is therefore kept (a resend with its commit id is a
+  duplicate). Damage inside committed data is `Error::Corrupt`; index and
+  data disagreeing is `Error::Inconsistent`; neither is repaired
+  silently.
 - **One writer, many readers.** `Db` is cheap to clone and shared between
   threads; commits serialise on one lock, reads never take it. A `LOCK`
   file refuses a second process. Transactions committed concurrently are
   landed together (one segment write, one fsync, one index commit for up
   to `Options::group_commit_max_txns` of them), each still checked and
-  acknowledged on its own; `Db::stats()` counts batches, transactions,
-  events and fsyncs.
+  acknowledged on its own; a replication chunk or an applied backup
+  lands the same way, as one batch. `Db::stats()` counts batches,
+  transactions, events, fsyncs (with a histogram of their durations)
+  and index checkpoints.
 - **Live subscriptions.** `subscribe(from)` and `subscribe_tag(tag, from)`
   return a `Subscription`: an iterator that catches up through the index
   and then blocks for new commits. `next_timeout` serves threads that also
@@ -262,6 +274,7 @@ that behind a small `Store` trait.
 ```
 cargo run -p chrond -- --data-dir ./orders.chron            # 127.0.0.1:4242
 chrond --data-dir DIR --listen 0.0.0.0:4242 [--no-fsync] [--verify-all-segments]
+       [--group-commit-max-txns N] [--group-commit-max-bytes N] [--index-checkpoint-batches N]
        [--tls-cert server.pem --tls-key server.key [--tls-client-ca ca.pem]]
        [--token SECRET | --token-file FILE] [--admin-token SECRET | --admin-token-file FILE]
        [--backup-dir DIR]
@@ -461,7 +474,10 @@ updated as things happen (`chron_rpc_calls_total{db,method,code}`,
 `chron_leader_known`, `chron_voted_epoch`, `chron_peers`), as are the library's commit counters
 (`chron_events_committed_total`, `chron_transactions_committed_total`,
 `chron_commit_batches_total`, `chron_fsyncs_total`,
-`chron_fsync_seconds_total`). `chron status [--max-lag N]` is the
+`chron_fsync_seconds_total`, the histogram `chron_fsync_seconds`, and
+`chron_index_checkpoints_total`, each checkpoint being one fsync of
+the index file; commit and sync-wait histograms are bucketed from
+100 µs). `chron status [--max-lag N]` is the
 one-screen check with an exit code. [docs/operations.md](docs/operations.md)
 holds the runbooks: promotion and failover, a failover group, restoring
 a replica, retention, rotating tokens, upgrading, and reading the
@@ -710,7 +726,8 @@ cargo clippy -p chron-db --all-targets -- -D warnings                 # the libr
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --workspace --all-features --no-fail-fast
 cargo doc --workspace --no-deps                                       # warning-free; the library denies missing docs
-cargo bench -p chron-db   # criterion: append in both fsync modes, the three reads
+cargo bench -p chron-db   # criterion: append in both fsync modes, 8 and 32 concurrent writers (fsyncs per transaction on stderr), the three reads
+scripts/e2e-load.sh [--nodes 3] [--writers N] [--in-flight N] [--secs N]   # release daemons under chron-load: txn/s, p50, p99, fsyncs per transaction
 cargo run -p bank -- open alice   # the example: deposit <id> 50, withdraw, balances [--follow], history <id>; --addr for a daemon
 ```
 
@@ -719,11 +736,19 @@ http://127.0.0.1:4243 --duration 600 --backup-dir ./backups --backup-every
 60 --retain-every 300` loads a leader and a replica while checking
 invariants (dense positions, payloads matching their records, aggregate
 lengths, restored backups, retention floors, replica equality at the
-end); it exits 1 on any violation and prints counts and commit latency
-percentiles (`--json` for a machine-readable report).
+end); it exits 1 on any violation and prints counts, throughput
+(transactions and events per second), commit latency percentiles and
+the leader's fsync mode (`--json` for a machine-readable report).
+`--in-flight N` keeps N commits per writer in flight on distinct
+aggregates, which is what fills group-commit batches; the tests take
+`CHRON_LOAD_FSYNC=1` and `CHRON_LOAD_IN_FLIGHT=N`.
 
 CI runs the first four on every push and pull request, then
-`cargo package --workspace --locked` so the crates are known to package.
+`cargo package --workspace --locked` so the crates are known to package;
+a separate `bench` job runs the criterion benches in quick mode and a
+15 s fsync-on load against one release daemon and writes throughput,
+p50, p99 and fsyncs per transaction to the run's summary (it fails only
+on its own build, a violation, or group commit not batching).
 The suite includes property tests against a model of the semantics, a
 crash test that kills a child process mid-commit and reopens,
 injected-failure tests for a commit that fails after writing, TLS and

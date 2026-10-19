@@ -21,6 +21,16 @@ struct Cli {
     /// Read every segment on open, checking crcs and the index.
     #[arg(long)]
     verify_all_segments: bool,
+    /// Transactions one group-commit batch may land (default 64).
+    #[arg(long, env = "CHROND_GROUP_COMMIT_MAX_TXNS", value_parser = clap::value_parser!(u64).range(1..))]
+    group_commit_max_txns: Option<u64>,
+    /// Bytes at which a batch stops growing (default 4 MiB).
+    #[arg(long, env = "CHROND_GROUP_COMMIT_MAX_BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+    group_commit_max_bytes: Option<u64>,
+    /// Batches between durable index commits (default 256); 1 makes every
+    /// batch's index commit durable, two fsyncs per batch as before 0.5.
+    #[arg(long, env = "CHROND_INDEX_CHECKPOINT_BATCHES", value_parser = clap::value_parser!(u64).range(1..))]
+    index_checkpoint_batches: Option<u64>,
     /// Follow the leader at this address as a read-only replica.
     #[arg(long, env = "CHRON_REPLICATE_FROM")]
     replicate_from: Option<String>,
@@ -232,6 +242,9 @@ async fn main() -> anyhow::Result<()> {
         .sync_timeout
         .map(|s| std::time::Duration::from_secs_f64(s.max(0.0)));
     opts.max_message_bytes = cli.max_message_bytes;
+    opts.group_commit_max_txns = cli.group_commit_max_txns.map(|n| n as usize);
+    opts.group_commit_max_bytes = cli.group_commit_max_bytes.map(|n| n as usize);
+    opts.index_checkpoint_batches = cli.index_checkpoint_batches.map(|n| n as usize);
     opts.request_timeout = cli.request_timeout.map(std::time::Duration::from_secs);
     opts.concurrency_per_connection = cli.concurrency_per_connection;
     let running = chrond::start(opts).await?;

@@ -163,3 +163,87 @@ fn a_cut_at_a_floor_above_zero_and_a_subscription_across_a_cut() {
     );
     assert_eq!((db.head(), db.floor()), (floor + 2, floor));
 }
+
+/// The index put back from a copy taken right after a truncation (a
+/// durable commit): the commits since are replayed at the reused
+/// positions.
+#[test]
+fn reopen_after_truncate_with_a_lagging_index() {
+    let d = tmp();
+    let db = open(d.path());
+    for i in 0..6 {
+        let mut t = db.transaction();
+        t.append_one(agg(1), Expected::Any, tagged(&format!("old{i}"), &["t"]));
+        t.commit().unwrap();
+    }
+    db.truncate_to(3).unwrap();
+    let stale = snapshot_index(d.path());
+    for i in 0..4 {
+        let mut t = db.transaction();
+        t.append_one(agg(1), Expected::Exact(3 + i), ev(&format!("new{i}")));
+        t.commit().unwrap();
+    }
+    let before = db.read_all(0, 0).unwrap();
+    drop(db);
+    restore_index(d.path(), &stale);
+    let db = open_with(d.path(), opts().verify_all_segments(true));
+    assert_eq!(db.head(), 7);
+    assert_eq!(db.read_all(0, 0).unwrap(), before);
+    assert_eq!(
+        payloads(&db.read_all(3, 0).unwrap()),
+        ["new0", "new1", "new2", "new3"]
+    );
+    assert_eq!(positions(&db.read_tag("t", 0, 0).unwrap()), [0, 1, 2]);
+    assert_eq!(db.aggregate_len(agg(1)).unwrap(), 7);
+}
+
+/// A crash between the truncation's index commit and its file work: the
+/// marker makes the next open finish the cut instead of replaying the
+/// cut records as committed.
+#[test]
+fn a_crash_after_the_truncate_marker_is_finished_on_open() {
+    for at_base in [false, true] {
+        let d = tmp();
+        let db = open_with(d.path(), opts().segment_max_bytes(300));
+        for i in 0..30 {
+            let mut t = db.transaction();
+            t.append_one(agg(1), Expected::Any, tagged(&format!("e{i}"), &["t"]));
+            t.commit().unwrap();
+        }
+        let segs = segments(d.path()).len();
+        assert!(segs > 3);
+        let to = if at_base {
+            // The base of the second segment: the cut leaves it empty.
+            segments(d.path())[1]
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        } else {
+            10
+        };
+        let r = db.debug_truncate_marker_only(to).unwrap();
+        assert_eq!((r.head, r.removed), (to, 30 - to));
+        drop(db);
+        assert_eq!(segments(d.path()).len(), segs, "the files are untouched");
+        let db = open_with(d.path(), opts().verify_all_segments(true));
+        assert_eq!(db.head(), to, "at_base {at_base}");
+        assert_eq!(db.aggregate_len(agg(1)).unwrap(), to);
+        assert_eq!(db.read_all(0, 0).unwrap().len() as u64, to);
+        assert_eq!(positions(&db.read_tag("t", 0, 0).unwrap()).len() as u64, to);
+        assert!(db.read_all(to, 0).unwrap().is_empty());
+        assert!(segments(d.path()).len() < segs, "later segments are gone");
+        let c = {
+            let mut t = db.transaction();
+            t.append_one(agg(1), Expected::Exact(to), ev("after"));
+            t.commit().unwrap()
+        };
+        assert_eq!(c.first, to);
+        drop(db);
+        let db = open_with(d.path(), opts().verify_all_segments(true));
+        assert_eq!(db.head(), to + 1, "a second open finds nothing pending");
+        assert_eq!(payloads(&db.read_all(to, 0).unwrap()), ["after"]);
+    }
+}

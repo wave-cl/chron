@@ -59,47 +59,60 @@ fn reads(c: &mut Criterion) {
     g.finish();
 }
 
-/// Eight threads committing one-event transactions to their own
-/// aggregates: what group commit is for. Wall time per transaction.
+/// Eight and thirty-two threads committing one-event transactions to
+/// their own aggregates: what group commit is for. Wall time per
+/// transaction, and on stderr the fsyncs per transaction (segment syncs
+/// plus index checkpoints).
 fn append_concurrent(c: &mut Criterion) {
-    const THREADS: u64 = 8;
     let mut g = c.benchmark_group("append-concurrent");
-    for (fsync, name) in [(Fsync::Never, "never"), (Fsync::Always, "always")] {
-        let (_dir, db) = db(fsync);
-        g.throughput(Throughput::Elements(1));
-        g.bench_with_input(BenchmarkId::new("8-threads", name), &db, |b, db| {
-            b.iter_custom(|iters| {
-                let per = iters.div_ceil(THREADS);
-                let start = std::time::Instant::now();
-                std::thread::scope(|s| {
-                    for t in 0..THREADS {
-                        let db = db.clone();
-                        s.spawn(move || {
-                            let agg = Uuid::from_u128(100 + u128::from(t));
-                            for i in 0..per {
-                                let mut txn = db.transaction();
-                                txn.append_one(agg, Expected::Any, event(i));
-                                txn.commit().unwrap();
+    for threads in [8u64, 32] {
+        for (fsync, name) in [(Fsync::Never, "never"), (Fsync::Always, "always")] {
+            let (_dir, db) = db(fsync);
+            g.throughput(Throughput::Elements(1));
+            g.bench_with_input(
+                BenchmarkId::new(format!("{threads}-threads"), name),
+                &db,
+                |b, db| {
+                    b.iter_custom(|iters| {
+                        let per = iters.div_ceil(threads);
+                        let start = std::time::Instant::now();
+                        std::thread::scope(|s| {
+                            for t in 0..threads {
+                                let db = db.clone();
+                                s.spawn(move || {
+                                    let agg = Uuid::from_u128(100 + u128::from(t));
+                                    for i in 0..per {
+                                        let mut txn = db.transaction();
+                                        txn.append_one(agg, Expected::Any, event(i));
+                                        txn.commit().unwrap();
+                                    }
+                                });
                             }
                         });
-                    }
-                });
-                start.elapsed()
-            })
-        });
-        let st = db.stats();
-        eprintln!(
-            "append-concurrent/{name}: batches {} transactions {} events {} fsyncs {} mean fsync {:.1} us",
-            st.batches,
-            st.transactions,
-            st.events,
-            st.fsyncs,
-            if st.fsyncs > 0 {
-                st.fsync_nanos as f64 / st.fsyncs as f64 / 1000.0
-            } else {
-                0.0
-            }
-        );
+                        start.elapsed()
+                    })
+                },
+            );
+            let st = db.stats();
+            eprintln!(
+                "append-concurrent/{threads}-threads/{name}: batches {} transactions {} events {} fsyncs {} checkpoints {} fsyncs/txn {:.3} mean fsync {:.1} us",
+                st.batches,
+                st.transactions,
+                st.events,
+                st.fsyncs,
+                st.index_checkpoints,
+                if st.transactions > 0 {
+                    (st.fsyncs + st.index_checkpoints) as f64 / st.transactions as f64
+                } else {
+                    0.0
+                },
+                if st.fsyncs > 0 {
+                    st.fsync_nanos as f64 / st.fsyncs as f64 / 1000.0
+                } else {
+                    0.0
+                }
+            );
+        }
     }
     g.finish();
 }

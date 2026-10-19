@@ -174,7 +174,7 @@ pub async fn wait_majority(node: &Node, dbn: &DbNode, next: u64, timeout: Durati
 /// DEADLINE_EXCEEDED carrying where the transaction landed locally.
 pub fn unconfirmed(c: &Committed, why: &str) -> Status {
     let mut s = Status::deadline_exceeded(format!(
-        "committed locally at {}..{} but {why}; it stays on this node's disk and replicates unless the node dies; do not resend it blindly: check with an exact expectation or a read",
+        "committed locally at {}..{} but {why}; it stays on this node's disk and replicates unless the node dies; resend it with the same commit id, or check with an exact expectation or a read before resending without one",
         c.first, c.last
     ));
     for (key, v) in [

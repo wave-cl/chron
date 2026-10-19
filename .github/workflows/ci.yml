@@ -55,3 +55,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: CHRON_PROTO_REGEN=1 cargo build -p chron-proto
       - run: git diff --exit-code -- crates/chron-proto/src/generated
+
+  # Numbers, not a gate: the library benches in quick mode and a short
+  # fsync-on load against one release daemon, summarised on the run. It
+  # fails only when its own build fails, when the load ran without fsync
+  # or found a violation, or when the leader paid half an fsync or more
+  # per transaction (group commit not batching).
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+      - run: cargo bench -p chron-db --bench chron -- --quick --noplot 2>&1 | tee bench.txt
+      - run: scripts/e2e-load.sh --nodes 1 --writers 8 --in-flight 4 --secs 15 --json-out load.json --metrics-out metrics.txt | tee load.txt
+      - run: scripts/bench-summary.sh load.json metrics.txt bench.txt | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench
+          path: |
+            bench.txt
+            load.txt
+            load.json
+            metrics.txt
+            target/criterion

@@ -14,9 +14,16 @@ use prometheus::{
 
 use crate::node::{Node, Role};
 
-/// Seconds, from a millisecond to half a minute.
+/// Seconds, from a millisecond to half a minute: the gRPC call buckets.
 pub const BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Seconds, from 100 µs to half a minute: commits and sync waits, which
+/// take well under a millisecond without fsync.
+pub const COMMIT_BUCKETS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+    5.0, 10.0, 30.0,
 ];
 
 /// Every `chron.v1.Chron` method and whether it streams.
@@ -148,8 +155,12 @@ fn gauge(name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
 }
 
 fn histogram(name: &str, help: &str, labels: &[&str]) -> HistogramVec {
+    histogram_with(name, help, labels, BUCKETS)
+}
+
+fn histogram_with(name: &str, help: &str, labels: &[&str], buckets: &[f64]) -> HistogramVec {
     HistogramVec::new(
-        HistogramOpts::new(name, help).buckets(BUCKETS.to_vec()),
+        HistogramOpts::new(name, help).buckets(buckets.to_vec()),
         labels,
     )
     .expect("valid metric")
@@ -178,15 +189,17 @@ impl Metrics {
             "Commit calls by result: ok, conflict, refused, unconfirmed, invalid, too_large, error",
             &["db", "result"],
         );
-        let commit_duration = histogram(
+        let commit_duration = histogram_with(
             "chron_commit_duration_seconds",
             "Commit duration including the write gate, the fsync and, for sync commits, the wait for a majority",
             &["db"],
+            COMMIT_BUCKETS,
         );
-        let sync_wait = histogram(
+        let sync_wait = histogram_with(
             "chron_sync_commit_wait_seconds",
             "time from the local commit to a majority's confirmation, for sync commits that were confirmed",
             &["db"],
+            COMMIT_BUCKETS,
         );
         let sync_timeouts = counter(
             "chron_sync_commit_timeouts_total",
@@ -349,6 +362,10 @@ struct NodeCollector {
     batches: IntCounterVec,
     fsyncs: IntCounterVec,
     fsync_seconds: prometheus::CounterVec,
+    index_checkpoints: IntCounterVec,
+    /// `chron_fsync_seconds`: built by hand from the library's bucket
+    /// counts on each scrape.
+    fsync_histogram: Desc,
     last_stats: Mutex<HashMap<String, chron::Stats>>,
 }
 
@@ -453,8 +470,56 @@ impl NodeCollector {
                 &["db"],
             )
             .expect("valid metric"),
+            index_checkpoints: counter(
+                "chron_index_checkpoints_total",
+                "durable index commits: the commit path's checkpoints and every maintenance write; each is one fsync of index.redb (the index's own syncs are not observable otherwise)",
+                &["db"],
+            ),
+            fsync_histogram: Desc::new(
+                "chron_fsync_seconds".to_string(),
+                "segment sync duration on the commit path".to_string(),
+                vec!["db".to_string()],
+                HashMap::new(),
+            )
+            .expect("valid metric"),
             last_stats: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// `chron_fsync_seconds{db}` for every database, from the library's
+    /// cumulative counters.
+    fn fsync_families(&self, node: &Node) -> MetricFamily {
+        use prometheus::proto::{Bucket, Histogram, LabelPair, Metric, MetricType};
+        let mut family = MetricFamily::default();
+        family.set_name(self.fsync_histogram.fq_name.clone());
+        family.set_help(self.fsync_histogram.help.clone());
+        family.set_field_type(MetricType::HISTOGRAM);
+        let mut metrics = Vec::new();
+        for dbn in node.databases() {
+            let st = dbn.db.stats();
+            let mut h = Histogram::default();
+            h.set_sample_count(st.fsyncs);
+            h.set_sample_sum(st.fsync_nanos as f64 / 1e9);
+            let mut cumulative = 0u64;
+            let mut buckets = Vec::new();
+            for (i, bound) in chron::FSYNC_BUCKET_BOUNDS.iter().enumerate() {
+                cumulative += st.fsync_buckets[i];
+                let mut b = Bucket::default();
+                b.set_cumulative_count(cumulative);
+                b.set_upper_bound(*bound);
+                buckets.push(b);
+            }
+            h.set_bucket(buckets);
+            let mut label = LabelPair::default();
+            label.set_name("db".to_string());
+            label.set_value(dbn.name.clone());
+            let mut m = Metric::default();
+            m.set_label(vec![label]);
+            m.set_histogram(h);
+            metrics.push(m);
+        }
+        family.set_metric(metrics);
+        family
     }
 
     fn collectors(&self) -> Vec<&dyn Collector> {
@@ -483,6 +548,7 @@ impl NodeCollector {
             &self.batches,
             &self.fsyncs,
             &self.fsync_seconds,
+            &self.index_checkpoints,
         ]
     }
 
@@ -596,24 +662,35 @@ impl NodeCollector {
             self.fsync_seconds
                 .with_label_values(&[db])
                 .inc_by(now.fsync_nanos.saturating_sub(prev.fsync_nanos) as f64 / 1e9);
+            self.index_checkpoints
+                .with_label_values(&[db])
+                .inc_by(now.index_checkpoints.saturating_sub(prev.index_checkpoints));
         }
     }
 }
 
 impl Collector for NodeCollector {
     fn desc(&self) -> Vec<&Desc> {
-        self.collectors()
+        let mut out: Vec<&Desc> = self
+            .collectors()
             .into_iter()
             .flat_map(|c| c.desc())
-            .collect()
+            .collect();
+        out.push(&self.fsync_histogram);
+        out
     }
 
     fn collect(&self) -> Vec<MetricFamily> {
         self.refresh();
-        self.collectors()
+        let mut out: Vec<MetricFamily> = self
+            .collectors()
             .into_iter()
             .flat_map(|c| c.collect())
-            .collect()
+            .collect();
+        if let Some(node) = self.node.upgrade() {
+            out.push(self.fsync_families(&node));
+        }
+        out
     }
 }
 

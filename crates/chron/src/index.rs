@@ -35,6 +35,9 @@ pub(crate) const DB_ID_KEY: &str = "db_id";
 pub(crate) const EPOCH_KEY: &str = "epoch";
 
 pub(crate) const HEAD_KEY: &str = "head";
+/// `"truncate_to"` → a truncation whose index change is committed but
+/// whose files may not be cut yet; the next open finishes it.
+pub(crate) const TRUNCATE_INTENT_KEY: &str = "truncate_to";
 /// `"floor"` → base of the first kept segment; absent means 0.
 pub(crate) const FLOOR_KEY: &str = "floor";
 
@@ -159,9 +162,27 @@ impl Index {
 
     /// A write transaction that reaches the disk before `commit` returns.
     pub(crate) fn begin_write_durable(&self) -> Result<WriteTransaction> {
+        self.begin_write_with(Durability::Immediate)
+    }
+
+    /// A write transaction at the given durability. A `None` commit is
+    /// visible to readers at once and reaches the disk with the next
+    /// `Immediate` commit; a crash before that drops it, the index file
+    /// staying at the last durable commit.
+    pub(crate) fn begin_write_with(&self, durability: Durability) -> Result<WriteTransaction> {
         let mut txn = self.db.begin_write()?;
-        txn.set_durability(Durability::Immediate)?;
+        txn.set_durability(durability)?;
         Ok(txn)
+    }
+
+    /// The position a truncation was cutting to when it was interrupted
+    /// between its index commit and its file work, if any.
+    pub(crate) fn truncate_intent(&self) -> Result<Option<u64>> {
+        let txn = self.begin_read()?;
+        Ok(txn
+            .open_table(META)?
+            .get(TRUNCATE_INTENT_KEY)?
+            .map(|v| v.value()))
     }
 
     pub(crate) fn head(&self) -> Result<u64> {

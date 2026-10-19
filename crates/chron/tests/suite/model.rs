@@ -37,6 +37,10 @@ enum Op {
     /// expectations it carried then. A no-op when op `k` lies ahead or
     /// is not a transaction.
     Resend(u8),
+    /// A crash: the index file as it is on disk while open (at its last
+    /// durable commit) is put back after the close, the segments hold
+    /// everything, open replays.
+    Crash,
 }
 
 fn arb_append() -> impl Strategy<Value = Append> {
@@ -59,6 +63,7 @@ fn arb_ops() -> impl Strategy<Value = Vec<Op>> {
     let op = prop_oneof![
         10 => prop::collection::vec(arb_append(), 1..=3).prop_map(Op::Txn),
         1 => Just(Op::Reopen),
+        1 => Just(Op::Crash),
         1 => (0..=100u8).prop_map(Op::Retain),
         2 => (0..40u8).prop_map(Op::Resend),
     ];
@@ -363,6 +368,12 @@ proptest! {
                 }
                 Op::Reopen => {
                     drop(db.take());
+                    db = Some(Db::open(d.path(), o.clone()).unwrap());
+                }
+                Op::Crash => {
+                    let image = snapshot_index(d.path());
+                    drop(db.take());
+                    restore_index(d.path(), &image);
                     db = Some(Db::open(d.path(), o.clone()).unwrap());
                 }
                 Op::Retain(pct) => {

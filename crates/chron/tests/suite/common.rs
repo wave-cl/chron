@@ -90,3 +90,14 @@ pub fn fill(db: &Db, id: Uuid, n: usize) {
         t.commit().unwrap();
     }
 }
+
+/// A copy of the index file, to be put back later: the cheapest way to
+/// make the index lag the data as a crash before a checkpoint would.
+pub fn snapshot_index(dir: &Path) -> Vec<u8> {
+    fs::read(dir.join("index.redb")).unwrap()
+}
+
+/// Puts a `snapshot_index` back. The database must be closed.
+pub fn restore_index(dir: &Path, bytes: &[u8]) {
+    fs::write(dir.join("index.redb"), bytes).unwrap();
+}

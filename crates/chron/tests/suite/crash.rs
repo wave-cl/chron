@@ -11,6 +11,21 @@ use chron::{Db, Expected, Fsync, Options};
 use crate::common::*;
 
 const CHILD_DIR: &str = "CHRON_CRASH_CHILD_DIR";
+/// Batches between durable index commits in the child; `max` holds
+/// every checkpoint back, so the whole run is replayed on open.
+const CHILD_CHECKPOINT: &str = "CHRON_CRASH_CHECKPOINT_EVERY";
+
+fn child_options() -> Options {
+    let every = match std::env::var(CHILD_CHECKPOINT).as_deref() {
+        Ok("max") => usize::MAX,
+        Ok(n) => n.parse().unwrap(),
+        Err(_) => 256,
+    };
+    Options::new()
+        .fsync(Fsync::Always)
+        .index_checkpoint_batches(every)
+        .index_checkpoint_interval(Duration::from_secs(3600))
+}
 
 /// The child. Only the re-executed test binary has the variable set; in a
 /// normal run this returns at once.
@@ -19,7 +34,7 @@ fn child_writer() {
     let Ok(dir) = std::env::var(CHILD_DIR) else {
         return;
     };
-    let db = Db::open(&dir, Options::new().fsync(Fsync::Always)).unwrap();
+    let db = Db::open(&dir, child_options()).unwrap();
     let mut out = std::io::stdout().lock();
     loop {
         let mut t = db.transaction();
@@ -43,6 +58,14 @@ impl Drop for KillOnDrop {
 
 #[test]
 fn kill_dash_nine_keeps_every_acknowledged_commit() {
+    for every in ["1", "3", "max"] {
+        kill_dash_nine_rounds(every);
+    }
+}
+
+/// `every`: the child's checkpoint setting; with `max` nothing but the
+/// replay on open can keep the acknowledged commits.
+fn kill_dash_nine_rounds(every: &str) {
     let d = tmp();
     let exe = std::env::current_exe().unwrap();
     for round in 0..4 {
@@ -53,6 +76,7 @@ fn kill_dash_nine_keeps_every_acknowledged_commit() {
         let child = Command::new(&exe)
             .args(["--exact", "crash::child_writer", "--nocapture"])
             .env(CHILD_DIR, d.path())
+            .env(CHILD_CHECKPOINT, every)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -82,11 +106,11 @@ fn kill_dash_nine_keeps_every_acknowledged_commit() {
                 .fsync(Fsync::Always)
                 .verify_all_segments(true),
         )
-        .unwrap_or_else(|e| panic!("round {round} seed {seed}: reopen failed: {e}"));
+        .unwrap_or_else(|e| panic!("every {every} round {round} seed {seed}: reopen failed: {e}"));
         let head = db.head();
         assert!(
             head > acked,
-            "round {round} seed {seed}: head {head} lost acknowledged {acked}"
+            "every {every} round {round} seed {seed}: head {head} lost acknowledged {acked}"
         );
         assert_eq!(
             head % 2,

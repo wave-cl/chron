@@ -16,6 +16,17 @@ pub enum Fsync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Options {
+    /// Under [`Fsync::Always`] a batch syncs its segment bytes before it
+    /// is acknowledged; the index commit reaches the disk every this
+    /// many batches (`1`: every batch, two fsyncs per batch as before
+    /// 0.5.0), or after [`index_checkpoint_interval`](Self::
+    /// index_checkpoint_interval), on close, and on every maintenance
+    /// write. On open, complete transactions the segments hold past the
+    /// durable index are replayed into it.
+    pub index_checkpoint_batches: usize,
+    /// The longest a batch's index commit stays non-durable under
+    /// [`Fsync::Always`].
+    pub index_checkpoint_interval: std::time::Duration,
     /// A new segment file starts after the commit that makes the current
     /// one reach this size. A transaction is never split across segments, so
     /// a segment may exceed this by up to one transaction.
@@ -58,6 +69,8 @@ impl Default for Options {
             group_commit_max_bytes: 4 * 1024 * 1024,
             page_max_bytes: 4 * 1024 * 1024,
             max_open_segments: 64,
+            index_checkpoint_batches: 256,
+            index_checkpoint_interval: std::time::Duration::from_secs(1),
         }
     }
 }
@@ -115,6 +128,19 @@ impl Options {
     /// How many segment files stay open for reading (at least 1).
     pub fn max_open_segments(mut self, n: usize) -> Self {
         self.max_open_segments = n.max(1);
+        self
+    }
+
+    /// Batches between durable index commits under [`Fsync::Always`]
+    /// (at least 1; `1` makes every batch's index commit durable).
+    pub fn index_checkpoint_batches(mut self, n: usize) -> Self {
+        self.index_checkpoint_batches = n.max(1);
+        self
+    }
+
+    /// The longest a batch's index commit stays non-durable.
+    pub fn index_checkpoint_interval(mut self, d: std::time::Duration) -> Self {
+        self.index_checkpoint_interval = d;
         self
     }
 }

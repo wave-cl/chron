@@ -61,6 +61,11 @@ pub struct Config {
     /// Wait for a majority (`Some(true)`), do not (`Some(false)`), or
     /// take the daemon's default (`None`).
     pub sync: Option<bool>,
+    /// Commits each writer keeps in flight at once, on distinct
+    /// aggregates (at least 1, at most `aggregates`). `writers *
+    /// in_flight` should stay under the daemon's concurrency per
+    /// connection (256 by default).
+    pub in_flight: usize,
 }
 
 impl Config {
@@ -108,6 +113,14 @@ pub struct Report {
     /// Commits the leader answered with an earlier landing because the
     /// client resent them under their commit id.
     pub duplicates: u64,
+    /// Seconds the writers ran.
+    pub wall_s: f64,
+    pub transactions_per_s: f64,
+    pub events_per_s: f64,
+    pub writers: usize,
+    pub in_flight: usize,
+    /// Whether the leader syncs on commit (from its `Info`).
+    pub fsync: Option<bool>,
     /// Every invariant that failed, with where and what.
     pub violations: Vec<String>,
 }
@@ -127,6 +140,9 @@ impl Report {
             "replica_head": self.replica_head, "kills": self.kills, "lost_acks": self.lost_acks,
             "failover_errors": self.failover_errors, "unconfirmed": self.unconfirmed,
             "duplicates": self.duplicates,
+            "wall_s": self.wall_s, "transactions_per_s": self.transactions_per_s,
+            "events_per_s": self.events_per_s, "writers": self.writers,
+            "in_flight": self.in_flight, "fsync": self.fsync,
             "violations": self.violations, "ok": self.ok(),
         })
     }
@@ -330,84 +346,156 @@ async fn connect(cfg: &Config, addr: &str) -> Result<Client, ClientError> {
     Client::connect(addr, client_config(cfg)).await
 }
 
+/// What one in-flight commit carries back to its writer.
+struct Flown {
+    agg: u64,
+    len: u64,
+    acked_at: Instant,
+    n: u64,
+    payloads: Vec<Vec<u8>>,
+    start: Instant,
+    result: Result<chron_client::Committed, ClientError>,
+}
+
+/// One writer: up to `in_flight` commits at a time, each on an aggregate
+/// no other of its commits is on, so every expectation stays exact.
 async fn writer(cfg: Config, client: Client, shared: Arc<Shared>, w: usize) {
     let mut rng = Rng::new(cfg.seed ^ ((w as u64 + 1) * 0x9E37));
     // Per aggregate: the length last seen and when it was last acknowledged.
     let mut lens: HashMap<u64, (u64, Instant)> = HashMap::new();
     let mut seq = 0u64;
-    while !shared.stop.load(Ordering::Relaxed) {
-        let agg = rng.below(cfg.aggregates);
-        let id = aggregate(agg);
-        let (len, acked_at) = match lens.get(&agg) {
-            Some(l) => *l,
-            None => match client.aggregate_len(id).await {
-                Ok(l) => (l, Instant::now()),
-                Err(e) => {
-                    shared.error("writer len", &e);
-                    after_error(&shared, &client, &e).await;
-                    continue;
+    let in_flight = cfg.in_flight.max(1).min(cfg.aggregates.max(1) as usize);
+    let mut busy: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut flying: tokio::task::JoinSet<Flown> = tokio::task::JoinSet::new();
+    loop {
+        while !shared.stop.load(Ordering::Relaxed) && flying.len() < in_flight {
+            let mut agg = rng.below(cfg.aggregates);
+            let mut tries = 0;
+            while busy.contains(&agg) && tries < 8 {
+                agg = rng.below(cfg.aggregates);
+                tries += 1;
+            }
+            if busy.contains(&agg) {
+                break;
+            }
+            let id = aggregate(agg);
+            let (len, acked_at) = match lens.get(&agg) {
+                Some(l) => *l,
+                None => match client.aggregate_len(id).await {
+                    Ok(l) => (l, Instant::now()),
+                    Err(e) => {
+                        shared.error("writer len", &e);
+                        after_error(&shared, &client, &e).await;
+                        continue;
+                    }
+                },
+            };
+            let payloads: Vec<Vec<u8>> = (0..cfg.events_per_txn)
+                .map(|j| payload(w, seq, agg, len + j as u64, cfg.payload_bytes))
+                .collect();
+            seq += 1;
+            let events: Vec<NewEvent> = payloads
+                .iter()
+                .map(|p| NewEvent::new(p.clone()).tag("load"))
+                .collect();
+            let n = events.len() as u64;
+            busy.insert(agg);
+            let client = client.clone();
+            flying.spawn(async move {
+                let start = Instant::now();
+                let result = client.append(id, Expected::Exact(len), events).await;
+                Flown {
+                    agg,
+                    len,
+                    acked_at,
+                    n,
+                    payloads,
+                    start,
+                    result,
                 }
-            },
+            });
+        }
+        let Some(flown) = flying.join_next().await else {
+            break;
         };
-        let payloads: Vec<Vec<u8>> = (0..cfg.events_per_txn)
-            .map(|j| payload(w, seq, agg, len + j as u64, cfg.payload_bytes))
-            .collect();
-        let events: Vec<NewEvent> = payloads
-            .iter()
-            .map(|p| NewEvent::new(p.clone()).tag("load"))
-            .collect();
-        let n = events.len() as u64;
-        let start = Instant::now();
-        match client.append(id, Expected::Exact(len), events).await {
-            Ok(c) => {
-                shared
-                    .latencies
-                    .lock()
-                    .await
-                    .push(start.elapsed().as_nanos() as u64);
-                if c.duplicate {
-                    // A resend answered with the first landing: real
-                    // positions, acknowledged like any other.
-                    shared.duplicates.fetch_add(1, Ordering::Relaxed);
-                }
-                shared.transactions.fetch_add(1, Ordering::Relaxed);
-                shared.events.fetch_add(n, Ordering::Relaxed);
-                if c.appends[0].first_index != len || c.appends[0].new_len != len + n {
-                    shared.violation(format!(
-                        "writer {w}: expected first index {len} and length {}, got {} and {}",
-                        len + n,
-                        c.appends[0].first_index,
-                        c.appends[0].new_len
-                    ));
-                }
-                for (j, p) in payloads.iter().enumerate() {
-                    shared.ack(c.first + j as u64, p);
-                }
-                lens.insert(agg, (len + n, Instant::now()));
-                seq += 1;
-            }
-            Err(ClientError::Unconfirmed { .. }) => {
-                // Landed on the leader, unconfirmed, and the client's
-                // resends ran out of time: not acknowledged, so not an
-                // ack to check; the length is read again.
-                shared.unconfirmed.fetch_add(1, Ordering::Relaxed);
-                lens.remove(&agg);
-            }
-            Err(ClientError::Conflict { actual, .. }) => {
-                shared.conflicts.fetch_add(1, Ordering::Relaxed);
-                // Shrinking is what a killed leader's lost writes look
-                // like; anything else is a violation.
-                if actual < len && !shared.killed_since(acked_at) {
-                    shared.violation(format!(
-                        "writer {w}: aggregate {agg} shrank from {len} to {actual}"
-                    ));
-                }
-                lens.insert(agg, (actual, Instant::now()));
-            }
+        let f = match flown {
+            Ok(f) => f,
             Err(e) => {
-                shared.error("writer commit", &e);
-                after_error(&shared, &client, &e).await;
+                shared.violation(format!("writer {w}: a commit task panicked: {e}"));
+                continue;
             }
+        };
+        busy.remove(&f.agg);
+        settle(&cfg, &client, &shared, w, &mut lens, f).await;
+    }
+}
+
+/// Accounts one commit's outcome.
+async fn settle(
+    _cfg: &Config,
+    client: &Client,
+    shared: &Arc<Shared>,
+    w: usize,
+    lens: &mut HashMap<u64, (u64, Instant)>,
+    f: Flown,
+) {
+    let Flown {
+        agg,
+        len,
+        acked_at,
+        n,
+        payloads,
+        start,
+        result,
+    } = f;
+    match result {
+        Ok(c) => {
+            shared
+                .latencies
+                .lock()
+                .await
+                .push(start.elapsed().as_nanos() as u64);
+            if c.duplicate {
+                // A resend answered with the first landing: real
+                // positions, acknowledged like any other.
+                shared.duplicates.fetch_add(1, Ordering::Relaxed);
+            }
+            shared.transactions.fetch_add(1, Ordering::Relaxed);
+            shared.events.fetch_add(n, Ordering::Relaxed);
+            if c.appends[0].first_index != len || c.appends[0].new_len != len + n {
+                shared.violation(format!(
+                    "writer {w}: expected first index {len} and length {}, got {} and {}",
+                    len + n,
+                    c.appends[0].first_index,
+                    c.appends[0].new_len
+                ));
+            }
+            for (j, p) in payloads.iter().enumerate() {
+                shared.ack(c.first + j as u64, p);
+            }
+            lens.insert(agg, (len + n, Instant::now()));
+        }
+        Err(ClientError::Unconfirmed { .. }) => {
+            // Landed on the leader, unconfirmed, and the client's
+            // resends ran out of time: not acknowledged, so not an
+            // ack to check; the length is read again.
+            shared.unconfirmed.fetch_add(1, Ordering::Relaxed);
+            lens.remove(&agg);
+        }
+        Err(ClientError::Conflict { actual, .. }) => {
+            shared.conflicts.fetch_add(1, Ordering::Relaxed);
+            // Shrinking is what a killed leader's lost writes look
+            // like; anything else is a violation.
+            if actual < len && !shared.killed_since(acked_at) {
+                shared.violation(format!(
+                    "writer {w}: aggregate {agg} shrank from {len} to {actual}"
+                ));
+            }
+            lens.insert(agg, (actual, Instant::now()));
+        }
+        Err(e) => {
+            shared.error("writer commit", &e);
+            after_error(shared, client, &e).await;
         }
     }
 }
@@ -783,6 +871,8 @@ fn check_backup(shared: &Shared, archive: &std::path::Path, head: u64, lens: &[(
 /// Runs the configured load for its duration and reports.
 pub async fn run(cfg: Config) -> anyhow::Result<Report> {
     let leader = connect_leader(&cfg).await?;
+    let fsync = leader.info().await.ok().map(|i| i.fsync);
+    let started = Instant::now();
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
         transactions: AtomicU64::new(0),
@@ -842,6 +932,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
     for t in tasks {
         let _ = tokio::time::timeout(Duration::from_secs(30), t).await;
     }
+    let wall = started.elapsed().as_secs_f64();
 
     if cfg.kill_mode() {
         // The last kill may still be settling.
@@ -943,6 +1034,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         failover_errors: shared.failover_errors.load(Ordering::Relaxed),
         unconfirmed: shared.unconfirmed.load(Ordering::Relaxed),
         duplicates: shared.duplicates.load(Ordering::Relaxed),
+        wall_s: wall,
+        transactions_per_s: shared.transactions.load(Ordering::Relaxed) as f64 / wall.max(1e-9),
+        events_per_s: shared.events.load(Ordering::Relaxed) as f64 / wall.max(1e-9),
+        writers: cfg.writers,
+        in_flight: cfg.in_flight.max(1).min(cfg.aggregates.max(1) as usize),
+        fsync,
         violations: shared
             .violations
             .lock()

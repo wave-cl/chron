@@ -194,6 +194,8 @@ PromQL:
 - Conflict ratio: `rate(chron_commits_total{result="conflict"}[5m]) / rate(chron_commits_total[5m])`
 - Commit p99: `histogram_quantile(0.99, sum by (le) (rate(chron_commit_duration_seconds_bucket[5m])))`
 - Mean fsync: `rate(chron_fsync_seconds_total[5m]) / rate(chron_fsyncs_total[5m])`
+- fsync p99: `histogram_quantile(0.99, sum by (le) (rate(chron_fsync_seconds_bucket[5m])))`
+- fsyncs per transaction (segment syncs plus index checkpoints): `(rate(chron_fsyncs_total[5m]) + rate(chron_index_checkpoints_total[5m])) / rate(chron_transactions_committed_total[5m])`; well under 1 under load, 1 + 1/256 at one writer; `--index-checkpoint-batches 1` restores the 0.4 rule of a durable index commit per batch (two fsyncs) where a deployment wants it
 - Error ratio by code: `sum by (code) (rate(chron_rpc_calls_total{code!="OK"}[5m]))`
 - Group commit effectiveness: `rate(chron_transactions_committed_total[5m]) / rate(chron_commit_batches_total[5m])`
 - Gateway error ratio: `sum by (route, status) (rate(chron_http_requests_total{status=~"5.."}[5m]))`

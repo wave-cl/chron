@@ -102,6 +102,9 @@ pub(crate) struct Inner {
     /// take it.
     pub(crate) maintenance: Mutex<()>,
     pub(crate) fail_next_commit: std::sync::atomic::AtomicBool,
+    /// Batches since the last durable index commit, and when that was.
+    /// Taken under the writer lock only.
+    pub(crate) checkpoint: Mutex<Checkpoint>,
     /// Transactions that joined a commit and wait for the writer lock's
     /// holder to land them. Lock order: the writer lock, then this.
     pub(crate) commits: Mutex<VecDeque<txn::Pending>>,
@@ -113,8 +116,15 @@ pub(crate) struct Inner {
     _lock: Lock,
 }
 
+/// Where the index stands against the disk.
+pub(crate) struct Checkpoint {
+    pub(crate) batches_since: u64,
+    pub(crate) last: Instant,
+}
+
 /// A database. Cheap to clone; every clone shares the same files, index
-/// and writer. Dropping the last clone flushes under [`Fsync::Never`].
+/// and writer. Dropping the last clone checkpoints the index and, under
+/// [`Fsync::Never`], syncs the segment too.
 #[derive(Clone)]
 pub struct Db {
     pub(crate) inner: Arc<Inner>,
@@ -173,6 +183,10 @@ impl Db {
                 epoch: AtomicU64::new(epoch),
                 maintenance: Mutex::new(()),
                 fail_next_commit: std::sync::atomic::AtomicBool::new(false),
+                checkpoint: Mutex::new(Checkpoint {
+                    batches_since: 0,
+                    last: Instant::now(),
+                }),
                 commits: Mutex::new(VecDeque::new()),
                 counters: Counters::default(),
                 head_watch: (Mutex::new(head), Condvar::new()),
@@ -727,10 +741,20 @@ impl Db {
         Transaction::new(self.clone())
     }
 
-    /// Forces everything committed so far to disk. Only matters under
-    /// [`Fsync::Never`]; also run when the last handle is dropped.
+    /// Forces everything committed so far to disk: the segment bytes and
+    /// a durable index commit (a checkpoint). Under [`Fsync::Always`] the
+    /// bytes already are, so this only brings the index file up to date;
+    /// also run when the last handle is dropped.
     pub fn flush(&self) -> Result<()> {
         self.inner.durable_index(|_, _| Ok(()))
+    }
+
+    /// A truncation stopped after its index commit and before its file
+    /// work: the state a crash there leaves. For tests of recovery only;
+    /// the `Db` must be dropped afterwards.
+    #[doc(hidden)]
+    pub fn debug_truncate_marker_only(&self, to: u64) -> Result<Truncated> {
+        truncate::truncate_with(&self.inner, to, true)
     }
 
     /// Blocks until the head is at least `min_head` or `timeout` passes.
@@ -817,8 +841,8 @@ impl Db {
     }
 
     /// Running totals of the commit path: batches, transactions, events,
-    /// fsyncs and the time they took. Concurrent commits land together,
-    /// so `batches` is at most `transactions`.
+    /// fsyncs and the time they took, index checkpoints. Concurrent
+    /// commits land together, so `batches` is at most `transactions`.
     pub fn stats(&self) -> Stats {
         self.inner.stats()
     }
@@ -1123,6 +1147,7 @@ impl Inner {
         let txn = self.index.begin_write_durable()?;
         let out = f(self, &txn)?;
         txn.commit()?;
+        self.note_index_commit(true);
         drop(w);
         Ok(out)
     }
@@ -1143,7 +1168,56 @@ impl Inner {
             fsyncs: c.fsyncs.load(Ordering::Relaxed),
             fsync_nanos: c.fsync_nanos.load(Ordering::Relaxed),
             duplicates: c.duplicates.load(Ordering::Relaxed),
+            index_checkpoints: c.index_checkpoints.load(Ordering::Relaxed),
+            fsync_buckets: std::array::from_fn(|i| c.fsync_buckets[i].load(Ordering::Relaxed)),
         }
+    }
+
+    /// The durability of the next batch's index commit: durable when
+    /// the checkpoint is due, under [`Fsync::Always`]; never under
+    /// [`Fsync::Never`], where the close syncs. Called under the writer
+    /// lock.
+    pub(crate) fn checkpoint_durability(&self) -> redb::Durability {
+        if self.opts.fsync == Fsync::Never {
+            return redb::Durability::None;
+        }
+        let cp = self.checkpoint.lock().unwrap_or_else(|p| p.into_inner());
+        if cp.batches_since + 1 >= self.opts.index_checkpoint_batches as u64
+            || cp.last.elapsed() >= self.opts.index_checkpoint_interval
+        {
+            redb::Durability::Immediate
+        } else {
+            redb::Durability::None
+        }
+    }
+
+    /// Records an index commit on the commit path: a durable one resets
+    /// the checkpoint clock.
+    pub(crate) fn note_index_commit(&self, durable: bool) {
+        let mut cp = self.checkpoint.lock().unwrap_or_else(|p| p.into_inner());
+        if durable {
+            cp.batches_since = 0;
+            cp.last = Instant::now();
+            self.counters
+                .index_checkpoints
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            cp.batches_since += 1;
+        }
+    }
+
+    /// Accounts one segment sync of `nanos`.
+    pub(crate) fn note_fsync(&self, nanos: u64) {
+        self.counters.fsyncs.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .fsync_nanos
+            .fetch_add(nanos, Ordering::Relaxed);
+        let secs = nanos as f64 / 1e9;
+        let bucket = FSYNC_BUCKET_BOUNDS
+            .iter()
+            .position(|b| secs <= *b)
+            .unwrap_or(FSYNC_BUCKET_BOUNDS.len() - 1);
+        self.counters.fsync_buckets[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Drops cached handles on segments about to be removed.
@@ -1273,14 +1347,24 @@ pub(crate) struct Counters {
     pub(crate) fsyncs: AtomicU64,
     pub(crate) fsync_nanos: AtomicU64,
     pub(crate) duplicates: AtomicU64,
+    pub(crate) index_checkpoints: AtomicU64,
+    pub(crate) fsync_buckets: [AtomicU64; FSYNC_BUCKET_BOUNDS.len()],
 }
+
+/// Upper bounds, in seconds, of the buckets [`Stats::fsync_buckets`]
+/// counts segment syncs into: from 100 µs to a second, the last bucket
+/// taking everything above.
+pub const FSYNC_BUCKET_BOUNDS: [f64; 12] = [
+    1e-4, 2.5e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 2.5e-2, 5e-2, 0.1, 0.25, 1.0,
+];
 
 /// What the commit path has done since the database was opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct Stats {
     /// Index commits that landed transactions: one per batch. An applied
-    /// backup or replication chunk counts one per transaction.
+    /// backup or replication chunk lands as one batch (several only when
+    /// it crosses the byte cap or the segment limit).
     pub batches: u64,
     /// Transactions landed through those batches.
     pub transactions: u64,
@@ -1294,6 +1378,13 @@ pub struct Stats {
     /// Commits answered with an earlier landing because their commit id
     /// was seen before; nothing was written for them.
     pub duplicates: u64,
+    /// Durable index commits: the checkpoints of the commit path plus
+    /// every maintenance write. Each is one fsync of the index file.
+    pub index_checkpoints: u64,
+    /// How many segment syncs took at most each of
+    /// [`FSYNC_BUCKET_BOUNDS`] (not cumulative; the last bucket counts
+    /// the rest).
+    pub fsync_buckets: [u64; FSYNC_BUCKET_BOUNDS.len()],
 }
 
 /// Holds the writer lock from a test, so that commits from other threads
@@ -1303,14 +1394,17 @@ pub struct WriterHold<'a>(#[allow(dead_code)] WriterGuard<'a>);
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if self.opts.fsync == Fsync::Never {
-            let w = self.writer.get_mut().unwrap_or_else(|p| p.into_inner());
-            if w.sync_data().is_err() {
-                return;
-            }
-            if let Ok(txn) = self.index.begin_write_durable() {
-                let _ = txn.commit();
-            }
+        // The closing checkpoint: the segment synced (already so under
+        // Always), then a durable index commit, so the next open has
+        // nothing to replay. (redb persists pending commits on a clean
+        // close too; a crash is what leaves the index behind, and a copy
+        // of the index file taken while open is the image it leaves.)
+        let w = self.writer.get_mut().unwrap_or_else(|p| p.into_inner());
+        if w.sync_data().is_err() {
+            return;
+        }
+        if let Ok(txn) = self.index.begin_write_durable() {
+            let _ = txn.commit();
         }
     }
 }

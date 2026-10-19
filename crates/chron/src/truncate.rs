@@ -7,12 +7,14 @@ use std::sync::atomic::Ordering;
 
 use uuid::Uuid;
 
-use crate::db::Inner;
+use crate::db::{Inner, Layout};
 use crate::error::{Error, Result};
 use crate::event::FLAG_FIRST_IN_TXN;
-use crate::index::{AGG_INDEX, AGG_LEN, HEAD_KEY, META, POS, TAG, TXN_ID};
+use crate::index::{
+    AGG_INDEX, AGG_LEN, HEAD_KEY, Index, META, POS, TAG, TRUNCATE_INTENT_KEY, TXN_ID,
+};
 use crate::recover::{Item, Records};
-use crate::segment::{self, SegmentWriter};
+use crate::segment::{self, HEADER_LEN, SegmentWriter};
 
 /// What [`Db::truncate_to`](crate::Db::truncate_to) did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,11 +28,18 @@ pub struct Truncated {
 }
 
 /// Drops the records at positions `to..head`. `to` must be a transaction
-/// boundary. The index is updated and committed first, then the segment
-/// holding `to` is cut back to it and later segments are removed; a
-/// crash in between is repaired by the next open, which drops what the
-/// index no longer vouches for.
+/// boundary. The index is updated and committed first, with a marker
+/// saying the files are not cut yet; then the segment holding `to` is
+/// cut back to it and later segments are removed, and the marker is
+/// cleared. A crash in between is finished by the next open from the
+/// marker, before anything past the durable head is replayed.
 pub(crate) fn truncate(inner: &Inner, to: u64) -> Result<Truncated> {
+    truncate_with(inner, to, false)
+}
+
+/// `truncate`, stopping after the index commit when `marker_only`: the
+/// state a crash between the two steps leaves (for tests).
+pub(crate) fn truncate_with(inner: &Inner, to: u64, marker_only: bool) -> Result<Truncated> {
     let _m = inner.maintenance.lock().unwrap_or_else(|p| p.into_inner());
     let mut w = inner.lock_writer();
     let head = inner.head.load(Ordering::Acquire);
@@ -148,9 +157,14 @@ pub(crate) fn truncate(inner: &Inner, to: u64) -> Result<Truncated> {
         for id in &ids {
             txn_ids.remove(id)?;
         }
-        txn.open_table(META)?.insert(HEAD_KEY, to)?;
+        let mut meta = txn.open_table(META)?;
+        meta.insert(HEAD_KEY, to)?;
+        // Until the files are cut, the records past `to` are still there
+        // and must not be replayed by an open in between.
+        meta.insert(TRUNCATE_INTENT_KEY, to)?;
     }
     txn.commit()?;
+    inner.note_index_commit(true);
 
     // The index is the commit point: from here the head is `to` and the
     // writer continues at the cut, whatever the file operations below
@@ -159,9 +173,16 @@ pub(crate) fn truncate(inner: &Inner, to: u64) -> Result<Truncated> {
     let kept = inner.layout.segment(loc.base);
     *w = SegmentWriter::open(&kept, loc.base, loc.offset)?;
     inner.publish_head(to);
+    let later: Vec<_> = listed.iter().filter(|(b, _)| *b > loc.base).collect();
+    if marker_only {
+        return Ok(Truncated {
+            head: to,
+            removed: head - to,
+            segments_removed: 0,
+        });
+    }
     // Then the files: the segment holding `to` is cut back to its
     // frame, later ones go.
-    let later: Vec<_> = listed.iter().filter(|(b, _)| *b > loc.base).collect();
     let bases: Vec<u64> = later.iter().map(|(b, _)| *b).collect();
     inner.forget_files(&bases);
     segment::truncate(&kept, loc.offset)?;
@@ -169,9 +190,73 @@ pub(crate) fn truncate(inner: &Inner, to: u64) -> Result<Truncated> {
         fs::remove_file(path).map_err(|e| Error::io(path, "remove", e))?;
     }
     segment::sync_dir(&dir)?;
+    let txn = inner.index.begin_write_durable()?;
+    txn.open_table(META)?.remove(TRUNCATE_INTENT_KEY)?;
+    txn.commit()?;
+    inner.note_index_commit(true);
     Ok(Truncated {
         head: to,
         removed: head - to,
         segments_removed: later.len(),
     })
+}
+
+/// Finishes a truncation to `to` whose index commit is durable but
+/// whose file work was interrupted: cuts the files from the index's own
+/// locations (the records past `to` may already be gone, so nothing is
+/// scanned) and clears the marker.
+pub(crate) fn finish(index: &Index, layout: &Layout, to: u64) -> Result<()> {
+    let dir = layout.segments_dir();
+    let floor = index.floor()?;
+    // Where the kept data ends: after the record at `to - 1`, when the
+    // index still has one above the floor.
+    let cut = if to > floor {
+        match index.locate(to - 1)? {
+            Some(l) => Some((l.base, l.offset + u64::from(l.frame_len))),
+            None => {
+                return Err(Error::corrupt(
+                    layout.index_file(),
+                    0,
+                    format!(
+                        "a truncation to {to} is pending but position {} is not indexed",
+                        to - 1
+                    ),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    for (base, path) in segment::list(&dir)? {
+        match cut {
+            Some((kept, end)) if base == kept => {
+                let len = fs::metadata(&path)
+                    .map_err(|e| Error::io(&path, "metadata", e))?
+                    .len();
+                if len > end {
+                    segment::truncate(&path, end)?;
+                }
+            }
+            Some((kept, _)) if base < kept => {}
+            _ if base == to => {
+                // A segment that begins exactly at the cut keeps its
+                // header: the writer continues in it.
+                let len = fs::metadata(&path)
+                    .map_err(|e| Error::io(&path, "metadata", e))?
+                    .len();
+                if len > HEADER_LEN {
+                    segment::truncate(&path, HEADER_LEN)?;
+                }
+            }
+            _ if base > to => {
+                fs::remove_file(&path).map_err(|e| Error::io(&path, "remove", e))?;
+            }
+            _ => {}
+        }
+    }
+    segment::sync_dir(&dir)?;
+    let txn = index.begin_write_durable()?;
+    txn.open_table(META)?.remove(TRUNCATE_INTENT_KEY)?;
+    txn.commit()?;
+    Ok(())
 }

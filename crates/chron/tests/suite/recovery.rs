@@ -1,4 +1,5 @@
 use std::fs;
+use std::time::Duration;
 
 use chron::{Db, Error, Expected, Fsync, Options};
 
@@ -19,8 +20,11 @@ fn durable() -> Options {
     Options::new().fsync(Fsync::Always)
 }
 
+/// A complete transaction the segment holds past the index head was
+/// written and synced before the index commit that a crash cut: it is
+/// replayed on open, as `rebuild_index` has always kept it.
 #[test]
-fn write_without_commit_is_truncated_on_open() {
+fn a_complete_unindexed_transaction_is_replayed_on_open() {
     let d = tmp();
     let db = open_with(d.path(), durable());
     fill(&db, agg(1), 10);
@@ -30,30 +34,34 @@ fn write_without_commit_is_truncated_on_open() {
     t.append(
         agg(1),
         Expected::Any,
-        vec![ev("ghost0"), ev("ghost1"), ev("ghost2")],
+        vec![tagged("ghost0", &["g"]), ev("ghost1"), ev("ghost2")],
     );
     db.debug_write_without_commit(t).unwrap();
     drop(db);
-    assert!(
-        file_len(&seg) > committed,
-        "the ghost bytes reached the file"
-    );
+    let written = file_len(&seg);
+    assert!(written > committed, "the ghost bytes reached the file");
 
-    let db = open_with(d.path(), durable());
-    assert_eq!(db.head(), 10);
-    assert_eq!(file_len(&seg), committed, "the ghost bytes were cut");
-    assert_eq!(db.aggregate_len(agg(1)).unwrap(), 10);
+    let db = open_with(d.path(), durable().verify_all_segments(true));
+    assert_eq!(db.head(), 13);
+    assert_eq!(file_len(&seg), written, "nothing was cut");
+    assert_eq!(db.aggregate_len(agg(1)).unwrap(), 13);
     let all = db.read_all(0, 100).unwrap();
-    assert_eq!(all.len(), 10);
-    assert!(payloads(&all).iter().all(|p| !p.starts_with("ghost")));
+    assert_eq!(all.len(), 13);
+    assert_eq!(payloads(&all[10..]), ["ghost0", "ghost1", "ghost2"]);
+    assert_eq!(positions(&db.read_tag("g", 0, 0).unwrap()), [10]);
+    assert_eq!(
+        indices(&db.read_aggregate(agg(1), 9, 10).unwrap()),
+        [9, 10, 11, 12]
+    );
     let mut t = db.transaction();
-    t.append_one(agg(1), Expected::Exact(10), ev("real"));
+    t.append_one(agg(1), Expected::Exact(13), ev("real"));
     let c = t.commit().unwrap();
-    assert_eq!(c.first, 10);
-    assert_eq!(c.appends[0].first_index, 10);
+    assert_eq!(c.first, 13);
+    assert_eq!(c.appends[0].first_index, 13);
     drop(db);
-    let db = open_with(d.path(), durable());
-    assert_eq!(payloads(&db.read_all(10, 10).unwrap()), ["real"]);
+    let db = open_with(d.path(), durable().verify_all_segments(true));
+    assert_eq!(payloads(&db.read_all(13, 10).unwrap()), ["real"]);
+    assert_eq!(db.head(), 14);
 }
 
 #[test]
@@ -74,6 +82,15 @@ fn torn_tail_matrix() {
     drop(db);
     let ghosts = file_len(&seg) - committed;
     assert_eq!(ghosts, 2 * one_record);
+    // Uncut, the whole transaction is there and is replayed.
+    {
+        let db = open_with(d.path(), durable());
+        assert_eq!(db.head(), 5, "uncut");
+        assert_eq!(payloads(&db.read_all(3, 10).unwrap()), ["g0", "g1"]);
+        db.truncate_to(3).unwrap();
+        drop(db);
+        assert_eq!(file_len(&seg), committed);
+    }
 
     let cuts = [
         1,
@@ -102,11 +119,149 @@ fn torn_tail_matrix() {
         drop(db);
     }
 
+    // Two transactions past the index, the second torn: the first is
+    // replayed, the second cut.
+    {
+        // The first committed with its index commit held back (the
+        // index image copied before it), the second written without one.
+        let db = open_with(
+            d.path(),
+            durable()
+                .index_checkpoint_batches(usize::MAX)
+                .index_checkpoint_interval(Duration::from_secs(3600)),
+        );
+        let crashed = snapshot_index(d.path());
+        let mut t = db.transaction();
+        t.append(agg(1), Expected::Any, vec![ev("h0"), ev("h1")]);
+        t.commit().unwrap();
+        let mut t = db.transaction();
+        t.append(agg(1), Expected::Any, vec![ev("h2"), ev("h3")]);
+        db.debug_write_without_commit(t).unwrap();
+        drop(db);
+        restore_index(d.path(), &crashed);
+        assert_eq!(file_len(&seg), committed + 2 * ghosts);
+        chop(&seg, 5);
+        let db = open_with(d.path(), durable());
+        assert_eq!(db.head(), 5, "two transactions, the second torn");
+        assert_eq!(payloads(&db.read_all(3, 10).unwrap()), ["h0", "h1"]);
+        assert_eq!(file_len(&seg), committed + ghosts);
+        db.truncate_to(3).unwrap();
+        drop(db);
+    }
+
     chop(&seg, 1);
     assert!(matches!(
         Db::open(d.path(), durable()),
         Err(Error::Corrupt { .. })
     ));
+}
+
+/// Checkpoints held back: the index file (its image as a crash leaves
+/// it, copied while open) lags the data across a segment roll, and open
+/// replays through the roll.
+#[test]
+fn replay_crosses_a_segment_roll() {
+    let d = tmp();
+    let o = durable()
+        .segment_max_bytes(300)
+        .index_checkpoint_batches(usize::MAX)
+        .index_checkpoint_interval(Duration::from_secs(3600));
+    let db = open_with(d.path(), o.clone());
+    fill(&db, agg(1), 2);
+    db.flush().unwrap();
+    let durable_head = db.head();
+    for i in 0..30 {
+        let mut t = db.transaction();
+        t.append_one(
+            agg(1 + i % 2),
+            Expected::Any,
+            tagged(&format!("r{i}"), &["t"]),
+        );
+        t.commit().unwrap();
+    }
+    let head = db.head();
+    let before = db.read_all(0, 0).unwrap();
+    let tag_before = db.read_tag("t", 0, 0).unwrap();
+    let segs = segments(d.path()).len();
+    assert!(segs > 3, "rolled");
+    assert_eq!(db.stats().index_checkpoints, 1, "only the flush");
+    // The index file as a crash leaves it: copied while open.
+    let crashed = snapshot_index(d.path());
+    drop(db);
+    restore_index(d.path(), &crashed);
+
+    let db = open_with(d.path(), o.verify_all_segments(true));
+    assert_eq!(db.head(), head);
+    assert!(head > durable_head);
+    assert_eq!(db.read_all(0, 0).unwrap(), before);
+    assert_eq!(db.read_tag("t", 0, 0).unwrap(), tag_before);
+    assert_eq!(db.aggregate_len(agg(1)).unwrap(), 2 + 15);
+    assert_eq!(db.aggregate_len(agg(2)).unwrap(), 15);
+    assert_eq!(segments(d.path()).len(), segs, "no segment lost");
+    fill(&db, agg(1), 1);
+    assert_eq!(db.head(), head + 1);
+}
+
+/// The index file put back from an earlier copy: everything committed
+/// since is replayed from the segments.
+#[test]
+fn a_stale_index_copy_is_rolled_forward() {
+    let d = tmp();
+    let db = open_with(d.path(), durable());
+    fill(&db, agg(1), 3);
+    db.flush().unwrap();
+    let stale = snapshot_index(d.path());
+    for i in 0..5 {
+        let mut t = db.transaction();
+        t.append(
+            agg(1),
+            Expected::Exact(3 + 2 * i),
+            vec![tagged("a", &["t"]), ev("b")],
+        );
+        t.append_free(vec![ev("f")]);
+        t.commit().unwrap();
+    }
+    let before = db.read_all(0, 0).unwrap();
+    let lens = (db.aggregate_len(agg(1)).unwrap(), db.head());
+    drop(db);
+    restore_index(d.path(), &stale);
+    let db = open_with(d.path(), durable().verify_all_segments(true));
+    assert_eq!(db.head(), 18);
+    assert_eq!((db.aggregate_len(agg(1)).unwrap(), db.head()), lens);
+    assert_eq!(db.read_all(0, 0).unwrap(), before);
+    assert_eq!(db.read_tag("t", 0, 0).unwrap().len(), 5);
+    assert_eq!(
+        indices(&db.read_aggregate(agg(1), 0, 0).unwrap()),
+        (0..13).collect::<Vec<_>>()
+    );
+    drop(db);
+    // The replay was checkpointed: a second open has nothing to do and
+    // the index on disk is at the head.
+    let db = open_with(d.path(), durable());
+    assert_eq!(db.head(), 18);
+}
+
+/// Damage inside the replayed tail with a valid record after it is
+/// corruption, not a torn tail.
+#[test]
+fn damage_in_the_replayed_tail_followed_by_a_valid_record_is_corrupt() {
+    let d = tmp();
+    let db = open_with(d.path(), durable());
+    fill(&db, agg(1), 2);
+    db.flush().unwrap();
+    let stale = snapshot_index(d.path());
+    fill(&db, agg(1), 4);
+    let (_, offset, _) = db.debug_locate(3).unwrap().unwrap();
+    drop(db);
+    let seg = last_segment(d.path());
+    restore_index(d.path(), &stale);
+    flip(&seg, offset + 20);
+    match Db::open(d.path(), durable()) {
+        Err(Error::Corrupt { reason, .. }) => {
+            assert!(reason.contains("committed records follow"), "{reason}")
+        }
+        other => panic!("unexpected {:?}", other.map(|_| ())),
+    }
 }
 
 #[test]

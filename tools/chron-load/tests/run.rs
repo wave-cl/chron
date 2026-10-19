@@ -3,16 +3,30 @@
 
 use std::time::Duration;
 
+/// `CHRON_LOAD_FSYNC=1` runs the daemons with fsync on (off by default:
+/// the tests are about invariants, not disks).
+fn fsync() -> bool {
+    std::env::var("CHRON_LOAD_FSYNC").is_ok_and(|v| v == "1")
+}
+
+/// `CHRON_LOAD_IN_FLIGHT`: commits per writer in flight (default 1).
+fn in_flight() -> usize {
+    std::env::var("CHRON_LOAD_IN_FLIGHT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_short_run_finds_no_violation() {
     let dir = tempfile::tempdir().unwrap();
     let mut opts = chrond::Options::new(dir.path().join("leader"), "127.0.0.1:0".parse().unwrap());
-    opts.fsync = false;
+    opts.fsync = fsync();
     opts.backup_dir = Some(dir.path().join("backups"));
     let leader = chrond::start(opts).await.unwrap();
     let mut ropts =
         chrond::Options::new(dir.path().join("replica"), "127.0.0.1:0".parse().unwrap());
-    ropts.fsync = false;
+    ropts.fsync = fsync();
     ropts.replicate_from = Some(format!("http://{}", leader.local_addr));
     let replica = chrond::start(ropts).await.unwrap();
 
@@ -39,11 +53,14 @@ async fn a_short_run_finds_no_violation() {
         kill_every: None,
         killer: None,
         sync: None,
+        in_flight: in_flight(),
     })
     .await
     .unwrap();
     eprintln!("{}", report.to_json());
     assert!(report.transactions > 100, "{report:?}");
+    assert!(report.transactions_per_s > 0.0 && report.wall_s > 0.0);
+    assert_eq!(report.fsync, Some(fsync()));
     assert!(
         report.reads > 10 && report.subscribed_events > 100,
         "{report:?}"
@@ -67,7 +84,7 @@ async fn a_run_with_the_leader_killed_finds_no_violation() {
         .unwrap_or(20);
     for (mode, sync) in [("sync", Some(true)), ("async", Some(false))] {
         let cluster = std::sync::Arc::new(tokio::sync::Mutex::new(
-            Cluster::start(3, Duration::from_secs(1)).await,
+            Cluster::start_fsync(3, Duration::from_secs(1), fsync()).await,
         ));
         let addrs: Vec<String> = {
             let c = cluster.lock().await;
@@ -115,6 +132,7 @@ async fn a_run_with_the_leader_killed_finds_no_violation() {
             kill_every: Some(Duration::from_secs(6)),
             killer: Some(killer),
             sync,
+            in_flight: in_flight(),
         })
         .await
         .unwrap();
@@ -132,4 +150,44 @@ async fn a_run_with_the_leader_killed_finds_no_violation() {
         tokio::time::sleep(Duration::from_secs(3)).await;
         cluster.lock().await.stop_all().await;
     }
+}
+
+/// Several commits in flight per writer on distinct aggregates: the
+/// expectations stay exact, cross-writer conflicts happen, nothing is
+/// violated, and the report carries throughput.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_pipelined_run_finds_no_violation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = chrond::Options::new(dir.path().join("leader"), "127.0.0.1:0".parse().unwrap());
+    opts.fsync = fsync();
+    let leader = chrond::start(opts).await.unwrap();
+    let report = chron_load::run(chron_load::Config {
+        addr: format!("http://{}", leader.local_addr),
+        replica: None,
+        token: None,
+        database: None,
+        duration: Duration::from_secs(10),
+        writers: 4,
+        readers: 1,
+        subscribers: 1,
+        aggregates: 8,
+        events_per_txn: 2,
+        payload_bytes: 120,
+        backup_dir: None,
+        backup_every: None,
+        retain_every: None,
+        seed: 13,
+        kill_every: None,
+        killer: None,
+        sync: None,
+        in_flight: 8,
+    })
+    .await
+    .unwrap();
+    eprintln!("{}", report.to_json());
+    assert_eq!(report.in_flight, 8);
+    assert!(report.conflicts > 0, "writers share aggregates: {report:?}");
+    assert!(report.transactions > 100 && report.transactions_per_s > 0.0);
+    assert!(report.ok(), "{:#?}", report.violations);
+    leader.shutdown().await.unwrap();
 }

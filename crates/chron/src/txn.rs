@@ -261,12 +261,13 @@ fn land(
     txn_ids: &[([u8; 16], u64, u64)],
     new_head: u64,
     txns: u64,
+    durable: bool,
 ) -> Result<()> {
     // Bytes first, synced before the index commit vouches for them.
     let base = w.base();
     let at = w.write_at_end(buf)?;
     let landed = land_index(
-        inner, w, wtxn, base, at, buf, entries, lens, txn_ids, new_head, txns,
+        inner, w, wtxn, base, at, buf, entries, lens, txn_ids, new_head, txns, durable,
     );
     if landed.is_err() {
         // Leftover bytes past the logical end would survive a later,
@@ -289,15 +290,12 @@ fn land_index(
     txn_ids: &[([u8; 16], u64, u64)],
     new_head: u64,
     txns: u64,
+    durable: bool,
 ) -> Result<()> {
     if inner.opts.fsync == Fsync::Always {
         let t = Instant::now();
         w.sync_data()?;
-        inner.counters.fsyncs.fetch_add(1, Ordering::Relaxed);
-        inner
-            .counters
-            .fsync_nanos
-            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        inner.note_fsync(t.elapsed().as_nanos() as u64);
     }
     if inner.fail_next_commit.swap(false, Ordering::AcqRel) {
         return Err(Error::io(
@@ -332,8 +330,10 @@ fn land_index(
         }
         meta.insert(HEAD_KEY, new_head)?;
     }
-    // Commit point.
+    // Commit point. In memory at once; on disk at the next checkpoint,
+    // which this commit may be.
     wtxn.commit()?;
+    inner.note_index_commit(durable);
     inner.counters.batches.fetch_add(1, Ordering::Relaxed);
     inner
         .counters
@@ -364,11 +364,13 @@ struct Group {
 }
 
 /// Appends `frames` (back-to-back `len, crc, body` records, as an
-/// incremental backup carries them) through the normal landing path, one
-/// transaction at a time. Every frame is checked before anything is
-/// written: it must decode, positions must continue from the head,
-/// transactions must be whole and well flagged, and aggregate indices must
-/// be dense. The head must be `base_head` first and `expect_head` after.
+/// incremental backup or a replication chunk carries them) through the
+/// normal landing path, as one batch (several only where the batch
+/// byte cap or the segment limit falls). Every frame is checked before
+/// anything is written: it must decode, positions must continue from
+/// the head, transactions must be whole and well flagged, and aggregate
+/// indices must be dense. The head must be `base_head` first and
+/// `expect_head` after.
 pub(crate) fn import_frames(
     inner: &Inner,
     archive: &Path,
@@ -465,25 +467,58 @@ pub(crate) fn import_frames(
     drop(agg_len);
     drop(rtxn);
 
-    for g in groups {
-        let wtxn = inner.index.begin_write()?;
-        let first = g.entries[0].position;
-        let ids: Vec<([u8; 16], u64, u64)> = g
-            .commit_id
-            .map(|id| (id, first, g.new_head))
-            .into_iter()
-            .collect();
+    // Sub-batches by the rules `drain` uses for queued commits, so a
+    // segment overshoots by at most one transaction.
+    let max_bytes = inner.opts.group_commit_max_bytes;
+    let mut i = 0;
+    while i < groups.len() {
+        let start = groups[i].start;
+        let mut end = groups[i].end;
+        let mut j = i + 1;
+        while j < groups.len() {
+            let next_end = groups[j].end;
+            if next_end - start > max_bytes
+                || w.len().saturating_add((end - start) as u64) >= inner.opts.segment_max_bytes
+            {
+                break;
+            }
+            end = next_end;
+            j += 1;
+        }
+        let sub = &groups[i..j];
+        let mut entries: Vec<Entry> = Vec::new();
+        let mut lens: HashMap<Uuid, u64> = HashMap::new();
+        let mut ids: Vec<([u8; 16], u64, u64)> = Vec::new();
+        for g in sub {
+            let shift = (g.start - start) as u64;
+            entries.extend(g.entries.iter().map(|e| Entry {
+                position: e.position,
+                rel_offset: e.rel_offset + shift,
+                frame_len: e.frame_len,
+                aggregate: e.aggregate,
+                index: e.index,
+                tags: e.tags.clone(),
+            }));
+            lens.extend(g.lens.iter().map(|(k, v)| (*k, *v)));
+            if let Some(id) = g.commit_id {
+                ids.push((id, g.entries[0].position, g.new_head));
+            }
+        }
+        let durability = inner.checkpoint_durability();
+        let wtxn = inner.index.begin_write_with(durability)?;
         land(
             inner,
             &mut w,
             wtxn,
-            &frames[g.start..g.end],
-            &g.entries,
-            &g.lens,
+            &frames[start..end],
+            &entries,
+            &lens,
             &ids,
-            g.new_head,
-            1,
+            sub[sub.len() - 1].new_head,
+            sub.len() as u64,
+            matches!(durability, redb::Durability::Immediate),
         )?;
+        i = j;
     }
     Ok(position)
 }
@@ -993,7 +1028,8 @@ fn run_batch(inner: &Inner, w: &mut SegmentWriter, batch: Vec<Pending>) {
     };
 
     let head = inner.head.load(Ordering::Acquire);
-    let wtxn = match inner.index.begin_write() {
+    let durability = inner.checkpoint_durability();
+    let wtxn = match inner.index.begin_write_with(durability) {
         Ok(t) => t,
         Err(e) => {
             let all: Vec<usize> = (0..n).collect();
@@ -1122,6 +1158,7 @@ fn run_batch(inner: &Inner, w: &mut SegmentWriter, batch: Vec<Pending>) {
         &txn_ids,
         position,
         accepted.len() as u64,
+        matches!(durability, redb::Durability::Immediate),
     ) {
         Ok(()) => {
             for &(i, j) in &echoes {

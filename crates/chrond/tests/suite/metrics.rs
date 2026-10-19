@@ -302,3 +302,42 @@ async fn a_replica_reports_lag_connection_and_errors() {
     .await;
     replica.stop().await;
 }
+
+/// With fsync on, the segment sync histogram counts every sync and a
+/// `Flush` is a durable index commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn fsync_histogram_and_checkpoints_are_reported() {
+    let mut s = Server::start_with(|o| {
+        with_metrics(o);
+        o.fsync = true;
+    })
+    .await;
+    let maddr = s.running.as_ref().unwrap().metrics_addr.unwrap();
+    fill(&mut s.client, agg(1), 3).await;
+    s.client.flush(pb::FlushRequest {}).await.unwrap();
+    let body = tokio::task::spawn_blocking(move || scrape(maddr))
+        .await
+        .unwrap();
+    let d = ("db", "default");
+    let fsyncs = metric(&body, "chron_fsyncs_total", &[d]).unwrap();
+    assert!(fsyncs >= 3.0, "{body}");
+    assert_eq!(
+        metric(&body, "chron_fsync_seconds_bucket", &[d, ("le", "+Inf")]),
+        Some(fsyncs),
+        "every sync is in the histogram"
+    );
+    assert_eq!(
+        metric(&body, "chron_fsync_seconds_count", &[d]),
+        Some(fsyncs)
+    );
+    assert!(metric(&body, "chron_fsync_seconds_sum", &[d]).unwrap() > 0.0);
+    assert!(
+        metric(&body, "chron_index_checkpoints_total", &[d]).unwrap() >= 1.0,
+        "the flush checkpointed: {body}"
+    );
+    assert!(
+        body.contains("chron_commit_duration_seconds_bucket{db=\"default\",le=\"0.0001\"}"),
+        "commit buckets start at 100 µs"
+    );
+    s.stop().await;
+}

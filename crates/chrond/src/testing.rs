@@ -120,10 +120,14 @@ impl ClusterNode {
 }
 
 /// `n` in-process daemons on fixed loopback ports, each with the others
-/// as peers, `fsync` off, one lease ttl.
+/// as peers, `fsync` off unless [`Cluster::fsync`] is set, one lease ttl.
 pub struct Cluster {
     pub nodes: Vec<ClusterNode>,
     pub ttl: Duration,
+    /// Whether the nodes sync on commit; off by default, on with
+    /// `CHRON_TEST_FSYNC=1` in the environment or by setting it before
+    /// a restart.
+    pub fsync: bool,
 }
 
 /// A free TCP port: bound then released, so a daemon can be restarted on it.
@@ -140,12 +144,29 @@ impl Cluster {
         Self::start_with(n, ttl, |_| {}).await
     }
 
+    /// `start` with the nodes syncing on commit (or not), kept across
+    /// restarts.
+    pub async fn start_fsync(n: usize, ttl: Duration, fsync: bool) -> Cluster {
+        Self::start_configured(n, ttl, fsync, |_| {}).await
+    }
+
     /// `start` with `f` adjusting every node's options.
     pub async fn start_with(n: usize, ttl: Duration, f: impl Fn(&mut Options)) -> Cluster {
+        let fsync = std::env::var("CHRON_TEST_FSYNC").is_ok_and(|v| v == "1");
+        Self::start_configured(n, ttl, fsync, f).await
+    }
+
+    async fn start_configured(
+        n: usize,
+        ttl: Duration,
+        fsync: bool,
+        f: impl Fn(&mut Options),
+    ) -> Cluster {
         let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
         let mut cluster = Cluster {
             nodes: Vec::new(),
             ttl,
+            fsync,
         };
         for port in &ports {
             cluster.nodes.push(ClusterNode {
@@ -195,7 +216,7 @@ impl Cluster {
             me.dir.path().join("data"),
             format!("127.0.0.1:{}", me.port).parse().expect("addr"),
         );
-        o.fsync = false;
+        o.fsync = self.fsync;
         o.lease_ttl = self.ttl;
         // Databases created on the leader show up on followers within a
         // second, not the ten of the default.

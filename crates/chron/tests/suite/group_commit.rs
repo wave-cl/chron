@@ -352,3 +352,49 @@ fn flags_and_recorded_at_are_per_transaction_inside_a_batch() {
     }
     assert_eq!(db.stats().batches, 1);
 }
+
+#[test]
+fn checkpoints_every_n_batches() {
+    let d = tmp();
+    let db = open_with(
+        d.path(),
+        always()
+            .index_checkpoint_batches(4)
+            .index_checkpoint_interval(Duration::from_secs(3600)),
+    );
+    for i in 0..10 {
+        commit_one(&db, agg(1), Expected::Any, &format!("c{i}")).unwrap();
+    }
+    let st = db.stats();
+    assert_eq!(
+        (st.batches, st.fsyncs),
+        (10, 10),
+        "one segment sync per batch"
+    );
+    assert_eq!(st.index_checkpoints, 2, "the 4th and 8th batch");
+    let total: u64 = st.fsync_buckets.iter().sum();
+    assert_eq!(total, st.fsyncs, "every sync is in a bucket");
+    // The interval forces one too.
+    let db2 = open_with(
+        tmp().path(),
+        always()
+            .index_checkpoint_batches(usize::MAX)
+            .index_checkpoint_interval(Duration::from_millis(50)),
+    );
+    commit_one(&db2, agg(1), Expected::Any, "a").unwrap();
+    std::thread::sleep(Duration::from_millis(80));
+    commit_one(&db2, agg(1), Expected::Any, "b").unwrap();
+    assert_eq!(db2.stats().index_checkpoints, 1);
+}
+
+#[test]
+fn checkpoint_batches_1_is_every_batch() {
+    let d = tmp();
+    let db = open_with(d.path(), always().index_checkpoint_batches(1));
+    for i in 0..5 {
+        commit_one(&db, agg(1), Expected::Any, &format!("c{i}")).unwrap();
+    }
+    let st = db.stats();
+    assert_eq!(st.index_checkpoints, st.batches);
+    assert_eq!(st.batches, 5);
+}

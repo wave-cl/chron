@@ -413,3 +413,32 @@ async fn replica_reconnects_after_the_leader_restarts_on_the_same_port() {
     replica.stop().await;
     leader.stop().await;
 }
+
+/// A follower lands a chunk as one batch: with fsync on, one segment
+/// sync per chunk rather than one per transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_lands_a_chunk_as_one_batch() {
+    let mut leader = Server::start_with(|o| o.fsync = true).await;
+    fill(&mut leader.client, agg(1), 50).await;
+    let replica = Server::start_with({
+        let addr = leader.addr();
+        move |o| {
+            o.fsync = true;
+            o.replicate_from = Some(addr);
+        }
+    })
+    .await;
+    let want = leader.info().await.head;
+    let replica_client = replica.client.clone();
+    wait_until("the replica to catch up", || {
+        let mut c = replica_client.clone();
+        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == want }
+    })
+    .await;
+    let st = replica.running.as_ref().unwrap().db.stats();
+    assert_eq!(st.transactions, 50);
+    assert!(st.batches <= 3, "landed in a few chunks: {st:?}");
+    assert_eq!(st.fsyncs, st.batches, "one segment sync per chunk");
+    replica.stop().await;
+    leader.stop().await;
+}

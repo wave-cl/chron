@@ -35,6 +35,11 @@ struct Cli {
     events_per_txn: usize,
     #[arg(long, default_value_t = 200)]
     payload_bytes: usize,
+    /// Commits each writer keeps in flight, on distinct aggregates (at
+    /// most --aggregates; writers x in-flight should stay under the
+    /// daemon's --concurrency-per-connection, 256 by default).
+    #[arg(long, default_value_t = 1)]
+    in_flight: usize,
     /// The daemon's --backup-dir on this host; enables periodic backups
     /// that are restored and checked offline.
     #[arg(long)]
@@ -154,13 +159,14 @@ async fn main() -> anyhow::Result<()> {
             (_, true) => Some(false),
             _ => None,
         },
+        in_flight: cli.in_flight.max(1),
     })
     .await?;
     if cli.json {
         println!("{}", report.to_json());
     } else {
         println!(
-            "transactions {}  events {}  conflicts {}  errors {}\nreads {} ({} events)  subscribed {}  backups {}  retentions {}\ncommit p50 {:.2} ms  p99 {:.2} ms\nfinal head {}  replica head {:?}\nkills {}  lost acks {}  failover errors {}  unconfirmed {}  duplicates {}",
+            "transactions {}  events {}  conflicts {}  errors {}\nreads {} ({} events)  subscribed {}  backups {}  retentions {}\ncommit p50 {:.2} ms  p99 {:.2} ms\nfinal head {}  replica head {:?}\nkills {}  lost acks {}  failover errors {}  unconfirmed {}  duplicates {}\nthroughput {:.0} txn/s ({:.0} events/s) over {:.1} s  {} writers x {} in flight  daemon fsync {}",
             report.transactions,
             report.events,
             report.conflicts,
@@ -178,7 +184,17 @@ async fn main() -> anyhow::Result<()> {
             report.lost_acks,
             report.failover_errors,
             report.unconfirmed,
-            report.duplicates
+            report.duplicates,
+            report.transactions_per_s,
+            report.events_per_s,
+            report.wall_s,
+            report.writers,
+            report.in_flight,
+            match report.fsync {
+                Some(true) => "on",
+                Some(false) => "off",
+                None => "unknown",
+            }
         );
         for v in &report.violations {
             println!("VIOLATION: {v}");

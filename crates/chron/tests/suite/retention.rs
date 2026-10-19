@@ -215,3 +215,30 @@ fn rebuild_after_retention_keeps_the_floor() {
         "the length counts the dropped events too"
     );
 }
+
+/// The index put back from a copy taken right after a retention: the
+/// floor is a durable commit, the commits since are replayed above it.
+#[test]
+fn reopen_after_retain_with_a_lagging_index() {
+    let d = tmp();
+    let db = multi_segment(d.path());
+    let floor = db.retain_from(db.head() / 2).unwrap().floor;
+    let stale = snapshot_index(d.path());
+    for i in 0..10 {
+        let mut t = db.transaction();
+        t.append_one(agg(1), Expected::Any, tagged(&format!("late{i}"), &["t"]));
+        t.commit().unwrap();
+    }
+    let head = db.head();
+    let before = db.read_all(floor, 10_000).unwrap();
+    drop(db);
+    restore_index(d.path(), &stale);
+    let db = open_with(
+        d.path(),
+        opts().segment_max_bytes(300).verify_all_segments(true),
+    );
+    assert_eq!(db.floor(), floor);
+    assert_eq!(db.head(), head);
+    assert_eq!(db.read_all(floor, 10_000).unwrap(), before);
+    assert!(matches!(db.read_all(0, 1), Err(Error::BelowFloor { .. })));
+}
