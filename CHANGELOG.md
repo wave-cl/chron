@@ -6,6 +6,68 @@ crates share one version.
 
 ## Unreleased
 
+### chrond
+
+- Failover review fixes: a campaign asks for pre-votes first, so a lost
+  or refused campaign (a forced promotion of a lagging node included)
+  leaves no promise on any node; a forced vote is exempt from the
+  recency rule only on the leader itself, so a node that cannot reach
+  the live leader cannot be promoted over it; a follower waits out the
+  longer of its own lease ttl and its leader's; a candidate re-checks
+  under the transition lock that it heard no leader; up-to-dateness is
+  a total order (epoch, per-database heads, then the larger total and
+  the lower address), so an election always ends; a fenced node
+  campaigns after a lease of silence; a node waits a lease between
+  campaigns; with peers a client's epoch token no longer fences the
+  leader; shutdown refuses cluster calls and stops the cluster task
+  before the pullers; an unreadable `vote` marker stops the start;
+  election jitter is seeded from the wall clock.
+- Resync fixes: the backup, cut and reset notice run as one task that
+  always finishes, the archive is never overwritten (a second cut at the
+  same positions gets a timestamp), the head is re-checked before the
+  cut, fingerprints are compared on the blocking pool with a bound on
+  the leader's answer, and the boundary walk reads backward in pages.
+  A replica whose index has no record below its head is refused rather
+  than fed a hole.
+- Gateway: `limit=0` means the maximum page, `expect` accepts a number
+  in quotes, binary tags via `tag_base64`, the body limit allows for
+  base64, 409 errors carry `reason` (`expectation` or `epoch`), the
+  documented outcome of a 408, and subscriptions end on a cut before
+  any buffered event.
+
+### chron-db
+
+- `Db::truncate_to` publishes the new head and reopens the writer right
+  after the index commit, so a later file error leaves a consistent
+  database; a `Subscription` that saw the old tail reports a cut
+  (`Error::Inconsistent`) instead of skipping positions.
+
+### chron-client
+
+- `connect_any` uses a seed that leads itself and otherwise believes a
+  named leader only once it confirms it leads, with bounded probes and
+  one search at a time; `ClientConfig::failover_timeout` (30 s)
+  replaces `failover_retries`; a commit is resent after a connection
+  failure only when every append has an exact or `new` expectation
+  (never with an epoch token), and `commit` documents the rule;
+  transport errors show their cause.
+
+### chron-cli
+
+- `chron discover` asks every address of `--addr` and prints one line
+  per node; a list with mixed schemes is a usage error; "no leader"
+  exits 2. The JSON `commit` path refuses an expectation on a free
+  append, as the flag path does.
+
+### tools
+
+- `chron-load` kill mode: a kill is counted only when it happened, waits
+  until every other node is a connected follower, keeps the leader's
+  address as the `--pid` key, treats only not-the-leader, unreachable
+  and timed-out calls as failover errors, keeps every violation, counts
+  errors as failures, and checks acknowledgments against the log without
+  holding the whole log in memory.
+
 Nothing yet.
 
 ## 0.3.0 - 2026-10-18

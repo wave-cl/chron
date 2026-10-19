@@ -8,14 +8,20 @@
 //! acknowledged did so after `t0`, and grants a vote only once it has
 //! heard no leader for `ttl`, that is at or after `t0 + ttl`. Any two
 //! majorities share a node, so no new leader is elected before the old
-//! leader's lease has expired; what can still be in flight is one commit
-//! that passed the lease check an instant before. An elected leader's
-//! votes are its first lease, measured the same way.
+//! leader's lease has expired; what can still be in flight are the
+//! commits that passed the lease check an instant before. An elected
+//! leader's votes are its first lease, measured the same way. A follower
+//! waits out the longer of its own ttl and the one its leader announces,
+//! so a group with mismatched settings errs on the slow side.
 //!
-//! A candidate records its own vote only once the round has won: the
-//! campaign holds the node's transition lock, so no vote for another
-//! candidate can slip in between, and a lost campaign leaves no promise
-//! behind that would keep the node from following the live leader.
+//! A campaign asks for pre-votes first (nothing recorded on either side)
+//! and sends real vote requests only when a majority would grant: a lost
+//! campaign leaves no promise behind on any node, neither the candidate's
+//! own vote (recorded only once the round has won, under the transition
+//! lock) nor a voter's. A forced campaign (an operator's Promote) is
+//! granted by the live leader, which fences itself first, or by nodes
+//! that have heard no leader for a lease; it never lets two leaders
+//! overlap.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,10 +55,12 @@ async fn run(node: Arc<Node>) {
     };
     let ttl = cfg.lease_ttl;
     let mut jitter = Jitter::new(&cfg.advertise);
-    // When the quiet period began, for a follower that has heard nothing.
+    // When the quiet period began: the last leader heard, or the last
+    // thing this node did (a lost campaign, a step-down), whichever is
+    // later, so a lost campaign is not followed by another at once.
     let mut quiet_since = Instant::now();
     loop {
-        if node.cancel.is_cancelled() {
+        if node.cancel.is_cancelled() || node.is_stopping() {
             return;
         }
         match node.role() {
@@ -69,26 +77,19 @@ async fn run(node: Arc<Node>) {
                     _ = tokio::time::sleep(tick(ttl)) => {}
                 }
             }
-            Role::Fenced => {
-                // Waits for the new leader's heartbeat; never campaigns.
-                tokio::select! {
-                    _ = node.cancel.cancelled() => return,
-                    _ = tokio::time::sleep(tick(ttl)) => {}
-                }
-                quiet_since = Instant::now();
-            }
-            Role::Replica | Role::Candidate => {
-                let heard_at = node.lease().heard.map(|(at, _, _)| at);
-                let since = heard_at.unwrap_or(quiet_since);
-                let deadline = since + ttl + jitter.next(ttl);
+            // A fenced node campaigns too, above the epoch that fenced
+            // it: the leader that fenced it may have died before it ever
+            // heard from it.
+            Role::Replica | Role::Candidate | Role::Fenced => {
+                let since = node.heard_at().map_or(quiet_since, |h| h.max(quiet_since));
+                let silence = node.silence_ttl();
+                let deadline = since + silence + jitter.next(silence);
                 let wait = deadline.saturating_duration_since(Instant::now());
                 tokio::select! {
                     _ = node.cancel.cancelled() => return,
                     _ = tokio::time::sleep(wait) => {}
                 }
-                if node.heard_leader().is_some()
-                    || !matches!(node.role(), Role::Replica | Role::Candidate)
-                {
+                if node.heard_leader().is_some() || node.role() == Role::Leader {
                     continue;
                 }
                 match campaign(&node, false).await {
@@ -106,7 +107,8 @@ async fn run(node: Arc<Node>) {
 }
 
 /// Election timeouts spread between `ttl/10` and `ttl/2` so two followers
-/// rarely campaign at once (xorshift seeded by the node's address).
+/// rarely campaign at once (xorshift seeded by the node's address and
+/// the wall clock at start).
 struct Jitter(u64);
 
 impl Jitter {
@@ -116,7 +118,10 @@ impl Jitter {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x100000001b3);
         }
-        h ^= Instant::now().elapsed().as_nanos() as u64;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        h ^= nanos.wrapping_mul(0x9E3779B97F4A7C15);
         Jitter(h.max(1))
     }
 
@@ -291,19 +296,34 @@ async fn vote_round(
     (granted, behind)
 }
 
-/// Campaigns to lead under the next epoch: one round of vote requests;
-/// a majority (this node's own vote counted, and recorded once the round
-/// has won) promotes this node, with the votes as its first lease, and
-/// tells the previous leader. `forced` (an operator's Promote) ignores
-/// leaders heard recently but fails if any peer says this node is
-/// behind.
+/// Campaigns to lead under the next epoch: a pre-vote round first
+/// (nothing recorded anywhere), then, when a majority would grant, the
+/// real one; a majority (this node's own vote counted, and recorded once
+/// the round has won) promotes this node, with the votes as its first
+/// lease, and tells the previous leader. `forced` (an operator's
+/// Promote) does not wait for the silence timer: the live leader fences
+/// itself and grants when the candidate holds everything it holds, and
+/// fails the campaign otherwise; nodes that heard a leader within the
+/// lease still refuse, so a forced campaign cannot overlap a live
+/// leader it cannot reach.
 pub async fn campaign(node: &Arc<Node>, forced: bool) -> Result<(u64, u64), Status> {
     let cfg = node.cluster.clone().ok_or_else(|| {
         Status::failed_precondition("this node has no peers; start it with --peer")
     })?;
+    if node.is_stopping() {
+        return Err(Status::unavailable("shutting down"));
+    }
     let _serial = node.transitions.lock().await;
-    if !matches!(node.role(), Role::Replica | Role::Candidate) {
-        return Err(node.refuse(format!("{:?}: not a replica or candidate", node.role())));
+    if node.is_stopping() {
+        return Err(Status::unavailable("shutting down"));
+    }
+    if !matches!(node.role(), Role::Replica | Role::Candidate | Role::Fenced) {
+        return Err(node.refuse(format!("{:?}: already leading", node.role())));
+    }
+    // Re-checked under the lock: a vote granted while this task waited
+    // for it is a promise this node must keep.
+    if !forced && let Some((addr, e)) = node.heard_leader() {
+        return Err(node.refuse(format!("heard {addr} (epoch {e}) within the lease")));
     }
     let epoch = node.floor_epoch() + 1;
     let data_epoch = node.data_epoch();
@@ -316,6 +336,17 @@ pub async fn campaign(node: &Arc<Node>, forced: bool) -> Result<(u64, u64), Stat
         })
         .collect();
     node.metrics.elections.inc();
+    let (granted, behind) = vote_round(node, &cfg, epoch, data_epoch, &heads, forced, true).await;
+    if forced && let Some(b) = behind {
+        return Err(node.refuse(format!("not up to date: {b}")));
+    }
+    if granted + 1 < cfg.quorum() {
+        return Err(node.refuse(format!(
+            "pre-vote at epoch {epoch}: {} of {} needed",
+            granted + 1,
+            cfg.quorum()
+        )));
+    }
     let t0 = Instant::now();
     let (granted, behind) = vote_round(node, &cfg, epoch, data_epoch, &heads, forced, false).await;
     if forced && let Some(b) = behind {
@@ -388,7 +419,14 @@ pub async fn handle_heartbeat(
     if node.partitioned_from(&req.leader_addr) {
         return Err(Status::unavailable("partitioned (test)"));
     }
+    if node.is_stopping() {
+        return Err(Status::unavailable("shutting down"));
+    }
     let _serial = node.transitions.lock().await;
+    if node.is_stopping() {
+        return Err(Status::unavailable("shutting down"));
+    }
+    let ttl = Duration::from_millis(req.lease_ttl_ms);
     let own = node.data_epoch();
     let answer = |ok: bool, node: &Node| pb::HeartbeatResponse {
         ok,
@@ -402,8 +440,9 @@ pub async fn handle_heartbeat(
     match node.role() {
         Role::Leader => {
             if req.epoch == own {
-                // Two leaders at one epoch cannot both have a majority;
-                // the other one learns our epoch and fences itself.
+                // Two leaders at one epoch cannot both hold a majority:
+                // one of them is on a stale lease and refuses writes by
+                // itself; refusing the ack keeps ours from extending.
                 return Ok(answer(false, node));
             }
             let n = node.clone();
@@ -412,14 +451,14 @@ pub async fn handle_heartbeat(
                 .await
                 .map_err(|e| Status::internal(format!("fence task: {e}")))??;
             node.metrics.leader_changes.inc();
-            node.record_heard(&req.leader_addr, req.epoch);
+            node.record_heard(&req.leader_addr, req.epoch, ttl);
             follow(node, &req.leader_addr).await?;
         }
         Role::Replica if node.leader_addr().as_deref() == Some(req.leader_addr.as_str()) => {
-            node.record_heard(&req.leader_addr, req.epoch);
+            node.record_heard(&req.leader_addr, req.epoch, ttl);
         }
         Role::Replica | Role::Candidate | Role::Fenced => {
-            node.record_heard(&req.leader_addr, req.epoch);
+            node.record_heard(&req.leader_addr, req.epoch, ttl);
             follow(node, &req.leader_addr).await?;
         }
     }
@@ -428,10 +467,15 @@ pub async fn handle_heartbeat(
 
 /// A peer's request for a vote. Granted when the epoch is new, this node
 /// has not voted for another at that epoch, the candidate is at least as
-/// up to date (epoch, then every database's head) and, unless `forced`,
-/// no leader was heard within the lease. A leader asked by force checks
-/// the candidate first, then fences itself and grants. A pre-vote
-/// answers without recording anything.
+/// up to date and no leader was heard within the lease. Up to date means:
+/// a newer epoch; or the same epoch and a head at least ours on every
+/// database this node has; when each is ahead on some database (pullers
+/// of different databases progress independently) the larger total,
+/// then the lower address, wins, so an election always ends. A leader
+/// asked by force (an operator's Promote) checks the candidate first,
+/// then fences itself and grants; every other node applies the recency
+/// rule to a forced request too. A pre-vote answers without recording
+/// anything.
 pub async fn handle_vote(
     node: &Arc<Node>,
     req: pb::RequestVoteRequest,
@@ -444,7 +488,13 @@ pub async fn handle_vote(
     if node.partitioned_from(&req.candidate_addr) {
         return Err(Status::unavailable("partitioned (test)"));
     }
+    if node.is_stopping() {
+        return Err(Status::unavailable("shutting down"));
+    }
     let _serial = node.transitions.lock().await;
+    if node.is_stopping() {
+        return Err(Status::unavailable("shutting down"));
+    }
     let own = node.data_epoch();
     let floor = node.floor_epoch();
     let refuse = |reason: String| {
@@ -458,7 +508,8 @@ pub async fn handle_vote(
         return refuse(format!("stale: this node has promised epoch {floor}"));
     }
     if let Some((e, who)) = node.lease().voted
-        && (e > req.epoch || (e == req.epoch && who != req.candidate_addr))
+        && e == req.epoch
+        && who != req.candidate_addr
     {
         return refuse(format!("already voted for {who} at epoch {e}"));
     }
@@ -468,21 +519,10 @@ pub async fn handle_vote(
             req.last_epoch
         ));
     }
-    if req.last_epoch == own {
-        for d in node.databases() {
-            let theirs = req
-                .databases
-                .iter()
-                .find(|h| h.name == d.name)
-                .map_or(0, |h| h.head);
-            let ours = d.db.head();
-            if theirs < ours {
-                return refuse(format!(
-                    "behind: {} is at {theirs} on the candidate, {ours} here",
-                    d.name
-                ));
-            }
-        }
+    if req.last_epoch == own
+        && let Some(reason) = behind(node, &cfg_advertise(node), &req)
+    {
+        return refuse(reason);
     }
     #[cfg(feature = "test-util")]
     let check_recency = !node
@@ -490,8 +530,12 @@ pub async fn handle_vote(
         .load(std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "test-util"))]
     let check_recency = true;
-    if !req.forced && check_recency {
-        if node.role() == Role::Leader {
+    let is_leader = node.role() == Role::Leader;
+    // A forced request is exempt from recency only on the leader itself,
+    // which fences before granting; every other node keeps its promise
+    // to a leader it heard within the lease.
+    if check_recency && !(req.forced && is_leader) {
+        if is_leader {
             if node.lease_held() {
                 return refuse("leading with a live lease".into());
             }
@@ -523,7 +567,11 @@ pub async fn handle_vote(
     tokio::task::spawn_blocking(move || n.record_vote(e, &who))
         .await
         .map_err(|e| Status::internal(format!("vote task: {e}")))??;
-    node.record_heard(&req.candidate_addr, req.epoch);
+    let ttl = node
+        .cluster
+        .as_ref()
+        .map_or(Duration::ZERO, |c| c.lease_ttl);
+    node.record_heard(&req.candidate_addr, req.epoch, ttl);
     tracing::info!(candidate = %req.candidate_addr, epoch = req.epoch, forced = req.forced, "vote granted");
     Ok(pb::RequestVoteResponse {
         granted: true,
@@ -532,14 +580,60 @@ pub async fn handle_vote(
     })
 }
 
-/// Who leads, as this node knows it.
+fn cfg_advertise(node: &Node) -> String {
+    node.cluster
+        .as_ref()
+        .map_or_else(String::new, |c| c.advertise.clone())
+}
+
+/// Why the candidate is behind this node at the same epoch, if it is:
+/// a head below ours on any database this node has, unless the
+/// candidate is ahead on another and wins the tie (larger total, then
+/// the lower address).
+fn behind(node: &Node, own_addr: &str, req: &pb::RequestVoteRequest) -> Option<String> {
+    let mut ours_ahead: Vec<String> = Vec::new();
+    let mut theirs_ahead = false;
+    let (mut sum_ours, mut sum_theirs) = (0u64, 0u64);
+    for d in node.databases() {
+        let theirs = req
+            .databases
+            .iter()
+            .find(|h| h.name == d.name)
+            .map_or(0, |h| h.head);
+        let ours = d.db.head();
+        sum_ours += ours;
+        sum_theirs += theirs;
+        if theirs < ours {
+            ours_ahead.push(format!(
+                "{} is at {theirs} on the candidate, {ours} here",
+                d.name
+            ));
+        } else if theirs > ours {
+            theirs_ahead = true;
+        }
+    }
+    if ours_ahead.is_empty() {
+        return None;
+    }
+    if theirs_ahead
+        && (sum_theirs > sum_ours
+            || (sum_theirs == sum_ours && req.candidate_addr.as_str() < own_addr))
+    {
+        tracing::warn!(candidate = %req.candidate_addr, "each side is ahead on some database; the candidate wins the tie and what this node holds beyond it will be cut back");
+        return None;
+    }
+    Some(format!("behind: {}", ours_ahead.join("; ")))
+}
+
+/// Who leads, as this node knows it: itself with a live lease, or the
+/// leader heard within the lease (a manual replica names its upstream).
 pub fn discover(node: &Node) -> pb::DiscoverResponse {
     let role = node.role();
     let leader_addr = match role {
         Role::Leader if node.lease_held() => Some(node.advertise()),
         Role::Leader => None,
-        Role::Replica => node.leader_addr(),
-        Role::Candidate | Role::Fenced => node.heard_leader().map(|(a, _)| a),
+        Role::Replica if node.cluster.is_none() => node.leader_addr(),
+        Role::Replica | Role::Candidate | Role::Fenced => node.heard_leader().map(|(a, _)| a),
     };
     pb::DiscoverResponse {
         leader_addr,

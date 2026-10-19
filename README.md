@@ -226,10 +226,11 @@ bound to one database: `ClientConfig.database`, or
 connection.
 Errors are typed: `Conflict`, `Fenced { epoch }`, `PositionOutOfRange
 { position, head }`, `BelowFloor { position, floor }`, `Unauthenticated`,
-`PermissionDenied`, `ResourceExhausted`, `Unavailable`. `ClientConfig`
-takes the TLS settings (`ca_pem`, an `Identity`, `domain`; only for
-`https://`), `token`, `admin_token`, `connect_timeout`, `request_timeout`
-and `max_message_bytes`. Code written against an embedded `chron::Db`
+`PermissionDenied`, `ResourceExhausted`, `Unavailable`, `NoLeader`.
+`ClientConfig` takes the TLS settings (`ca_pem`, an `Identity`,
+`domain`; only for `https://`), `token`, `admin_token`,
+`connect_timeout`, `request_timeout`, `max_message_bytes` and, for
+`connect_any`, `failover_timeout`. Code written against an embedded `chron::Db`
 moves to a daemon by swapping the handle; `examples/bank` does exactly
 that behind a small `Store` trait.
 
@@ -346,7 +347,10 @@ curl -sN 'localhost:8080/v1/db/default/tail?from=0' -H 'authorization: Bearer S'
 ```
 
 Reads return `{"events":[..],"next":POSITION|null}`; `limit` is at most
-4096 and defaults to 256; `next` is `null` once the log is exhausted.
+4096 (0 asks for that) and defaults to 256; `next` is where the next
+page starts, and an empty page (`next` null) means the read is
+exhausted. A binary tag is read with `tag_base64=` (the path's
+tag is then `-`) and tailed with `tail?tag_base64=`.
 Binary payloads, metadata and tags come back as `payload_base64` and
 friends, and may be sent that way. `tail` is server-sent events: one
 `data:` line of JSON per event, a `: heartbeat` comment every 15 s, and
@@ -354,15 +358,19 @@ a final `event: error` when the database is dropped, the node fenced or
 the daemon stops. Errors are `{"error","code",...}` with the gRPC code's
 name (`FailedPrecondition`, `OutOfRange`, …) and the same metadata as
 the gRPC call (`actual_length`, `aggregate`, `epoch`, `position`,
-`head`, `floor`), as HTTP 400, 401, 403, 404, 409 (a failed expectation
-or an existing database), 413, 416, 503 or 500.
+`head`, `floor`), as HTTP 400, 401, 403, 404, 405, 409 (a failed
+expectation, a write the node's role or epoch refused, or an existing
+database; `reason` says `expectation` or `epoch`), 413, 416, 503 or
+500.
 
 The gateway shares the daemon's tokens and TLS: with `--token` every
 `/v1` route needs `authorization: Bearer <token>`, the admin routes the
 admin token, and with `--tls-cert` the gateway is HTTPS (a client CA is
-enforced there too). Bodies are bounded by `--max-message-bytes`,
-a response's head by `--request-timeout` (408; a `tail` stream keeps
-running once it has started), and
+enforced there too). Bodies are bounded by `--max-message-bytes` (a
+third more, since JSON carries binary as base64), a response's head by
+`--request-timeout` (a bodiless 408 whose outcome is unknown: a commit
+may still land, so check before resending; a `tail` stream keeps running
+once it has started), and
 `chron_http_requests_total{route,status}` counts the calls. Off by
 default; on a non-loopback address without a token or TLS the daemon
 warns.
@@ -480,9 +488,10 @@ record before it is gone; the leader accepts it without that check.
 
 ### Automatic failover
 
-Three or more daemons started with each other as `--peer`s form a
-**failover group** that elects its own leader and replaces it when it
-dies, with no coordinator process. Such a node never starts as a
+Daemons started with each other as `--peer`s form a **failover group**
+that elects its own leader and replaces it when it dies, with no
+coordinator process; three is the useful minimum (two need each other
+for every majority). Such a node never starts as a
 leader: it starts as a **candidate** (writes refused), follows the first
 leader it hears, and campaigns when it has heard none for a lease.
 Peers are reached with the replication credentials (`--replicate-token`,
@@ -496,19 +505,29 @@ The leader keeps a **majority lease**: every third of `--lease-ttl`
 before the round. When the lease expires, because the majority is
 unreachable, writes are refused at once ("the leader's majority lease
 has expired") and the node steps down to candidate. A follower that
-hears no leader for a ttl, plus a random tenth to half of it, asks every
-peer for a vote under the next epoch; a vote is granted when the epoch
-is new, the voter has not voted for another node in it, the candidate is
-at least as up to date (epoch first, then every database's head) and no
-leader was heard within the last ttl. Any two majorities share a node,
-and that node's silence lasted a full ttl after it last acknowledged the
-old leader, so the old lease has expired before the new leader is
-elected; the votes are the new leader's first lease. Votes are kept in a
-`vote` marker, so a restart never votes twice in one epoch. A leader
-that hears a newer epoch, from a heartbeat answer or another leader's
-heartbeat, fences itself and then follows that leader; one that falls
-behind a majority's promises resolves it the same way, by a re-election
-at a higher epoch.
+hears no leader for a ttl, plus a tenth to a half of it drawn per node,
+first asks every peer whether it would vote for it (a pre-vote, which
+records nothing anywhere) and, when a majority would, asks for the
+votes under the next epoch; a vote is granted when the epoch is new, the
+voter has not voted for another node in it, the candidate is at least as
+up to date and no leader was heard within the last ttl. Up to date means
+a newer epoch, or the same epoch and a head at least the voter's on every
+database; when each side is ahead on some database (pullers progress
+independently) the larger total, then the lower address, wins, so an
+election always ends. Any two majorities share a node, and that node's
+silence lasted a full ttl after it last acknowledged the old leader, so
+the old lease has expired before the new leader is elected; the votes
+are the new leader's first lease. A follower waits out the longer of its
+own ttl and the one its leader announces, so mismatched settings err on
+the slow side. Votes are kept in a `vote` marker, so a restart never
+votes twice in one epoch (a marker it cannot read stops the start). A
+leader that hears a newer epoch, from a heartbeat answer or another
+leader's heartbeat, fences itself and then follows that leader; a fenced
+node that hears nobody for a lease campaigns like a candidate; a node
+that falls behind a majority's promises resolves it the same way, by a
+re-election at a higher epoch. With peers a writer's epoch token cannot
+fence the leader: an epoch above the leader's is refused like any wrong
+one.
 
 A leader acknowledges a write once it is on its own disk, not once a
 peer has it, so writes acknowledged by a dead leader after the last
@@ -516,8 +535,8 @@ transaction its successor had pulled are **lost**: the replication lag
 at the moment of death (`chron_replication_lag_events` on the followers
 measures the exposure; the most up-to-date follower is the one elected).
 A leader cut off rather than dead adds up to one lease of writes to
-that, plus one commit that passed the lease check an instant before it
-expired. Writes acknowledged by the leader that replaces it are never
+that, plus the commits that had passed the lease check an instant before
+it expired. Writes acknowledged by the leader that replaces it are never
 lost. An old leader that took such writes comes back as a replica
 whose history parts from the leader's: it finds the shared prefix by
 comparing stored record fingerprints (`Fingerprints`), writes the tail
@@ -526,18 +545,28 @@ database directory (restore it offline to read what was lost), cuts
 back to the prefix (`Db::truncate_to`) and pulls from there; its live
 subscriptions end with "cut back", since positions from the cut are
 rewritten. Without peers (`--replicate-from`) a diverged replica is
-still refused and left to the operator. `chron promote` on a group node is a *forced* campaign: the
-current leader fences itself and grants the vote, but only to a node
-whose heads match its own, so promote a lagging node and it is refused
-("not up to date"). `chrond --promote` with peers campaigns at start.
+still refused and left to the operator. `chron promote` on a group node
+is a *forced* campaign: it skips the silence timer, and the live leader
+fences itself and grants the vote, but only to a node whose heads match
+its own, so promote a lagging node and it is refused ("not up to date")
+at the pre-vote, with nothing recorded anywhere. Every other node keeps
+the recency rule for a forced request, so a node that cannot reach the
+live leader cannot be promoted over it. `chrond --promote` with peers
+campaigns at start.
 
 Clients find the leader with `Discover`, which any node answers:
 `Client::connect_any(["http://a:4242", "http://b:4242"], config)` asks
-each seed in turn and connects to the leader it names; a commit refused
-as not-the-leader, or failing to reach it, looks for the leader again
-and is retried (`failover_retries`, 3). Reads are not redirected. The
-CLI takes the same list in `--addr`, and `chron discover` prints what a
-node knows. `chron info` and `chron status` show the leader, the lease
+each seed in turn, uses a seed that leads itself and otherwise connects
+to the node it names once that node confirms it leads. A commit the
+node refused as not the leader was never written and is sent again to
+the leader found next; one that failed because the connection broke
+may have landed, so it is sent again only when every append names an
+aggregate with an exact or `new` expectation (a second landing is then
+a conflict, possibly reporting the caller's own write), and otherwise
+returned to the caller; the search goes on for `failover_timeout`
+(30 s), long enough for an election. Reads are not redirected. The CLI
+takes the same list in `--addr` (one scheme for all), and `chron
+discover` asks every listed node and prints a line each. `chron info` and `chron status` show the leader, the lease
 left, the peers and the last vote; `status` is degraded on a candidate
 or an expired lease. The metrics are `chron_role{role="candidate"}`,
 `chron_lease_remaining_seconds`, `chron_leader_known`,
@@ -561,8 +590,12 @@ or an expired lease. The metrics are `chron_role{role="candidate"}`,
   once a majority holds the write) and more than one leader at a time
   (sharding) are not in this version.
 - Failover relies on each node's monotonic clock advancing at the same
-  rate; a stalled process (a long pause, a suspended VM) past the lease
-  can accept one more write than the group has agreed to.
+  rate and while the process is running. A machine suspended and resumed
+  keeps the lease it held, since the clock did not advance meanwhile,
+  and can accept writes until that lease runs out by its own clock while
+  the others have elected a new leader: do not suspend a leader's host.
+  A stalled process (a long pause) past the lease can land the commits
+  that had passed the lease check before it.
 
 ## Development
 

@@ -420,7 +420,7 @@ impl Chron for ChronService {
         self.node.require_admin(req.metadata())?;
         match self.node.role() {
             Role::Leader => return Err(self.node.refuse("already the leader")),
-            Role::Fenced => {
+            Role::Fenced if self.node.cluster.is_none() => {
                 return Err(self
                     .node
                     .refuse("fenced; restart it with --replicate-from the new leader"));
@@ -428,7 +428,7 @@ impl Chron for ChronService {
             Role::Candidate if self.node.cluster.is_none() => {
                 return Err(self.node.refuse("not a replica"));
             }
-            Role::Replica | Role::Candidate => {}
+            Role::Replica | Role::Candidate | Role::Fenced => {}
         }
         // Its own task: a client that gives up mid-way must not leave the
         // puller stopped and the role unchanged.

@@ -59,7 +59,18 @@ pub struct Unreachable {
 
 impl std::fmt::Display for Unreachable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "cannot reach chrond at {}: {}", self.addr, self.source)
+        match &self.source {
+            ClientError::NoLeader(notes) => write!(f, "no leader among {}: {notes}", self.addr),
+            source => {
+                write!(f, "cannot reach chrond at {}: {source}", self.addr)?;
+                let mut cause = std::error::Error::source(source);
+                while let Some(c) = cause {
+                    write!(f, ": {c}")?;
+                    cause = c.source();
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -83,7 +94,18 @@ impl Conn {
     }
 
     pub fn config(&self) -> anyhow::Result<ClientConfig> {
-        let tls = if self.addr.starts_with("https://") {
+        let addrs = self.addrs();
+        if addrs.is_empty() {
+            return Err(Usage("--addr names no address".into()).into());
+        }
+        let https = addrs.iter().filter(|a| a.starts_with("https://")).count();
+        if https != 0 && https != addrs.len() {
+            return Err(Usage(
+                "--addr mixes http:// and https:// addresses; one scheme for the whole list".into(),
+            )
+            .into());
+        }
+        let tls = if https == addrs.len() {
             Some(TlsConfig {
                 ca_pem: self.tls_ca.as_ref().map(|p| read(p, "CA")).transpose()?,
                 identity: match (&self.tls_cert, &self.tls_key) {
@@ -122,4 +144,17 @@ pub async fn connect(conn: &Conn) -> anyhow::Result<Client> {
             source,
         })
     })
+}
+
+/// A plain connection to one address of the list, for commands that ask
+/// every node (`discover`).
+pub async fn connect_one(conn: &Conn, addr: &str) -> anyhow::Result<Client> {
+    Client::connect(addr.to_string(), conn.config()?)
+        .await
+        .map_err(|source| {
+            anyhow::Error::new(Unreachable {
+                addr: addr.to_string(),
+                source,
+            })
+        })
 }

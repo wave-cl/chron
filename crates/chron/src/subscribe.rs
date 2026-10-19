@@ -41,6 +41,8 @@ pub struct Subscription {
     /// Set once a position below the floor was asked for: nothing more can
     /// be delivered in order.
     ended: bool,
+    /// The highest head seen: a lower one later means a cut.
+    head_seen: u64,
     #[cfg(feature = "tokio")]
     head_rx: tokio::sync::watch::Receiver<u64>,
 }
@@ -64,6 +66,7 @@ impl Subscription {
             buffer: VecDeque::new(),
             batch: DEFAULT_BATCH,
             ended: false,
+            head_seen: 0,
             #[cfg(feature = "tokio")]
             head_rx,
         }
@@ -158,6 +161,19 @@ impl Subscription {
             }
         }
         let head = self.db.head();
+        if head < self.head_seen && self.cursor > head {
+            // The database was cut back (`Db::truncate_to`) below what this
+            // subscription delivered: what comes next at those positions is
+            // other records.
+            self.ended = true;
+            return Err(crate::Error::Inconsistent {
+                position: self.cursor,
+                reason: format!(
+                    "the database was cut back to {head}, below this subscription; subscribe again"
+                ),
+            });
+        }
+        self.head_seen = self.head_seen.max(head);
         if self.cursor >= head {
             return Ok(());
         }

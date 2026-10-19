@@ -54,7 +54,9 @@ The leader died:
 1. Nothing to do: within one to two leases the surviving pair elects the
    more up-to-date one; `chron_leader_changes_total` rises on it,
    `chron --addr $B,$C discover` names it. Writers using `connect_any`
-   retry on their own; others repoint.
+   retry on their own for `failover_timeout` (30 s) under the rule the
+   README states (a commit that may have landed is resent only with an
+   exact or `new` expectation); others repoint.
 2. Writes the dead leader acknowledged after the last transaction the
    new leader had pulled are lost: the replication lag at that moment
    (`chron_replication_lag_events`; `chron-load --kill-leader-every`

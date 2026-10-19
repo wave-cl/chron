@@ -43,7 +43,7 @@ fn truncate_drops_the_tail_and_the_database_goes_on() {
         indices(&db.read_aggregate(agg(1), 0, 0).unwrap()),
         (0..10).collect::<Vec<_>>()
     );
-    assert!(db.read_all(10, 0).unwrap().is_empty() || db.read_all(10, 0).is_err());
+    assert!(db.read_all(10, 0).unwrap().is_empty());
     let c = {
         let mut t = db.transaction();
         t.append_one(agg(1), Expected::Exact(10), ev("new"));
@@ -107,4 +107,59 @@ fn truncate_at_a_segment_base_leaves_an_empty_tail_segment() {
     );
     assert_eq!(db.head(), base + 1);
     assert_eq!(payloads(&db.read_all(base, 0).unwrap()), ["after"]);
+}
+
+#[test]
+fn a_cut_inside_the_tail_segment_removes_no_file_and_an_aggregate_can_vanish() {
+    let d = tmp();
+    let db = open_with(d.path(), opts());
+    fill(&db, agg(1), 4);
+    fill(&db, agg(2), 3);
+    assert_eq!(segments(d.path()).len(), 1);
+    let r = db.truncate_to(4).unwrap();
+    assert_eq!((r.head, r.removed, r.segments_removed), (4, 3, 0));
+    assert_eq!(db.aggregate_len(agg(2)).unwrap(), 0, "wholly cut");
+    assert_eq!(db.aggregate_len(agg(1)).unwrap(), 4);
+    assert!(db.read_aggregate(agg(2), 0, 0).unwrap().is_empty());
+    assert!(db.read_all(4, 0).unwrap().is_empty());
+    fill(&db, agg(2), 2);
+    assert_eq!(db.aggregate_len(agg(2)).unwrap(), 2);
+    assert_eq!(indices(&db.read_aggregate(agg(2), 0, 0).unwrap()), [0, 1]);
+    drop(db);
+    let db = open_with(d.path(), opts().verify_all_segments(true));
+    assert_eq!(db.head(), 6);
+    assert_eq!(db.aggregate_len(agg(2)).unwrap(), 2);
+}
+
+#[test]
+fn a_cut_at_a_floor_above_zero_and_a_subscription_across_a_cut() {
+    let d = tmp();
+    let db = open_with(d.path(), opts().segment_max_bytes(300));
+    fill(&db, agg(1), 40);
+    let r = db.retain_from(20).unwrap();
+    assert!(r.floor > 0);
+    let floor = r.floor;
+    // A subscription that has seen the tail notices the cut.
+    let mut sub = db.subscribe(floor);
+    let seen: Vec<_> = (0..(40 - floor))
+        .map(|_| sub.next().unwrap().unwrap())
+        .collect();
+    assert_eq!(seen.last().unwrap().position, 39);
+    let r = db.truncate_to(floor).unwrap();
+    assert_eq!((r.head, db.floor()), (floor, floor));
+    let err = sub.next_timeout(std::time::Duration::from_millis(50));
+    assert!(
+        matches!(err, Err(Error::Inconsistent { .. })),
+        "a subscription across the cut: {err:?}"
+    );
+    fill(&db, agg(1), 2);
+    assert_eq!(db.aggregate_len(agg(1)).unwrap(), floor + 2);
+    // The subscription keeps the database open; both go before the reopen.
+    drop(sub);
+    drop(db);
+    let db = open_with(
+        d.path(),
+        opts().segment_max_bytes(300).verify_all_segments(true),
+    );
+    assert_eq!((db.head(), db.floor()), (floor + 2, floor));
 }

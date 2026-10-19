@@ -121,6 +121,17 @@ impl ClusterConfig {
     }
 }
 
+/// The last leader (or candidate) a follower accepted: when, who, at
+/// which epoch, and the lease ttl the sender runs with, so a peer with a
+/// longer lease is waited for that long.
+#[derive(Debug, Clone)]
+pub struct Heard {
+    pub at: Instant,
+    pub addr: String,
+    pub epoch: u64,
+    pub ttl: Duration,
+}
+
 /// What a node knows about leadership in time: its own lease as a leader,
 /// the last leader it heard as a follower, and the vote it gave.
 #[derive(Debug, Clone, Default)]
@@ -128,9 +139,8 @@ pub struct Lease {
     /// A leader: until when a majority acknowledged it. Writes are refused
     /// past it.
     pub held_until: Option<Instant>,
-    /// A follower: the last heartbeat or vote it accepted (when, whose
-    /// address, which epoch).
-    pub heard: Option<(Instant, String, u64)>,
+    /// A follower: the last heartbeat or vote it accepted.
+    pub heard: Option<Heard>,
     /// The vote given: epoch and candidate. Persisted in [`VOTE_MARKER`].
     pub voted: Option<(u64, String)>,
     /// The highest epoch a peer has answered with: a campaign starts
@@ -148,7 +158,8 @@ pub struct DbNode {
     /// a child of the daemon's token); its streams end then.
     pub cancel: CancellationToken,
     /// The position the database was last cut back to (a diverged copy
-    /// resetting itself); live streams past it end when it changes.
+    /// resetting itself); every live stream on the database ends when it
+    /// changes, since positions from there on are rewritten.
     pub reset: watch::Sender<Option<u64>>,
 }
 
@@ -211,6 +222,9 @@ pub struct Node {
     /// Serialises role transitions driven by heartbeats and elections.
     pub transitions: tokio::sync::Mutex<()>,
     pub cluster_task: Mutex<Option<JoinHandle<()>>>,
+    /// Set first thing in shutdown: cluster calls are refused and no
+    /// transition starts after it.
+    pub stopping: std::sync::atomic::AtomicBool,
     /// Peers this node neither calls nor answers (a simulated partition).
     #[cfg(feature = "test-util")]
     pub partition: Mutex<HashSet<String>>,
@@ -265,6 +279,7 @@ impl Node {
             advertise: std::sync::OnceLock::new(),
             transitions: tokio::sync::Mutex::new(()),
             cluster_task: Mutex::new(None),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-util")]
             partition: Mutex::new(HashSet::new()),
             #[cfg(feature = "test-util")]
@@ -353,11 +368,35 @@ impl Node {
         }
     }
 
-    /// The leader last heard, if it was heard within the lease ttl.
+    /// The ttl this node waits out before it treats a leader as gone:
+    /// its own, or the longer one the last leader heard runs with.
+    pub fn silence_ttl(&self) -> Duration {
+        let own = self
+            .cluster
+            .as_ref()
+            .map_or(Duration::ZERO, |c| c.lease_ttl);
+        self.lease().heard.map_or(own, |h| h.ttl.max(own))
+    }
+
+    /// When the last leader (or candidate) was heard, for the silence
+    /// timer.
+    pub fn heard_at(&self) -> Option<Instant> {
+        self.lease().heard.map(|h| h.at)
+    }
+
+    /// The leader last heard, if it was heard within the lease ttl (its
+    /// own ttl when longer than ours).
     pub fn heard_leader(&self) -> Option<(String, u64)> {
-        let ttl = self.cluster.as_ref()?.lease_ttl;
-        let (at, addr, epoch) = self.lease().heard?;
-        (at.elapsed() < ttl).then_some((addr, epoch))
+        self.cluster.as_ref()?;
+        let ttl = self.silence_ttl();
+        let h = self.lease().heard?;
+        (h.at.elapsed() < ttl).then_some((h.addr, h.epoch))
+    }
+
+    /// Whether this daemon is shutting down: cluster calls and
+    /// transitions are refused.
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The epoch this node has promised itself to: the highest of its
@@ -369,7 +408,7 @@ impl Node {
         let l = self.lease();
         self.data_epoch()
             .max(l.voted.map_or(0, |(e, _)| e))
-            .max(l.heard.map_or(0, |(_, _, e)| e))
+            .max(l.heard.map_or(0, |h| h.epoch))
             .max(self.fenced_by().unwrap_or(0))
             .max(l.seen)
     }
@@ -379,14 +418,26 @@ impl Node {
         self.with_lease(|l| l.seen = l.seen.max(epoch));
     }
 
-    /// Records a heartbeat (or a vote given) from `addr` at `epoch`: the
-    /// follower's recency clock starts now.
-    pub fn record_heard(&self, addr: &str, epoch: u64) {
-        self.with_lease(|l| l.heard = Some((Instant::now(), addr.to_string(), epoch)));
+    /// Records a heartbeat (or a vote given) from `addr` at `epoch`, whose
+    /// sender runs a lease of `ttl`: the follower's recency clock starts
+    /// now.
+    pub fn record_heard(&self, addr: &str, epoch: u64, ttl: Duration) {
+        self.with_lease(|l| {
+            l.heard = Some(Heard {
+                at: Instant::now(),
+                addr: addr.to_string(),
+                epoch,
+                ttl,
+            })
+        });
     }
 
-    /// Extends the lease to `until` (never shortens it).
+    /// Extends the lease to `until` (never shortens it); only a leader
+    /// has one, so a round that ends after a step-down extends nothing.
     pub fn extend_lease(&self, until: Instant) {
+        if self.role() != Role::Leader {
+            return;
+        }
         self.with_lease(|l| {
             if l.held_until.is_none_or(|u| u < until) {
                 l.held_until = Some(until);
@@ -714,7 +765,10 @@ impl Node {
                     format!("stale epoch {e}; the leader is at epoch {ours}; refresh it from Info"),
                 ));
             }
-            if e == ours + 1 {
+            // Without peers a writer's epoch token is how a promotion
+            // reaches an old leader; with peers elections do that, and a
+            // client must not be able to unseat the leader.
+            if e == ours + 1 && self.cluster.is_none() {
                 drop(gate);
                 self.fence(e)?;
                 return Err(self.refuse_at(

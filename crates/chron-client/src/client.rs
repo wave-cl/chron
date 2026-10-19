@@ -1,6 +1,7 @@
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chron::{BackupMeta, Committed, Event, Expected, NewEvent, Retained, Uuid};
@@ -64,10 +65,12 @@ pub struct ClientConfig {
     /// The database every call goes to (`chron-db` metadata); `None` is
     /// the daemon's `default`. [`Client::database`] rebinds a client.
     pub database: Option<String>,
-    /// For a client made by [`Client::connect_any`]: how many times a
-    /// commit refused as not-the-leader, or failing to reach the daemon,
-    /// looks for the leader again and retries.
-    pub failover_retries: u32,
+    /// For a client made by [`Client::connect_any`]: how long a commit
+    /// keeps looking for the leader and retrying after the node refused
+    /// it as not the leader, or could not be reached. An election takes
+    /// one to two lease ttls (10 s each by default), so the default is
+    /// 30 s. See [`Client::commit`] for which failures are retried.
+    pub failover_timeout: Duration,
 }
 
 impl Default for ClientConfig {
@@ -80,7 +83,7 @@ impl Default for ClientConfig {
             request_timeout: None,
             max_message_bytes: 64 * 1024 * 1024,
             database: None,
-            failover_retries: 3,
+            failover_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -92,7 +95,8 @@ pub enum Role {
     Leader,
     /// Follows a leader; read-only.
     Replica,
-    /// A newer leader exists; refuses writes until restarted as a replica.
+    /// A newer leader exists; refuses writes until it follows that
+    /// leader (with peers, by itself) or is restarted as a replica.
     Fenced,
     /// With peers: no leader known and no lease held; refuses writes until
     /// one is heard or elected.
@@ -178,7 +182,8 @@ pub struct Info {
     pub last_replication_error: Option<String>,
     /// The epoch that fenced this node, for a fenced one.
     pub fenced_by: Option<u64>,
-    /// The leader's address as the daemon knows it (its own on a leader).
+    /// The leader's address as the daemon knows it: its own on a leader
+    /// with a live lease, the one heard within the lease otherwise.
     pub leader_addr: Option<String>,
     /// On a leader with peers: how much of its majority lease is left
     /// (zero once it expired and writes are refused).
@@ -273,6 +278,10 @@ pub struct Client {
     conn: Arc<RwLock<Conn>>,
     config: ClientConfig,
     seeds: Option<Arc<Vec<String>>>,
+    /// One search for the leader at a time; the generation says whether
+    /// the connection was swapped while a caller waited for the lock.
+    discovery: Arc<tokio::sync::Mutex<()>>,
+    generation: Arc<AtomicU64>,
     token: Option<MetadataValue<Ascii>>,
     admin_token: Option<MetadataValue<Ascii>>,
     db: Option<MetadataValue<Ascii>>,
@@ -363,49 +372,96 @@ async fn open(addr: &str, config: &ClientConfig) -> Result<Channel, ClientError>
     Ok(endpoint.connect().await?)
 }
 
-/// Asks each seed in turn who leads and opens a connection to that
-/// leader; the first seed that names a reachable leader wins.
+/// An error with its causes, for a note: tonic's transport error says
+/// only "transport error" on its own.
+fn why(e: &ClientError) -> String {
+    let mut text = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(s) = source {
+        text.push_str(": ");
+        text.push_str(&s.to_string());
+        source = s.source();
+    }
+    text
+}
+
+/// Opens `addr` and asks it who leads, both bounded by the connect
+/// timeout; `Ok(None)` when it answered but names no leader.
+async fn probe(
+    addr: &str,
+    config: &ClientConfig,
+    token: &Option<MetadataValue<Ascii>>,
+) -> Result<(Channel, pb::DiscoverResponse), ClientError> {
+    let channel = open(addr, config).await?;
+    let mut probe = build(&channel, token, &None, config.max_message_bytes);
+    let d = tokio::time::timeout(
+        config.connect_timeout,
+        probe.discover(pb::DiscoverRequest {}),
+    )
+    .await
+    .map_err(|_| {
+        ClientError::Unavailable(format!(
+            "no answer to Discover within {:?}",
+            config.connect_timeout
+        ))
+    })??
+    .into_inner();
+    Ok((channel, d))
+}
+
+/// Asks each seed in turn who leads: a seed that leads itself (with a
+/// live lease) is used directly, whatever address it advertises; a
+/// seed naming another node is believed only once that node confirms
+/// it leads. Each address is asked at most once per search.
 async fn find_leader(seeds: &[String], config: &ClientConfig) -> Result<Conn, ClientError> {
     let mut notes: Vec<String> = Vec::new();
+    let mut asked: std::collections::HashSet<String> = std::collections::HashSet::new();
     let token = auth(config.token.as_deref())?;
     for seed in seeds {
-        let channel = match open(seed, config).await {
-            Ok(c) => c,
+        if !asked.insert(seed.clone()) {
+            continue;
+        }
+        let (channel, d) = match probe(seed, config, &token).await {
+            Ok(x) => x,
             Err(e) => {
-                notes.push(format!("{seed}: {e}"));
+                notes.push(format!("{seed}: {}", why(&e)));
                 continue;
             }
         };
-        let mut probe = build(&channel, &token, &None, config.max_message_bytes);
-        let d = match probe.discover(pb::DiscoverRequest {}).await {
-            Ok(d) => d.into_inner(),
-            Err(s) => {
-                notes.push(format!("{seed}: {}", ClientError::from(s)));
-                continue;
-            }
-        };
+        let role = Role::from_wire(d.role());
         let Some(leader) = d.leader_addr else {
             notes.push(format!(
-                "{seed}: {} at epoch {}, knows no leader",
-                Role::from_wire(d.role()),
+                "{seed}: {role} at epoch {}, knows no leader",
                 d.epoch
             ));
             continue;
         };
-        if leader == *seed {
+        if role == Role::Leader {
             return Ok(Conn {
-                addr: leader,
+                addr: seed.clone(),
                 channel,
             });
         }
-        match open(&leader, config).await {
-            Ok(channel) => {
+        if !asked.insert(leader.clone()) {
+            notes.push(format!("{seed} names {leader}, already asked"));
+            continue;
+        }
+        match probe(&leader, config, &token).await {
+            Ok((channel, d)) if Role::from_wire(d.role()) == Role::Leader => {
                 return Ok(Conn {
                     addr: leader,
                     channel,
                 });
             }
-            Err(e) => notes.push(format!("{seed} names {leader}, which is unreachable: {e}")),
+            Ok((_, d)) => notes.push(format!(
+                "{seed} names {leader}, which is {} at epoch {}",
+                Role::from_wire(d.role()),
+                d.epoch
+            )),
+            Err(e) => notes.push(format!(
+                "{seed} names {leader}, which is unreachable: {}",
+                why(&e)
+            )),
         }
     }
     Err(ClientError::NoLeader(notes.join("; ")))
@@ -437,11 +493,14 @@ impl Client {
 
     /// Connects to the leader of a failover group: each seed (any node
     /// of the group) is asked who leads, in order, and the first that
-    /// names a reachable leader wins. [`ClientError::NoLeader`] when none
-    /// does. Commits refused because the node no longer leads, or that
-    /// cannot reach it, look for the leader again
-    /// (`config.failover_retries` times) and are retried there; reads
-    /// are not redirected.
+    /// leads, or names a node that confirms it leads, wins.
+    /// [`ClientError::NoLeader`] when none does. Commits that fail
+    /// because the node no longer leads, or cannot be reached, look for
+    /// the leader again and are retried there for up to
+    /// `config.failover_timeout`, under the rule [`commit`](Client::commit)
+    /// states; reads are not redirected. Every seed must use one scheme
+    /// (`http://` or `https://`) and the TLS settings apply to all of
+    /// them.
     pub async fn connect_any(
         seeds: impl IntoIterator<Item = impl Into<String>>,
         config: ClientConfig,
@@ -467,6 +526,8 @@ impl Client {
             database: config.database.clone(),
             config,
             seeds,
+            discovery: Arc::new(tokio::sync::Mutex::new(())),
+            generation: Arc::new(AtomicU64::new(0)),
             token,
             admin_token,
             db,
@@ -489,18 +550,25 @@ impl Client {
     }
 
     /// Looks for the leader again among the seeds and switches every
-    /// clone of this client to it. Only for a client made by
-    /// [`connect_any`](Client::connect_any); others fail with
-    /// [`ClientError::NoLeader`].
+    /// clone of this client to it. One search runs at a time: a caller
+    /// that waited for another's search takes its result. Only for a
+    /// client made by [`connect_any`](Client::connect_any); others fail
+    /// with [`ClientError::InvalidArgument`].
     pub async fn rediscover(&self) -> Result<String, ClientError> {
         let Some(seeds) = &self.seeds else {
-            return Err(ClientError::NoLeader(
+            return Err(ClientError::InvalidArgument(
                 "this client was not made by connect_any".into(),
             ));
         };
+        let before = self.generation.load(Ordering::Acquire);
+        let _one = self.discovery.lock().await;
+        if self.generation.load(Ordering::Acquire) != before {
+            return Ok(self.addr());
+        }
         let conn = find_leader(seeds, &self.config).await?;
         let addr = conn.addr.clone();
         *self.conn.write().unwrap_or_else(|p| p.into_inner()) = conn;
+        self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(addr)
     }
 
@@ -512,21 +580,37 @@ impl Client {
             .clone()
     }
 
-    /// Whether a failed commit is worth looking for the leader again.
-    fn worth_a_failover(&self, e: &ClientError) -> bool {
-        self.seeds.is_some()
-            && matches!(
-                e,
-                ClientError::Fenced { .. }
-                    | ClientError::Unavailable(_)
-                    | ClientError::Transport(_)
-            )
+    /// Whether a failed commit may be sent again to the leader found
+    /// next without writing twice: a refusal for the node's role came
+    /// before any write; a connection failure may have come after it,
+    /// so it is retried only when every append carries an expectation
+    /// that makes a second landing a conflict. A commit with an epoch
+    /// token is the caller's own fencing and is never retried.
+    fn retryable(
+        &self,
+        e: &ClientError,
+        epoch: Option<u64>,
+        expectations: &[(Option<Uuid>, Expected)],
+    ) -> bool {
+        if self.seeds.is_none() || epoch.is_some() {
+            return false;
+        }
+        match e {
+            ClientError::Fenced { .. } => true,
+            ClientError::Unavailable(_) | ClientError::Transport(_) => {
+                expectations.iter().all(|(agg, exp)| {
+                    agg.is_some() && matches!(exp, Expected::Exact(_) | Expected::New)
+                })
+            }
+            _ => false,
+        }
     }
 
     /// The same connection bound to the database `name`: every call of
     /// the returned client carries `chron-db: name`. A name that is not
     /// valid header text makes every call fail with
-    /// [`ClientError::InvalidArgument`].
+    /// [`ClientError::InvalidArgument`]. The binding follows a leader
+    /// swap of the client it came from.
     pub fn database(&self, name: impl Into<String>) -> Client {
         let name = name.into();
         let db = db_header(Some(&name)).unwrap_or_else(|_| {
@@ -537,6 +621,8 @@ impl Client {
             conn: self.conn.clone(),
             config: self.config.clone(),
             seeds: self.seeds.clone(),
+            discovery: self.discovery.clone(),
+            generation: self.generation.clone(),
             token: self.token.clone(),
             admin_token: self.admin_token.clone(),
             db,
@@ -570,6 +656,18 @@ impl Client {
 
     /// Commits every append atomically. [`ClientError::Conflict`] when an
     /// expectation fails; nothing is written then.
+    ///
+    /// On a client made by [`connect_any`](Client::connect_any) a commit
+    /// the node refused for its role ([`ClientError::Fenced`]) was never
+    /// written and is sent again to the leader found next. One that
+    /// failed with [`ClientError::Unavailable`] or
+    /// [`ClientError::Transport`] may have landed before the connection
+    /// broke: it is sent again only when every append names an aggregate
+    /// with [`Expected::Exact`] or [`Expected::New`], where a second
+    /// landing is a [`ClientError::Conflict`] (one that may then report
+    /// the caller's own earlier write); with [`Expected::Any`] or free
+    /// events the error is returned and the caller decides. A timed-out
+    /// call is never retried.
     pub async fn commit(&self, txn: Transaction) -> Result<Committed, ClientError> {
         self.commit_inner(txn, None).await
     }
@@ -596,21 +694,36 @@ impl Client {
             .into_iter()
             .map(|a| convert::append_to_wire(a.aggregate, a.expected, a.events))
             .collect();
-        let mut attempt = 0;
-        loop {
-            match self.commit_once(&wire, epoch, &expectations).await {
-                Err(e) if attempt < self.config.failover_retries && self.worth_a_failover(&e) => {
-                    attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
-                    if let Err(again) = self.rediscover().await
-                        && attempt >= self.config.failover_retries
-                    {
-                        return Err(again);
+        let mut last = match self.commit_once(&wire, epoch, &expectations).await {
+            Err(e) if self.retryable(&e, epoch, &expectations) => e,
+            other => return other,
+        };
+        // Look for the leader until the deadline, resending only once one
+        // is found; a search that fails keeps the commit's own error.
+        let deadline = Instant::now() + self.config.failover_timeout;
+        let mut backoff = Duration::from_millis(100);
+        let mut search_failed: Option<ClientError> = None;
+        while Instant::now() < deadline {
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(1));
+            match self.rediscover().await {
+                Err(e) => search_failed = Some(e),
+                Ok(_) => {
+                    search_failed = None;
+                    match self.commit_once(&wire, epoch, &expectations).await {
+                        Err(e) if self.retryable(&e, epoch, &expectations) => last = e,
+                        other => return other,
                     }
                 }
-                other => return other,
             }
         }
+        Err(match search_failed {
+            Some(ClientError::NoLeader(notes)) => ClientError::NoLeader(format!(
+                "{last}; no leader found within {:?}: {notes}",
+                self.config.failover_timeout
+            )),
+            _ => last,
+        })
     }
 
     async fn commit_once(

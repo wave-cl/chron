@@ -198,8 +198,9 @@ pub fn exit_code(e: &anyhow::Error) -> i32 {
     {
         return 2;
     }
-    if let Some(ClientError::Unavailable(_) | ClientError::Transport(_)) =
-        e.downcast_ref::<ClientError>()
+    if let Some(
+        ClientError::Unavailable(_) | ClientError::Transport(_) | ClientError::NoLeader(_),
+    ) = e.downcast_ref::<ClientError>()
     {
         return 2;
     }

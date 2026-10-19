@@ -69,8 +69,28 @@ async fn a_commit_follows_a_failover_and_reads_do_not() {
     c.wait_heads(first + 1, SOON).await;
     c.stop(l).await;
     let l2 = c.wait_for_leader(SOON).await;
-    // The old connection is dead: the commit looks for the leader again.
-    let p = free(&client, "after").await.unwrap();
+    // The old connection is dead. A free append may have landed before
+    // the connection broke, so it is not resent: the caller decides.
+    let r = free(&client, "after").await;
+    assert!(
+        matches!(
+            r,
+            Err(ClientError::Unavailable(_) | ClientError::Transport(_))
+        ),
+        "{r:?}"
+    );
+    // An append with an exact expectation is resent to the leader found
+    // next, since a second landing would be a conflict.
+    let id = chron_client::Uuid::from_u128(9);
+    let p = client
+        .append(
+            id,
+            chron_client::Expected::Exact(0),
+            vec![NewEvent::new("after")],
+        )
+        .await
+        .unwrap()
+        .first;
     assert_eq!(p, first + 1);
     assert_eq!(client.addr(), c.addr(l2));
     assert_eq!(bound.addr(), c.addr(l2), "the binding followed the swap");

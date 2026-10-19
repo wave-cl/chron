@@ -78,28 +78,55 @@ pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Asks every address of `--addr` who leads, one line (or JSON object)
+/// per node; a node that cannot be reached is reported, not fatal. Exit
+/// 2 when none answered.
 pub async fn discover(conn: &Conn, format: Format) -> anyhow::Result<()> {
-    let d = client::connect(conn).await?.discover().await?;
-    print_value(
-        format,
-        format!(
-            "leader {}\nrole {}  epoch {}  lease_remaining {}\npeers {}",
-            d.leader_addr.as_deref().unwrap_or("none"),
-            d.role,
-            d.epoch,
-            d.lease_remaining
-                .map_or("-".to_string(), |l| format!("{} ms", l.as_millis())),
-            if d.peers.is_empty() {
-                "none".to_string()
-            } else {
-                d.peers.join(",")
+    let addrs = conn.addrs();
+    let mut reached = 0;
+    for addr in &addrs {
+        let answer = match client::connect_one(conn, addr).await {
+            Ok(c) => c.discover().await.map_err(anyhow::Error::from),
+            Err(e) => Err(e),
+        };
+        match answer {
+            Ok(d) => {
+                reached += 1;
+                print_value(
+                    format,
+                    format!(
+                        "{addr}: leader {}  role {}  epoch {}  lease_remaining {}  peers {}",
+                        d.leader_addr.as_deref().unwrap_or("none"),
+                        d.role,
+                        d.epoch,
+                        d.lease_remaining
+                            .map_or("-".to_string(), |l| format!("{} ms", l.as_millis())),
+                        if d.peers.is_empty() {
+                            "none".to_string()
+                        } else {
+                            d.peers.join(",")
+                        }
+                    ),
+                    json!({
+                        "node": addr, "leader_addr": d.leader_addr, "role": d.role.to_string(),
+                        "epoch": d.epoch, "lease_remaining_ms": d.lease_remaining.map(|l| l.as_millis() as u64),
+                        "peers": d.peers,
+                    }),
+                );
             }
-        ),
-        json!({
-            "leader_addr": d.leader_addr, "role": d.role.to_string(), "epoch": d.epoch,
-            "lease_remaining_ms": d.lease_remaining.map(|l| l.as_millis() as u64), "peers": d.peers,
-        }),
-    );
+            Err(e) => print_value(
+                format,
+                format!("{addr}: unreachable: {e}"),
+                json!({ "node": addr, "error": e.to_string() }),
+            ),
+        }
+    }
+    if reached == 0 {
+        anyhow::bail!(crate::client::Unreachable {
+            addr: conn.addr.clone(),
+            source: chron_client::ClientError::NoLeader("no node answered".into()),
+        });
+    }
     Ok(())
 }
 

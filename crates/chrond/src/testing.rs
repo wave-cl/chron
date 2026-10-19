@@ -220,8 +220,11 @@ impl Cluster {
             .expect("connect")
     }
 
-    /// Cuts node `i` off: it neither calls nor answers any other node,
-    /// and the running others neither call nor answer it.
+    /// Cuts node `i` off on the control plane: heartbeats, votes and the
+    /// other cluster calls neither leave it nor are answered by it, in
+    /// both directions. Replication streams, Fingerprints, the fencer and
+    /// clients still pass, so a leader cut off this way loses its lease
+    /// but its followers keep pulling from it until they switch.
     pub fn partition(&self, i: usize) {
         let me = self.addr(i);
         for (j, n) in self.nodes.iter().enumerate() {

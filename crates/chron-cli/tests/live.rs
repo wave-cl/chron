@@ -805,14 +805,25 @@ fn a_comma_list_of_addresses_finds_the_leader_and_discover_names_it() {
         .success()
         .stdout(predicate::str::contains("committed 0"));
     // Discover on the follower names the leader; info shows the group.
+    // Discover asks every listed node and prints one line each.
     Command::cargo_bin("chron")
         .unwrap()
-        .args(["--addr", &c.addr(f), "discover"])
+        .args([
+            "--addr",
+            &format!("{},{}", c.addr(f), c.addr(l)),
+            "discover",
+        ])
         .assert()
         .success()
         .stdout(
-            predicate::str::contains(format!("leader {}", c.addr(l)))
-                .and(predicate::str::contains("role replica")),
+            predicate::str::contains(format!("{}: leader {}", c.addr(f), c.addr(l)))
+                .and(predicate::str::contains("role replica"))
+                .and(predicate::str::contains(format!(
+                    "{}: leader {}",
+                    c.addr(l),
+                    c.addr(l)
+                )))
+                .and(predicate::str::contains("role leader")),
         );
     Command::cargo_bin("chron")
         .unwrap()
@@ -857,9 +868,16 @@ fn a_comma_list_of_addresses_finds_the_leader_and_discover_names_it() {
         .args(["--addr", &list, "head"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("1"));
-    // Cut the group apart: a candidate is degraded, and the list finds
-    // no leader (exit 2).
+        .stdout(predicate::eq("1\n"));
+    // Mixed schemes are a usage error.
+    Command::cargo_bin("chron")
+        .unwrap()
+        .args(["--addr", &format!("https://x:1,{}", c.addr(f)), "head"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("one scheme"));
+    // Stop two of three: the survivor is a degraded candidate, and the
+    // list finds no leader (exit 2).
     rt.block_on(c.stop(l));
     rt.block_on(c.stop(f));
     let third = (0..3).find(|i| *i != l && *i != f).unwrap();

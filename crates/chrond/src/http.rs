@@ -105,7 +105,8 @@ pub fn router(
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
-        .layer(DefaultBodyLimit::max(node.max_message_bytes));
+        // JSON carries binary as base64, a third larger than the wire.
+        .layer(DefaultBodyLimit::max(node.max_message_bytes / 3 * 4 + 1024));
     if let Some(t) = request_timeout {
         v1 = v1.layer(tower_http::timeout::TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -200,12 +201,19 @@ struct ReadQuery {
     from: Option<u64>,
     limit: Option<u64>,
     backward: Option<bool>,
+    /// A binary tag, base64; the path's tag is then `-`.
+    tag_base64: Option<String>,
 }
 
 async fn page(dbn: &DbNode, read: Read, q: ReadQuery) -> Result<Json<Value>> {
     let backward = q.backward.unwrap_or(false);
     let from = q.from.unwrap_or(if backward { u64::MAX } else { 0 });
-    let limit = q.limit.unwrap_or(PAGE as u64).clamp(1, MAX_LIMIT) as usize;
+    // 0 means "as many as a page holds", as the gRPC calls' 0 means all.
+    let limit = match q.limit {
+        None => PAGE as u64,
+        Some(0) => MAX_LIMIT,
+        Some(n) => n.min(MAX_LIMIT),
+    } as usize;
     let read = Arc::new(read);
     let events = ops::read_page(dbn, read.clone(), from, limit).await?;
     let next = events.last().and_then(|l| read.next_cursor(l));
@@ -283,15 +291,11 @@ async fn read_tag(
     let dbn = db(&st, &name)?;
     let Query(q) = q.map_err(bad)?;
     let backward = q.backward.unwrap_or(false);
-    page(
-        &dbn,
-        Read::Tag {
-            tag: Bytes::from(tag),
-            backward,
-        },
-        q,
-    )
-    .await
+    let tag = match &q.tag_base64 {
+        Some(b) => Bytes::from(crate::http_json::decode_base64(b, "tag_base64").map_err(ApiError)?),
+        None => Bytes::from(tag),
+    };
+    page(&dbn, Read::Tag { tag, backward }, q).await
 }
 
 async fn aggregate_len(
@@ -318,6 +322,7 @@ async fn info(State(st): State<HttpState>, Path(name): Path<String>) -> Result<J
 struct TailQuery {
     from: Option<u64>,
     tag: Option<String>,
+    tag_base64: Option<String>,
 }
 
 async fn tail(
@@ -327,12 +332,11 @@ async fn tail(
 ) -> Result<Sse<impl tokio_stream::Stream<Item = std::result::Result<SseEvent, Infallible>>>> {
     let dbn = db(&st, &name)?;
     let Query(q) = q.map_err(bad)?;
-    let rx = ops::subscribe(
-        st.node.clone(),
-        dbn,
-        q.from.unwrap_or(0),
-        q.tag.map(String::into_bytes),
-    );
+    let tag = match (&q.tag_base64, q.tag) {
+        (Some(b), _) => Some(crate::http_json::decode_base64(b, "tag_base64").map_err(ApiError)?),
+        (None, t) => t.map(String::into_bytes),
+    };
+    let rx = ops::subscribe(st.node.clone(), dbn, q.from.unwrap_or(0), tag);
     let stream = rx.map(|item| {
         Ok(match item {
             Ok(ev) => SseEvent::default().data(event_json(&ev).to_string()),

@@ -311,7 +311,9 @@ async fn oversize_bodies_are_413() {
     })
     .await;
     let addr = s.running.as_ref().unwrap().http_addr.unwrap();
-    let big = json!({"appends": [{"aggregate": "free", "events": [{"payload": "x".repeat(1100 * 1024)}]}]}).to_string();
+    // The body limit allows a third more than the message limit, since
+    // JSON carries binary as base64; this is above that.
+    let big = json!({"appends": [{"aggregate": "free", "events": [{"payload": "x".repeat(1500 * 1024)}]}]}).to_string();
     let (code, v, _) = call(
         addr,
         "POST",
@@ -544,17 +546,28 @@ async fn every_route_answers_and_metrics_count_them() {
     let (code, _, text) = call(addr, "GET", "/openapi.json".into(), vec![], None).await;
     assert_eq!(code, 200);
     let doc: Value = serde_json::from_str(&text).unwrap();
+    // Every documented (method, path) is routed: anything but 404/405.
+    // Bodies are empty, so writes answer 400; the delete names a
+    // database that cannot be dropped (409); the tail is HTTP/1.0 and
+    // ends on its own only when the database goes, so it is skipped.
     for (path, ops) in doc["paths"].as_object().unwrap() {
         for method in ops.as_object().unwrap().keys() {
-            if method.to_uppercase() == "GET" && path != "/v1/db/{db}/tail" {
-                let concrete = path
-                    .replace("{db}", "default")
-                    .replace("{uuid}", AGG)
-                    .replace("{tag}", "t")
-                    .replace("{name}", "default");
-                let (code, _, _) = call(addr, "GET", concrete.clone(), vec![], None).await;
-                assert!(code != 404 && code != 405, "{concrete} -> {code}");
+            if path == "/v1/db/{db}/tail" {
+                continue;
             }
+            let method: &'static str = match method.as_str() {
+                "get" => "GET",
+                "post" => "POST",
+                "delete" => "DELETE",
+                other => panic!("{other}"),
+            };
+            let concrete = path
+                .replace("{db}", "default")
+                .replace("{uuid}", AGG)
+                .replace("{tag}", "t")
+                .replace("{name}", "default");
+            let (code, _, _) = call(addr, method, concrete.clone(), vec![], None).await;
+            assert!(code != 404 && code != 405, "{method} {concrete} -> {code}");
         }
     }
     let (code, _, _) = call(addr, "GET", "/v1/nope".into(), vec![], None).await;
@@ -630,5 +643,84 @@ async fn https_is_served_and_plaintext_refused() {
         plain_code, 200,
         "plaintext on a TLS listener gets no HTTP answer"
     );
+    s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn limit_zero_is_the_maximum_and_quoted_numbers_are_expectations() {
+    let s = Server::start_with(with_http).await;
+    let addr = s.running.as_ref().unwrap().http_addr.unwrap();
+    let body = serde_json::json!({"appends": [{"aggregate": AGG, "expect": "0",
+        "events": [{"payload": "a"}, {"payload": "b"}]}]})
+    .to_string();
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/commit".into(),
+        vec![],
+        Some(body),
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    let body = serde_json::json!({"appends": [{"aggregate": AGG, "expect": "0",
+        "events": [{"payload": "c"}]}]})
+    .to_string();
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/commit".into(),
+        vec![],
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        (code, v["reason"].as_str()),
+        (409, Some("expectation")),
+        "{v}"
+    );
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/events?limit=0".into(),
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(v["events"].as_array().unwrap().len(), 2);
+    assert_eq!(v["next"], 2, "where the next page would start");
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/events?from=2".into(),
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert!(v["events"].as_array().unwrap().is_empty() && v["next"].is_null());
+    // A binary tag goes in base64, the path tag being `-`.
+    let body = serde_json::json!({"appends": [{"aggregate": "free",
+        "events": [{"payload": "bin", "tags_base64": ["/w=="]}]}]})
+    .to_string();
+    let (code, _, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/commit".into(),
+        vec![],
+        Some(body),
+    )
+    .await;
+    assert_eq!(code, 200);
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/tags/-/events?tag_base64=%2Fw%3D%3D".into(),
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["events"][0]["payload"], "bin");
     s.stop().await;
 }

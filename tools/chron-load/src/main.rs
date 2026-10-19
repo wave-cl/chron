@@ -61,7 +61,9 @@ struct Cli {
 }
 
 /// A killer that sends SIGKILL to the pid given for an address (a
-/// number, or a file holding one, read at each kill).
+/// number, or a file holding one, read at each kill). Says whether the
+/// signal was delivered; a pid file that a restart loop rewrites between
+/// the read and the kill is a small window this tool accepts.
 fn killer(pairs: &[String]) -> anyhow::Result<chron_load::Killer> {
     let mut pids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for p in pairs {
@@ -75,8 +77,10 @@ fn killer(pairs: &[String]) -> anyhow::Result<chron_load::Killer> {
         let pids = pids.clone();
         Box::pin(async move {
             let Some(spec) = pids.get(&addr) else {
-                eprintln!("no pid known for the leader {addr}; not killed");
-                return;
+                eprintln!(
+                    "no pid known for the leader {addr} (--pid keys are advertised addresses); not killed"
+                );
+                return false;
             };
             let pid: Option<u32> = match spec.parse() {
                 Ok(n) => Some(n),
@@ -84,14 +88,31 @@ fn killer(pairs: &[String]) -> anyhow::Result<chron_load::Killer> {
                     .ok()
                     .and_then(|t| t.trim().parse().ok()),
             };
-            match pid {
-                Some(pid) => {
-                    eprintln!("killing the leader {addr} (pid {pid})");
-                    let _ = std::process::Command::new("kill")
-                        .args(["-9", &pid.to_string()])
-                        .status();
+            let Some(pid) = pid else {
+                eprintln!("no pid in {spec} for the leader {addr}; not killed");
+                return false;
+            };
+            eprintln!("killing the leader {addr} (pid {pid})");
+            let status = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status()
+            })
+            .await;
+            match status {
+                Ok(Ok(s)) if s.success() => true,
+                Ok(Ok(s)) => {
+                    eprintln!("kill -9 {pid} exited {s}");
+                    false
                 }
-                None => eprintln!("no pid in {spec} for the leader {addr}; not killed"),
+                Ok(Err(e)) => {
+                    eprintln!("kill -9 {pid}: {e}");
+                    false
+                }
+                Err(e) => {
+                    eprintln!("kill -9 {pid}: {e}");
+                    false
+                }
             }
         })
     }))

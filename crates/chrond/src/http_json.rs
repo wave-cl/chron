@@ -53,7 +53,7 @@ pub struct EventJson {
     pub metadata_base64: Option<String>,
 }
 
-fn decode_base64(b: &str, what: &str) -> Result<Vec<u8>, Status> {
+pub fn decode_base64(b: &str, what: &str) -> Result<Vec<u8>, Status> {
     base64::engine::general_purpose::STANDARD
         .decode(b)
         .map_err(|e| Status::invalid_argument(format!("{what} is not base64: {e}")))
@@ -84,14 +84,18 @@ pub fn appends_from_json(txn: TxnJson) -> Result<Vec<pb::Append>, Status> {
         let expected = match a.expect {
             None => Expected::Any,
             Some(ExpectJson::Exact(n)) => Expected::Exact(n),
+            // A number in quotes is accepted too, as the CLI's commit -f does.
             Some(ExpectJson::Word(w)) => match w.as_str() {
                 "any" => Expected::Any,
                 "new" => Expected::New,
-                other => {
-                    return Err(Status::invalid_argument(format!(
-                        "expect takes any, new or a number, not {other:?}"
-                    )));
-                }
+                other => match other.parse::<u64>() {
+                    Ok(n) => Expected::Exact(n),
+                    Err(_) => {
+                        return Err(Status::invalid_argument(format!(
+                            "expect takes any, new or a number, not {other:?}"
+                        )));
+                    }
+                },
             },
         };
         if aggregate.is_none() && expected != Expected::Any {
@@ -274,6 +278,19 @@ pub fn error_json(s: &Status) -> Value {
     ] {
         if let Some(n) = num(key) {
             obj.insert(name.into(), json!(n));
+        }
+    }
+    // The two 409s told apart without parsing the message.
+    if s.code() == Code::FailedPrecondition {
+        let reason = if obj.contains_key("actual_length") {
+            Some("expectation")
+        } else if obj.contains_key("epoch") {
+            Some("epoch")
+        } else {
+            None
+        };
+        if let Some(r) = reason {
+            obj.insert("reason".into(), Value::String(r.into()));
         }
     }
     Value::Object(obj)

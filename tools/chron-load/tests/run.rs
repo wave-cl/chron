@@ -80,7 +80,7 @@ async fn a_run_with_the_leader_killed_finds_no_violation() {
                 let i = {
                     let mut c = cluster.lock().await;
                     let Some(i) = (0..3).find(|i| c.addr(*i) == addr) else {
-                        return;
+                        return false;
                     };
                     c.stop(i).await;
                     i
@@ -90,6 +90,7 @@ async fn a_run_with_the_leader_killed_finds_no_violation() {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     cluster.lock().await.restart(i).await;
                 });
+                true
             })
         })
     };

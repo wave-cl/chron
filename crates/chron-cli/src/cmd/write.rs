@@ -194,6 +194,9 @@ pub async fn commit(conn: &Conn, format: Format, a: CommitArgs) -> anyhow::Resul
             }
             events.push(event);
         }
+        if aggregate.is_none() && expected != Expected::Any {
+            return Err(Usage("free events have no length to expect; use \"any\"".into()).into());
+        }
         match aggregate {
             Some(id) => txn.append(id, expected, events),
             None => txn.append_free(events),

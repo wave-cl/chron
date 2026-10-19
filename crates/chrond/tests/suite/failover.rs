@@ -433,9 +433,10 @@ async fn a_follower_cut_off_from_the_leader_cannot_unseat_it() {
             assert_eq!(c.leader(), Some(l), "{}", c.describe());
             assert_eq!(c.node(l).data_epoch(), epoch);
             assert_eq!(c.node(f2).floor_epoch(), floor, "{}", c.describe());
+            let elections = c.node(f2).metrics_elections();
             assert!(
-                c.node(f2).metrics_elections() > 0,
-                "the cut-off follower never campaigned"
+                (1..=4).contains(&elections),
+                "the cut-off follower campaigned {elections} times in 3 s: it should wait a lease between campaigns"
             );
         }
         c.uncut(l, f2);
@@ -510,6 +511,7 @@ async fn a_diverged_old_leader_cuts_back_and_rejoins() {
         }
         let head = fill(&c.client(l).await, 5).await;
         c.wait_heads(head, SOON).await;
+        let old_epoch = c.node(l).data_epoch();
         c.stop(l).await;
         // Three writes of its own, offline, as if they had been
         // acknowledged just before it died.
@@ -547,11 +549,9 @@ async fn a_diverged_old_leader_cuts_back_and_rejoins() {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with("diverged-"))
             .collect();
-        // The epoch in the name is the old leader's, whatever the
-        // initial election took.
-        assert_eq!(archives.len(), 1, "{archives:?}");
-        assert!(
-            archives[0].starts_with("diverged-") && archives[0].ends_with("-5-8.chronbak"),
+        assert_eq!(
+            archives,
+            [format!("diverged-{old_epoch}-5-8.chronbak")],
             "{archives:?}"
         );
         let meta = chron::inspect_backup(dir.join(&archives[0])).unwrap();
@@ -565,4 +565,124 @@ async fn a_diverged_old_leader_cuts_back_and_rejoins() {
         assert_ne!(l3, l2);
         c.stop_all().await;
     }
+}
+
+/// A forced promotion of a node that lags, and cannot reach the leader,
+/// fails at the pre-vote: no voter promises anything, so the leader,
+/// which still holds a majority elsewhere, keeps leading. Without the
+/// pre-vote the other cut-off follower's real vote would raise its floor
+/// and fence the leader on its next heartbeat.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_forced_promote_leaves_no_promise_behind() {
+    let mut c = Cluster::start(5, TTL).await;
+    let l = c.wait_for_leader(SOON).await;
+    let others: Vec<usize> = (0..5).filter(|i| *i != l).collect();
+    let (x, y) = (others[0], others[1]);
+    for i in &others {
+        c.wait_following(*i, l, SOON).await;
+    }
+    let leader = c.client(l).await;
+    let head = fill(&leader, 5).await;
+    c.wait_heads(head, SOON).await;
+    let epoch = c.node(l).data_epoch();
+    // Two followers come back deaf to the leader and miss three writes;
+    // the other two keep acknowledging it.
+    c.stop(x).await;
+    c.stop(y).await;
+    fill(&leader, 3).await;
+    for i in [x, y] {
+        let la = c.addr(l);
+        c.restart_with(i, move |o| o.partition = vec![la]).await;
+    }
+    let r = c.client(x).await.promote().await;
+    assert!(matches!(&r, Err(ClientError::Fenced { .. })), "{r:?}");
+    tokio::time::sleep(2 * TTL).await;
+    assert_eq!(c.leader(), Some(l), "{}", c.describe());
+    assert_eq!(c.node(l).data_epoch(), epoch);
+    assert!(
+        c.node(y).lease().voted.map(|(e, _)| e).unwrap_or(0) <= epoch,
+        "the other cut-off follower promised an epoch to the refused candidate"
+    );
+    c.heal(x);
+    c.heal(y);
+    for i in [x, y] {
+        c.wait_following(i, l, SOON).await;
+    }
+    c.stop_all().await;
+}
+
+/// A leader that runs a longer lease than its followers is waited for
+/// that long: the followers do not elect another leader between its
+/// heartbeats.
+#[tokio::test(flavor = "multi_thread")]
+async fn followers_wait_out_a_leaders_longer_lease() {
+    let mut c = Cluster::start(3, TTL).await;
+    let l = c.wait_for_leader(SOON).await;
+    for i in (0..3).filter(|i| *i != l) {
+        c.wait_following(i, l, SOON).await;
+    }
+    // The leader restarts with a lease six times longer (heartbeats
+    // every 2 s) and takes the lead back by force.
+    c.stop(l).await;
+    let l2 = c.wait_for_leader(SOON).await;
+    c.restart_with(l, |o| o.lease_ttl = 6 * TTL).await;
+    c.wait_following(l, l2, SOON).await;
+    c.client(l).await.promote().await.unwrap();
+    c.wait("the long-lease node leading", SOON, || {
+        c.leader() == Some(l)
+    })
+    .await;
+    let epoch = c.node(l).data_epoch();
+    tokio::time::sleep(4 * TTL).await;
+    assert_eq!(c.leader(), Some(l), "{}", c.describe());
+    assert_eq!(
+        c.node(l).data_epoch(),
+        epoch,
+        "a follower elected a new leader between heartbeats"
+    );
+    c.stop_all().await;
+}
+
+/// A node fenced by an epoch whose leader never reaches it is not stuck:
+/// after a lease of silence it campaigns like a candidate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fenced_node_campaigns_after_silence() {
+    let mut c = Cluster::start(3, TTL).await;
+    let l = c.wait_for_leader(SOON).await;
+    for i in (0..3).filter(|i| *i != l) {
+        c.wait_following(i, l, SOON).await;
+    }
+    let head = fill(&c.client(l).await, 3).await;
+    c.wait_heads(head, SOON).await;
+    let epoch = c.node(l).data_epoch();
+    // A fence by an epoch nobody leads under.
+    c.client(l).await.fence(epoch + 1).await.unwrap();
+    assert_eq!(c.role(l), Some(Role::Fenced));
+    let l2 = c.wait_for_leader(SOON).await;
+    assert!(c.node(l2).data_epoch() > epoch);
+    c.wait("the fenced node following or leading", SOON, || {
+        matches!(c.role(l), Some(Role::Replica) | Some(Role::Leader))
+    })
+    .await;
+    let head = fill(&c.client(c.leader().unwrap()).await, 2).await;
+    c.wait_heads(head, SOON).await;
+    c.stop_all().await;
+}
+
+/// With peers a writer's epoch token cannot unseat the leader: an epoch
+/// one above is refused like any other wrong epoch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_epoch_one_above_does_not_fence_a_group_leader() {
+    let mut c = Cluster::start(3, TTL).await;
+    let l = c.wait_for_leader(SOON).await;
+    let epoch = c.node(l).data_epoch();
+    let client = c.client(l).await;
+    let mut t = chron_client::Transaction::new();
+    t.append_free(vec![NewEvent::new("x")]);
+    let r = client.commit_with_epoch(t, epoch + 1).await;
+    assert!(matches!(r, Err(ClientError::Fenced { .. })), "{r:?}");
+    assert_eq!(c.role(l), Some(Role::Leader));
+    assert_eq!(c.leader(), Some(l));
+    append(&client, "still writable").await.unwrap();
+    c.stop_all().await;
 }

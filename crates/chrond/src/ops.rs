@@ -129,6 +129,9 @@ pub fn subscribe(
     from: u64,
     tag: Option<Vec<u8>>,
 ) -> ReceiverStream<Result<Event, Status>> {
+    // The reset watch is taken before the subscription so a cut between
+    // the two is not missed.
+    let mut reset = dbn.reset.subscribe();
     let mut sub = match tag {
         Some(tag) => dbn.db.subscribe_tag(tag, from),
         None => dbn.db.subscribe(from),
@@ -137,11 +140,10 @@ pub fn subscribe(
     let (tx, rx) = mpsc::channel(PAGE);
     let cancel = dbn.cancel.clone();
     let mut role = node.watch_role();
-    let mut reset = dbn.reset.subscribe();
-    reset.mark_unchanged();
     tokio::spawn(async move {
         loop {
             let next = tokio::select! {
+                biased;
                 _ = cancel.cancelled() => {
                     let _ = tx.send(Err(gone(&node))).await;
                     return;
@@ -155,9 +157,13 @@ pub fn subscribe(
                     let status = match r {
                         Ok(()) => {
                             let to = reset.borrow_and_update().unwrap_or(0);
-                            Status::unavailable(format!(
+                            let mut s = Status::unavailable(format!(
                                 "the database was cut back to {to} to follow the leader; positions from there are being rewritten, subscribe again"
-                            ))
+                            ));
+                            if let Ok(v) = to.to_string().parse() {
+                                s.metadata_mut().insert(chron_proto::POSITION_HEADER, v);
+                            }
+                            s
                         }
                         Err(_) => gone(&node),
                     };

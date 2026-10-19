@@ -212,7 +212,10 @@
             "type": "string"
           },
           "db_id": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "role": {
             "type": "string",
@@ -247,7 +250,18 @@
             ]
           },
           "options": {
-            "type": "object"
+            "type": "object",
+            "properties": {
+              "verify_all_segments": {
+                "type": "boolean"
+              },
+              "segment_max_bytes": {
+                "type": "integer"
+              },
+              "max_record_bytes": {
+                "type": "integer"
+              }
+            }
           },
           "replicating_from": {
             "type": [
@@ -379,7 +393,7 @@
           },
           "code": {
             "type": "string",
-            "description": "the gRPC code's name: InvalidArgument (400), Unauthenticated (401), PermissionDenied (403), NotFound (404), AlreadyExists or FailedPrecondition (409), ResourceExhausted (413), OutOfRange (416), Unavailable (503), Internal (500)"
+            "description": "the gRPC code's name: InvalidArgument (400), Unauthenticated (401), PermissionDenied (403), NotFound (404), AlreadyExists or FailedPrecondition (409), Unimplemented (405), ResourceExhausted (413), OutOfRange (416), Unavailable (503), Internal (500). A 408 from --request-timeout has no body: the request's outcome is unknown (a commit may still land)."
           },
           "actual_length": {
             "type": "integer"
@@ -398,6 +412,14 @@
           },
           "head": {
             "type": "integer"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "expectation",
+              "epoch"
+            ],
+            "description": "On a 409 FailedPrecondition: an append's expectation failed (actual_length, aggregate) or the node's role or epoch refused the write (epoch)."
           }
         }
       }
@@ -463,7 +485,8 @@
               }
             }
           }
-        }
+        },
+        "description": " With --request-timeout a 408 has no body and means the outcome is unknown: the transaction may still land; check with an exact expectation or a read before resending."
       }
     },
     "/v1/db/{db}/events": {
@@ -515,9 +538,11 @@
             "name": "limit",
             "in": "query",
             "required": false,
-            "description": "at most this many events (1..4096, default 256)",
+            "description": "records per page, at most 4096 (0: the maximum); default 256",
             "schema": {
-              "type": "integer"
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4096
             }
           },
           {
@@ -590,9 +615,11 @@
             "name": "limit",
             "in": "query",
             "required": false,
-            "description": "at most this many events (1..4096, default 256)",
+            "description": "records per page, at most 4096 (0: the maximum); default 256",
             "schema": {
-              "type": "integer"
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4096
             }
           },
           {
@@ -698,7 +725,7 @@
             "name": "tag",
             "in": "path",
             "required": true,
-            "description": "the tag",
+            "description": "the tag as UTF-8 text; for a binary tag pass - here and tag_base64",
             "schema": {
               "type": "string"
             }
@@ -717,9 +744,11 @@
             "name": "limit",
             "in": "query",
             "required": false,
-            "description": "at most this many events (1..4096, default 256)",
+            "description": "records per page, at most 4096 (0: the maximum); default 256",
             "schema": {
-              "type": "integer"
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4096
             }
           },
           {
@@ -730,6 +759,15 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "tag_base64",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "a binary tag, base64; pass - as the path's tag"
           }
         ]
       }
@@ -856,7 +894,8 @@
             "required": false,
             "description": "start position (default 0)",
             "schema": {
-              "type": "integer"
+              "type": "integer",
+              "format": "uint64"
             }
           },
           {
@@ -867,8 +906,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "tag_base64",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "a binary tag, base64, instead of tag"
           }
-        ]
+        ],
+        "description": " The stream is text/event-stream: one data: line of JSON per event, a `: heartbeat` comment every 15 s, and a final event: error when the database is dropped, cut back to an earlier position (a diverged node resetting; its JSON carries position), the node fenced or the daemon stops."
       }
     },
     "/v1/db/{db}/flush": {

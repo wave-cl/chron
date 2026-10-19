@@ -143,19 +143,23 @@ pub(crate) fn truncate(inner: &Inner, to: u64) -> Result<Truncated> {
     }
     txn.commit()?;
 
-    // Then the files: the segment holding `to` is cut back to its
-    // frame, later ones go. The writer continues at the cut.
+    // The index is the commit point: from here the head is `to` and the
+    // writer continues at the cut, whatever the file operations below
+    // manage; bytes they leave behind are overwritten by later writes
+    // or dropped by the next open.
     let kept = inner.layout.segment(loc.base);
-    segment::truncate(&kept, loc.offset)?;
+    *w = SegmentWriter::open(&kept, loc.base, loc.offset)?;
+    inner.publish_head(to);
+    // Then the files: the segment holding `to` is cut back to its
+    // frame, later ones go.
     let later: Vec<_> = listed.iter().filter(|(b, _)| *b > loc.base).collect();
+    let bases: Vec<u64> = later.iter().map(|(b, _)| *b).collect();
+    inner.forget_files(&bases);
+    segment::truncate(&kept, loc.offset)?;
     for (_, path) in &later {
         fs::remove_file(path).map_err(|e| Error::io(path, "remove", e))?;
     }
     segment::sync_dir(&dir)?;
-    let bases: Vec<u64> = later.iter().map(|(b, _)| *b).collect();
-    inner.forget_files(&bases);
-    *w = SegmentWriter::open(&kept, loc.base, loc.offset)?;
-    inner.publish_head(to);
     Ok(Truncated {
         head: to,
         removed: head - to,

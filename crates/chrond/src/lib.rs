@@ -109,7 +109,9 @@ pub struct Options {
     pub advertise: Option<String>,
     /// How long a majority's acknowledgment lets a leader accept writes;
     /// heartbeats go out every third of it and an election starts after
-    /// one to one and a half of it without a leader.
+    /// 1.1 to 1.5 times it without a leader. Every node of a group should
+    /// run the same value; a follower waits out the longer of its own
+    /// and its leader's.
     pub lease_ttl: Duration,
     /// Peers this node neither calls nor answers from the start (a
     /// simulated partition for tests).
@@ -534,7 +536,12 @@ async fn open_all(node: &Arc<Node>) -> anyhow::Result<()> {
 async fn settle_role(node: &Arc<Node>, opts: &Options) -> anyhow::Result<()> {
     let dir = opts.data_dir.display();
     if node.cluster.is_some() {
-        if let Some(v) = node.read_vote_marker() {
+        if let Some(text) = node.marker_text(node::VOTE_MARKER) {
+            let v = node::parse_vote(&text).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{dir}/vote holds {text:?}, not `epoch N for ADDR`; a node that cannot read its vote could vote twice: fix or remove the file"
+                )
+            })?;
             node.with_lease(|l| l.voted = Some(v));
         }
         if let Some(e) = node.read_marker(PROMOTED_MARKER)
@@ -688,6 +695,23 @@ impl Running {
     /// server, then flushes the database. The flush runs whatever came
     /// before; the first failure is returned.
     pub async fn shutdown(self) -> anyhow::Result<()> {
+        // Cluster calls are refused and no transition starts from here on;
+        // the cluster task is stopped and awaited before the pullers, so
+        // nothing restarts them.
+        self.node
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        let cluster_task = self
+            .node
+            .cluster_task
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(c) = cluster_task {
+            c.abort();
+            let _ = c.await;
+        }
+        let _transitions = self.node.transitions.lock().await;
         self.health
             .set_not_serving::<ChronServer<service::ChronService>>()
             .await;
@@ -697,15 +721,6 @@ impl Running {
         self.health
             .set_service_status(LEADER_HEALTH_SERVICE, ServingStatus::NotServing)
             .await;
-        if let Some(c) = self
-            .node
-            .cluster_task
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
-            c.abort();
-        }
         replica::stop_all(&self.node).await;
         if let Some(f) = self
             .node

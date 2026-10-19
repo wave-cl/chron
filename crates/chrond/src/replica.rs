@@ -147,9 +147,18 @@ pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<ChunkSt
     // check then too.
     let last_fingerprint = if head > floor {
         let db = db.clone();
-        blocking(move || db.fingerprint(head - 1))
+        let f = blocking(move || db.fingerprint(head - 1))
             .await
-            .map_err(CheckError::Refused)?
+            .map_err(CheckError::Refused)?;
+        if f.is_none() {
+            // The index has no record below the head: never valid, and
+            // the leader would skip its check and feed a hole.
+            return Err(CheckError::Refused(format!(
+                "the index holds no record at {}, below the head {head}; rebuild the index (chron rebuild-index)",
+                head - 1
+            )));
+        }
+        f
     } else {
         None
     };
@@ -187,12 +196,16 @@ pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<ChunkSt
 /// (galloping back from the lower of the two heads, then bisecting),
 /// moved back to a transaction boundary, the dropped tail written to
 /// `diverged-<epoch>-<from>-<head>.chronbak` in the database directory,
-/// and the records cut. Returns the new head.
+/// and the records cut. The probing can be cancelled between calls; the
+/// backup, the cut and the reset notice run as one task that is always
+/// finished, so a transition cannot leave a half-cut database or an
+/// archive overwritten by a later, empty one. Returns the new head.
 async fn resync(
     node: &Arc<Node>,
     dbn: &Arc<DbNode>,
     leader_head: u64,
     leader_floor: u64,
+    cancel: &CancellationToken,
 ) -> Result<u64, String> {
     let up = node.upstream().ok_or("no leader configured")?;
     let client = connect(&up)
@@ -221,22 +234,37 @@ async fn resync(
         }
         step = step.saturating_mul(2);
     }
-    let matches =
-        |db: &chron::Db, positions: &[u64], theirs: &[Option<u32>]| -> Result<Vec<bool>, String> {
+    let ask = |positions: Vec<u64>| {
+        let client = client.clone();
+        let addr = up.addr.clone();
+        async move {
+            let answer = tokio::time::timeout(INFO_TIMEOUT, client.fingerprints(&positions))
+                .await
+                .map_err(|_| format!("{addr} did not answer Fingerprints within {INFO_TIMEOUT:?}"))?
+                .map_err(|e| format!("Fingerprints on {addr}: {e}"))?;
+            if answer.len() != positions.len() {
+                return Err(format!(
+                    "{addr} answered {} fingerprints for {} positions",
+                    answer.len(),
+                    positions.len()
+                ));
+            }
+            Ok(answer)
+        }
+    };
+    // Compared on the blocking pool: each is an index read and a pread.
+    let compare = |positions: Vec<u64>, theirs: Vec<Option<u32>>| {
+        let db = db.clone();
+        blocking(move || {
             positions
                 .iter()
-                .zip(theirs)
-                .map(|(p, t)| {
-                    let mine = db.fingerprint(*p).map_err(|e| e.to_string())?;
-                    Ok(mine.is_some() && mine == *t)
-                })
-                .collect()
-        };
-    let theirs = client
-        .fingerprints(&probes)
-        .await
-        .map_err(|e| format!("Fingerprints on {}: {e}", up.addr))?;
-    let same = matches(&db, &probes, &theirs)?;
+                .zip(&theirs)
+                .map(|(p, t)| Ok(db.fingerprint(*p)?.is_some_and(|m| Some(m) == *t)))
+                .collect::<chron::Result<Vec<bool>>>()
+        })
+    };
+    let theirs = ask(probes.clone()).await?;
+    let same = compare(probes.clone(), theirs).await?;
     // The first probe (highest) that matches, and the lowest that did not.
     let Some(k) = same.iter().position(|m| *m) else {
         return Err(format!(
@@ -246,48 +274,97 @@ async fn resync(
     let mut good = probes[k];
     let mut bad = if k == 0 { hi } else { probes[k - 1] };
     while bad - good > 1 {
+        if cancel.is_cancelled() {
+            return Err("cancelled while looking for the shared history".into());
+        }
         let mid = good + (bad - good) / 2;
-        let t = client
-            .fingerprints(&[mid])
-            .await
-            .map_err(|e| format!("Fingerprints on {}: {e}", up.addr))?;
-        if matches(&db, &[mid], &t)?[0] {
+        let t = ask(vec![mid]).await?;
+        if compare(vec![mid], t).await?[0] {
             good = mid;
         } else {
             bad = mid;
         }
     }
-    // Positions below `bad` are shared; cut at the transaction boundary
-    // at or below it.
-    let mut to = bad;
-    while to > lo {
-        let first = db
-            .read_all(to, 1)
-            .map_err(|e| e.to_string())?
-            .first()
-            .is_some_and(|e| e.is_first_in_txn());
-        if first {
-            break;
-        }
-        to -= 1;
+    if bad >= head {
+        return Err(format!(
+            "the shared history reaches this node's head {head}, yet the leader refused it; restore this node from a backup of the leader"
+        ));
     }
+    // Positions below `bad` are shared; the cut goes at the transaction
+    // boundary at or below `bad`, found by reading backward in pages.
+    let db2 = db.clone();
+    let to = blocking(move || {
+        let mut cursor = bad;
+        loop {
+            let page = db2.read_all_backward(cursor, PAGE_BACK)?;
+            let Some(last) = page.last() else {
+                return Ok(lo);
+            };
+            for ev in &page {
+                if ev.position < lo {
+                    return Ok(lo);
+                }
+                if ev.is_first_in_txn() {
+                    return Ok(ev.position);
+                }
+            }
+            if last.position <= lo {
+                return Ok(lo);
+            }
+            cursor = last.position - 1;
+        }
+    })
+    .await?;
     if to >= head {
         return Err(format!(
             "the shared history reaches this node's head {head}, yet the leader refused it; restore this node from a backup of the leader"
         ));
     }
-    let archive = db
-        .path()
-        .join(format!("diverged-{}-{to}-{head}.chronbak", db.epoch()));
-    let db2 = db.clone();
-    let a2 = archive.clone();
-    blocking(move || db2.backup_since(&a2, to)).await?;
-    let db2 = db.clone();
-    let cut = blocking(move || db2.truncate_to(to)).await?;
-    tracing::warn!(database = %dbn.name, from = to, removed = cut.removed, archive = %archive.display(), "dropped a diverged tail");
-    dbn.reset.send_replace(Some(to));
-    Ok(to)
+    // The cut itself: not cancellable, awaited whatever happens to the
+    // caller, so a transition during a resync finds a whole database.
+    let dbn2 = dbn.clone();
+    let name = dbn.name.clone();
+    let cut = tokio::spawn(async move {
+        let db = dbn2.db.clone();
+        let head_now = db.head();
+        if head_now != head {
+            return Err(format!(
+                "the head moved from {head} to {head_now} while the shared history was being found; retrying"
+            ));
+        }
+        let mut archive = db
+            .path()
+            .join(format!("diverged-{}-{to}-{head}.chronbak", db.epoch()));
+        if archive.exists() {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            archive = db.path().join(format!(
+                "diverged-{}-{to}-{head}-{nanos}.chronbak",
+                db.epoch()
+            ));
+        }
+        let db2 = db.clone();
+        let a2 = archive.clone();
+        let meta = blocking(move || db2.backup_since(&a2, to)).await?;
+        if meta.head != head {
+            let _ = std::fs::remove_file(&archive);
+            return Err(format!(
+                "the head moved to {} while the tail was being archived; retrying",
+                meta.head
+            ));
+        }
+        let db2 = db.clone();
+        let cut = blocking(move || db2.truncate_to(to)).await?;
+        tracing::warn!(database = %name, from = to, removed = cut.removed, archive = %archive.display(), "dropped a diverged tail");
+        dbn2.reset.send_replace(Some(to));
+        Ok(to)
+    });
+    cut.await.map_err(|e| format!("cut task: {e}"))?
 }
+
+/// Records per page when walking back to a transaction boundary.
+const PAGE_BACK: usize = 256;
 
 /// Stops the discoverer and every database's puller.
 pub async fn stop_all(node: &Arc<Node>) {
@@ -374,10 +451,12 @@ async fn pull(
                         leader_floor,
                     }) if node.cluster.is_some() => {
                         record_error(node, dbn, message);
-                        let r = tokio::select! {
-                            _ = cancel.cancelled() => return,
-                            r = resync(node, dbn, leader_head, leader_floor) => r,
-                        };
+                        // Not raced against `cancel`: the cut must finish
+                        // once started; resync stops early by itself.
+                        let r = resync(node, dbn, leader_head, leader_floor, cancel).await;
+                        if cancel.is_cancelled() && r.is_err() {
+                            return;
+                        }
                         match r {
                             Ok(to) => {
                                 tracing::warn!(database = %dbn.name, head = to, "cut back to the history shared with the leader; the dropped tail is kept as a backup");

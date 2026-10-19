@@ -15,9 +15,20 @@ use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 
 /// Kills the daemon at an address (a SIGKILL to its pid, or a test's
-/// shutdown of an in-process node). What restarts it is the caller's
-/// business.
-pub type Killer = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+/// shutdown of an in-process node) and says whether it did. What restarts
+/// it is the caller's business. The address is the one the daemon
+/// advertises (`Discover` names it), which is how `--pid` keys it.
+pub type Killer = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
+/// A writer stamps an acknowledgment after the call returns, so one
+/// acknowledged just before a leader died can carry a time a little after
+/// the kill was stamped. Half a second covers that, and no successor
+/// leads within half a second of a kill: an election waits at least
+/// 0.77 of a lease ttl (the last heartbeat may predate the kill by a
+/// third of the ttl, and the silence timer is 1.1 to 1.5 of it), so
+/// the groups this tool is run against must use a ttl of a second or
+/// more, as the daemon's default (10 s) and the tests (1 s) do.
+const SLACK: Duration = Duration::from_millis(500);
 
 /// What one run does.
 #[derive(Clone)]
@@ -94,7 +105,7 @@ pub struct Report {
 
 impl Report {
     pub fn ok(&self) -> bool {
-        self.violations.is_empty()
+        self.violations.is_empty() && self.errors == 0
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -146,7 +157,7 @@ struct Shared {
     retentions: AtomicU64,
     floor: AtomicU64,
     latencies: Mutex<Vec<u64>>,
-    violations: Mutex<Vec<String>>,
+    violations: std::sync::Mutex<Vec<String>>,
     kill_mode: bool,
     kills: AtomicU64,
     failover_errors: AtomicU64,
@@ -159,24 +170,30 @@ struct Shared {
 }
 
 impl Shared {
+    /// Records a violation; the first hundred are kept in full, every
+    /// one is counted.
     fn violation(&self, what: String) {
-        if let Ok(mut v) = self.violations.try_lock()
-            && v.len() < 100
-        {
+        let mut v = self.violations.lock().unwrap_or_else(|p| p.into_inner());
+        if v.len() < 100 {
             v.push(what);
         }
     }
 
-    /// Whether `e` is what a failover looks like from a client.
+    /// Whether `e` is what a failover looks like from a client: the
+    /// node is not the leader, cannot be reached, or the call timed out.
+    /// Anything else (Internal, Unknown, DataLoss, ...) is a real error.
     fn failover_error(e: &ClientError) -> bool {
-        matches!(
-            e,
+        match e {
             ClientError::Fenced { .. }
-                | ClientError::Unavailable(_)
-                | ClientError::Transport(_)
-                | ClientError::NoLeader(_)
-                | ClientError::Status(_)
-        )
+            | ClientError::Unavailable(_)
+            | ClientError::Transport(_)
+            | ClientError::NoLeader(_) => true,
+            ClientError::Status(s) => matches!(
+                s.code(),
+                tonic::Code::Cancelled | tonic::Code::DeadlineExceeded
+            ),
+            _ => false,
+        }
     }
 
     /// Records an error: in kill mode a failover-shaped one is counted,
@@ -200,13 +217,14 @@ impl Shared {
         }
     }
 
-    /// Whether a kill happened at or after `t`.
+    /// Whether a kill happened at or after `t`, with the same slack as
+    /// the acknowledgment check.
     fn killed_since(&self, t: Instant) -> bool {
         self.kill_log
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .any(|(k, _)| *k >= t)
+            .any(|(k, _)| *k + SLACK >= t)
     }
 }
 
@@ -480,13 +498,14 @@ async fn killer(cfg: Config, client: Client, shared: Arc<Shared>) {
     let (Some(every), Some(kill)) = (cfg.kill_every, cfg.killer.clone()) else {
         return;
     };
+    // `last` moves only on a kill that happened, so a miss (no leader
+    // known yet, a node still rejoining) is retried a moment later.
     let mut last = Instant::now();
     while !shared.stop.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if last.elapsed() < every {
             continue;
         }
-        last = Instant::now();
         let leader = match client.discover().await {
             Ok(d) => match d.leader_addr {
                 Some(a) => a,
@@ -497,26 +516,40 @@ async fn killer(cfg: Config, client: Client, shared: Arc<Shared>) {
                 continue;
             }
         };
-        // The successor is the most up-to-date node that follows the
-        // leader; a node still cutting back a diverged tail of its own
-        // may be ahead and says nothing about what survives.
+        // The successor is the most up-to-date node among those that
+        // vote; with three nodes every other node that follows the
+        // leader votes, so the highest head among them bounds what the
+        // successor holds. The kill waits until every other node is a
+        // connected follower, so the bound means something and a node
+        // still rejoining (or cutting back a tail of its own, and ahead)
+        // is never counted.
+        let others: Vec<String> = cfg.addrs().into_iter().filter(|a| *a != leader).collect();
         let mut bound = 0;
-        for addr in cfg.addrs().into_iter().filter(|a| *a != leader) {
-            if let Ok(c) = connect(&cfg, &addr).await
+        let mut connected = 0;
+        for addr in &others {
+            if let Ok(c) = connect(&cfg, addr).await
                 && let Ok(i) = c.info().await
                 && i.role == chron_client::Role::Replica
                 && i.replica_connected
             {
                 bound = bound.max(i.head);
+                connected += 1;
             }
         }
-        kill(leader).await;
+        if connected < others.len() {
+            continue;
+        }
+        if !kill(leader.clone()).await {
+            eprintln!("the leader {leader} was not killed; trying again shortly");
+            continue;
+        }
         shared
             .kill_log
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push((Instant::now(), bound));
         shared.kills.fetch_add(1, Ordering::Relaxed);
+        last = Instant::now();
     }
 }
 
@@ -524,11 +557,10 @@ async fn killer(cfg: Config, client: Client, shared: Arc<Shared>) {
 /// ones acknowledged before a kill at positions past the other nodes'
 /// heads at that kill.
 async fn check_acks(shared: &Shared, leader: &Client) -> Result<u64, ClientError> {
-    let acks = shared
-        .acks
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
+    // Taken, not cloned, and walked in position order against the log's
+    // pages: memory stays at one copy of the acknowledgments.
+    let mut acks = std::mem::take(&mut *shared.acks.lock().unwrap_or_else(|p| p.into_inner()));
+    acks.sort_unstable_by_key(|(p, _, _)| *p);
     let kills = shared
         .kill_log
         .lock()
@@ -536,7 +568,9 @@ async fn check_acks(shared: &Shared, leader: &Client) -> Result<u64, ClientError
         .clone();
     let floor = leader.info().await?.floor;
     let head = leader.head().await?;
-    let mut have: HashMap<u64, u64> = HashMap::with_capacity((head - floor) as usize);
+    let mut lost = 0;
+    let mut i = acks.partition_point(|(p, _, _)| *p < floor);
+    let mut missing: Vec<(u64, u64, Instant)> = Vec::new();
     let mut from = floor;
     while from < head {
         let page = leader.read_all(from, 4096).await?;
@@ -544,24 +578,22 @@ async fn check_acks(shared: &Shared, leader: &Client) -> Result<u64, ClientError
             break;
         }
         for ev in &page {
-            have.insert(ev.position, hash(&ev.payload));
+            while i < acks.len() && acks[i].0 < ev.position {
+                missing.push(acks[i]);
+                i += 1;
+            }
+            let h = hash(&ev.payload);
+            while i < acks.len() && acks[i].0 == ev.position {
+                if acks[i].1 != h {
+                    missing.push(acks[i]);
+                }
+                i += 1;
+            }
         }
         from = page.last().map_or(head, |e| e.position + 1);
     }
-    // A writer stamps its acknowledgment after the call returns, so one
-    // acknowledged just before the leader died can carry a time just
-    // after the kill was stamped; half a second covers that, and no
-    // successor leads within half a second of a kill (an election waits
-    // a full lease).
-    const SLACK: Duration = Duration::from_millis(500);
-    let mut lost = 0;
-    for (position, h, at) in acks {
-        if position < floor {
-            continue;
-        }
-        if have.get(&position) == Some(&h) {
-            continue;
-        }
+    missing.extend_from_slice(&acks[i..]);
+    for (position, _, at) in missing {
         lost += 1;
         let allowed = kills
             .iter()
@@ -739,7 +771,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         retentions: AtomicU64::new(0),
         floor: AtomicU64::new(leader.info().await?.floor),
         latencies: Mutex::new(Vec::new()),
-        violations: Mutex::new(Vec::new()),
+        violations: std::sync::Mutex::new(Vec::new()),
         kill_mode: cfg.kill_mode(),
         kills: AtomicU64::new(0),
         failover_errors: AtomicU64::new(0),
@@ -882,6 +914,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         kills: shared.kills.load(Ordering::Relaxed),
         lost_acks,
         failover_errors: shared.failover_errors.load(Ordering::Relaxed),
-        violations: shared.violations.lock().await.clone(),
+        violations: shared
+            .violations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone(),
     })
 }
