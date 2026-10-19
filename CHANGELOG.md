@@ -6,6 +6,10 @@ crates share one version.
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.5.0 - 2026-10-19
+
 ### chron-db
 
 - One fsync per batch: the index commit is made durable every
