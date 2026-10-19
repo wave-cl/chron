@@ -160,6 +160,10 @@ segment count and bytes, identity, epoch and the fsync mode.
   (`Error::WrongBaseHead`), and a damaged archive changes nothing. Giving
   either call the other kind is `Error::WrongBackupKind`.
 - `chron::inspect_backup(archive)` reads the header only.
+- `db.backup_to(&mut sink)` writes the same archive to any `Write`, and
+  `chron::restore_backup_from(reader, dir, &opts)` restores from any
+  `Read`: how a backup travels over the daemon without touching a disk
+  in between.
 
 The archive is one file: a magic, a JSON header (`BackupMeta`: kind,
 base head, head, floor, identity, time, counts), the entries, and a CRC32
@@ -391,6 +395,7 @@ chron tail [--from N | --from-head] [--tag T]        # from the floor by default
 chron len <AGGREGATE> | head | info | flush
 chron status [--max-lag N]                           # exit 0 healthy, 1 degraded, 2 unreachable
 chron backup <NAME> [--since N] | apply <NAME>       # names under the daemon's --backup-dir
+chron backup --fetch FILE                            # a full backup downloaded to a local file; no --backup-dir needed
 chron retain <FLOOR>
 chron health [--service NAME]                        # exit 0 SERVING, 1 NOT_SERVING, 2 unreachable
 chron promote | fence <EPOCH>                        # replication
@@ -488,7 +493,13 @@ is refused as diverged and must be restored from a backup of the
 leader. A promoted directory refuses to become a replica until its
 `promoted` marker is removed. A replica restored from a backup of a
 leader retained up to its head starts at the leader's floor, where the
-record before it is gone; the leader accepts it without that check.
+record before it is gone; the leader accepts it without that check. A
+replica whose head lies below the leader's floor cannot resume: without
+peers it is refused ("below the leader's floor"), and
+`chron --addr LEADER backup --fetch FILE` then `chron restore` rebuild it
+from any node, no `--backup-dir` needed (the daemon's `FetchBackup`
+streams the archive; the database's retention and other backups wait
+while it runs).
 
 ### Automatic failover
 
@@ -591,8 +602,18 @@ it is about to drop to `diverged-<epoch>-<from>-<head>.chronbak` in its
 database directory (restore it offline to read what was lost), cuts
 back to the prefix (`Db::truncate_to`) and pulls from there; its live
 subscriptions end with "cut back", since positions from the cut are
-rewritten. Without peers (`--replicate-from`) a diverged replica is
-still refused and left to the operator. `chron promote` on a group node
+rewritten. A node whose shared history lies below the leader's
+retention floor, or whose head does (a stale or empty node joining a
+retained group), **restores itself**: it streams the leader's backup
+straight into a restore at `<data_dir>/<name>.fetched`, checks the
+copy's identity, moves its old directory to `<name>.replaced-<nanos>`
+(kept, since in the diverged case it holds writes nobody else has; an
+empty one is removed), takes the copy, and follows from the leader's
+floor; its live streams end with "replaced by a copy restored from the
+leader". A crash in between is finished or undone at the next start.
+`chron_restores_total{result}` counts these. Without peers
+(`--replicate-from`) a diverged or below-floor replica is still refused
+and left to the operator. `chron promote` on a group node
 is a *forced* campaign: it skips the silence timer, and the live leader
 fences itself and grants the vote, but only to a node whose heads match
 its own, so promote a lagging node and it is refused ("not up to date")

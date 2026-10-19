@@ -9,6 +9,7 @@ use chron_client::{Client, ClientError, Expected, NewEvent, Role as WireRole, Uu
 use chron_proto::v1 as pb;
 use chrond::node::Role;
 use chrond::testing::Cluster;
+use tokio_stream::StreamExt;
 
 use crate::common::Server;
 
@@ -705,5 +706,262 @@ async fn a_client_epoch_one_above_does_not_fence_a_group_leader() {
     assert_eq!(c.role(l), Some(Role::Leader));
     assert_eq!(c.leader(), Some(l));
     append(&client, "still writable").await.unwrap();
+    c.stop_all().await;
+}
+
+/// Opens the leader's `default` database offline with tiny segments,
+/// writes `n` more events and retains past `floor`, so a lagging node
+/// has nothing to pull from.
+fn retain_offline(dir: &std::path::Path, n: usize, floor: u64) -> u64 {
+    let db = chron::Db::open(
+        dir,
+        chron::Options::new()
+            .fsync(chron::Fsync::Never)
+            .segment_max_bytes(1),
+    )
+    .unwrap();
+    for i in 0..n {
+        let mut t = db.transaction();
+        t.append_free(vec![chron::NewEvent::new(format!("later-{i}"))]);
+        t.commit().unwrap();
+    }
+    let r = db.retain_from(floor).unwrap();
+    assert!(r.floor >= floor / 2 && r.floor > 0, "{r:?}");
+    r.floor
+}
+
+fn restores(c: &Cluster, i: usize, result: &str) -> u64 {
+    c.node(i)
+        .metrics
+        .restores
+        .with_label_values(&["default", result])
+        .get()
+}
+
+fn replaced_dirs(c: &Cluster, i: usize) -> Vec<String> {
+    std::fs::read_dir(c.nodes[i].dir.path().join("data"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("default.replaced-") || n == "default.fetched")
+        .collect()
+}
+
+/// A replica whose head lies below the leader's retention floor, stale or
+/// empty, fetches the leader's backup and takes it as its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_below_the_leaders_floor_restores_itself() {
+    for empty in [false, true] {
+        let mut c = Cluster::start(3, TTL).await;
+        let l = c.wait_for_leader(SOON).await;
+        let others: Vec<usize> = (0..3).filter(|i| *i != l).collect();
+        for i in &others {
+            c.wait_following(*i, l, SOON).await;
+        }
+        let head = fill(&c.client(l).await, 5).await;
+        c.wait_heads(head, SOON).await;
+        c.stop_all().await;
+        let floor = retain_offline(
+            &c.nodes[l].dir.path().join("data").join("default"),
+            195,
+            100,
+        );
+        let (f1, f2) = (others[0], others[1]);
+        if empty {
+            std::fs::remove_dir_all(c.nodes[f2].dir.path().join("data")).unwrap();
+        }
+        c.restart(l).await;
+        c.restart(f1).await;
+        // The leader is ahead, so it wins; f1 at head 5 has nothing to
+        // pull and restores itself.
+        c.wait("the retained node leading", 3 * SOON, || {
+            c.leader() == Some(l)
+        })
+        .await;
+        // A subscription on f1 opened before the swap ends saying so.
+        let early = c.client(f1).await;
+        let mut sub = early.subscribe(0).await.unwrap();
+        c.restart(f2).await;
+        c.wait("both restored", 3 * SOON, || {
+            restores(&c, f1, "ok") == 1 && restores(&c, f2, "ok") == 1
+        })
+        .await;
+        for i in [f1, f2] {
+            c.wait_following(i, l, SOON).await;
+        }
+        c.wait_heads(200, SOON).await;
+        for i in [f1, f2] {
+            // The copy already holds the head; its puller connects after.
+            c.wait(&format!("node {i} connected"), SOON, || {
+                c.node(i).default_db().replica_status().connected
+            })
+            .await;
+            let info = c.client(i).await.info().await.unwrap();
+            assert_eq!((info.head, info.floor), (200, floor), "node {i}");
+            assert!(info.replica_connected);
+            let (a, b) = (
+                c.client(i).await.read_all(floor, 0).await.unwrap(),
+                c.client(l).await.read_all(floor, 0).await.unwrap(),
+            );
+            assert_eq!(
+                a.iter().map(|e| e.payload.clone()).collect::<Vec<_>>(),
+                b.iter().map(|e| e.payload.clone()).collect::<Vec<_>>()
+            );
+            assert_eq!(c.node(i).data_epoch(), c.node(l).data_epoch());
+        }
+        let ended = loop {
+            match tokio::time::timeout(SOON, sub.next()).await {
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(e))) => break e,
+                other => panic!("the early subscription did not end: {other:?}"),
+            }
+        };
+        assert!(
+            ended.to_string().contains("restored from the leader"),
+            "{ended}"
+        );
+        let kept = replaced_dirs(&c, f1);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0].starts_with("default.replaced-"), "{kept:?}");
+        assert!(
+            replaced_dirs(&c, f2).is_empty() == empty,
+            "{:?}",
+            replaced_dirs(&c, f2)
+        );
+        let head = fill(&c.client(l).await, 2).await;
+        c.wait_heads(head, SOON).await;
+        c.stop(l).await;
+        let l2 = c.wait_for_leader(SOON).await;
+        assert_ne!(l2, l);
+        c.stop_all().await;
+        // The kept copy is the old database, head 5.
+        let kept_db = chron::Db::open(
+            c.nodes[f1].dir.path().join("data").join(&kept[0]),
+            chron::Options::new().fsync(chron::Fsync::Never),
+        )
+        .unwrap();
+        assert_eq!(kept_db.head(), 5);
+    }
+}
+
+/// An old leader whose own writes lie entirely below the new leader's
+/// floor cannot cut back to a shared history: it restores itself and
+/// keeps its old copy, writes included, aside.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_whose_shared_history_lies_below_the_floor_restores_itself() {
+    let mut c = Cluster::start(3, TTL).await;
+    let l = c.wait_for_leader(SOON).await;
+    let others: Vec<usize> = (0..3).filter(|i| *i != l).collect();
+    for i in &others {
+        c.wait_following(*i, l, SOON).await;
+    }
+    let head = fill(&c.client(l).await, 5).await;
+    c.wait_heads(head, SOON).await;
+    c.stop_all().await;
+    // The old leader's own tail: 145 events nobody saw.
+    {
+        let db = chron::Db::open(
+            c.nodes[l].dir.path().join("data").join("default"),
+            chron::Options::new().fsync(chron::Fsync::Never),
+        )
+        .unwrap();
+        for i in 0..145 {
+            let mut t = db.transaction();
+            t.append_free(vec![chron::NewEvent::new(format!("lost-{i}"))]);
+            t.commit().unwrap();
+        }
+        assert_eq!(db.head(), 150);
+    }
+    let (f1, f2) = (others[0], others[1]);
+    let floor = retain_offline(
+        &c.nodes[f1].dir.path().join("data").join("default"),
+        115,
+        100,
+    );
+    c.restart(f1).await;
+    c.restart(f2).await;
+    c.wait("the retained node leading", 3 * SOON, || {
+        c.leader() == Some(f1)
+    })
+    .await;
+    c.restart(l).await;
+    c.wait("the old leader restored", 3 * SOON, || {
+        restores(&c, l, "ok") == 1
+    })
+    .await;
+    c.wait_following(l, f1, SOON).await;
+    c.wait_heads(120, SOON).await;
+    let info = c.client(l).await.info().await.unwrap();
+    assert_eq!((info.head, info.floor), (120, floor));
+    let kept = replaced_dirs(&c, l);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    c.stop_all().await;
+    let kept_db = chron::Db::open(
+        c.nodes[l].dir.path().join("data").join(&kept[0]),
+        chron::Options::new().fsync(chron::Fsync::Never),
+    )
+    .unwrap();
+    assert_eq!(kept_db.head(), 150);
+    assert_eq!(kept_db.read_all(149, 1).unwrap()[0].payload, "lost-144");
+}
+
+/// A fetched backup of another database is refused and the old copy stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fetched_backup_of_another_database_is_refused_and_the_old_copy_stays() {
+    let mut c = Cluster::start(3, TTL).await;
+    let l = c.wait_for_leader(SOON).await;
+    let others: Vec<usize> = (0..3).filter(|i| *i != l).collect();
+    for i in &others {
+        c.wait_following(*i, l, SOON).await;
+    }
+    let leader = c.client(l).await;
+    leader.create_database("orders").await.unwrap();
+    let head = fill(&leader, 5).await;
+    c.wait_heads(head, SOON).await;
+    c.stop_all().await;
+    retain_offline(
+        &c.nodes[l].dir.path().join("data").join("default"),
+        195,
+        100,
+    );
+    let f1 = others[0];
+    c.restart(l).await;
+    c.node(l)
+        .fetch_alias
+        .lock()
+        .unwrap()
+        .insert("default".into(), "orders".into());
+    c.restart(f1).await;
+    c.wait("the retained node leading", 3 * SOON, || {
+        c.leader() == Some(l)
+    })
+    .await;
+    c.wait("the wrong backup refused", 3 * SOON, || {
+        restores(&c, f1, "error") >= 1
+    })
+    .await;
+    // The puller records the refusal, then goes on trying; catch it.
+    c.wait("the refusal in last_error", SOON, || {
+        c.node(f1)
+            .default_db()
+            .replica_status()
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("is of database"))
+    })
+    .await;
+    assert_eq!(c.node(f1).default_db().db.head(), 5);
+    assert!(
+        replaced_dirs(&c, f1).is_empty(),
+        "{:?}",
+        replaced_dirs(&c, f1)
+    );
+    c.node(l).fetch_alias.lock().unwrap().clear();
+    c.wait("restored once the alias is gone", 3 * SOON, || {
+        restores(&c, f1, "ok") == 1
+    })
+    .await;
+    c.wait_following(f1, l, SOON).await;
+    c.wait_heads(200, SOON).await;
     c.stop_all().await;
 }

@@ -82,16 +82,21 @@ A planned switchover to `$B`:
    next heartbeat.
 4. Resume writers; `chron --addr $A,$B,$C status` is healthy on `$B`.
 
-A node that stays refused as diverged (its `last_error` says "restore
-this node from a backup of the leader": the shared history lies below a
-retention floor):
+A node whose shared history lies below the leader's retention floor, or
+an empty or long-stopped node joining a retained group, restores itself
+from the leader's backup over the wire: `chron_restores_total{result="ok"}`
+rises on it, its log says "replaced by a copy restored from the leader",
+and its old directory stays beside the data as
+`<data_dir>/<db>.replaced-<nanos>` (the diverged case's own writes are in
+there; remove it when no longer needed). What stays manual:
 
-1. `chron --addr $X info` shows `role replica`, `last_error` with
-   "diverged" and the leader's address.
-2. Stop it, move its data directory aside, restore every database from a
-   backup of the leader (next runbook) and remove any `promoted`,
-   `fenced` or `vote` marker from the directory.
-3. Start it with the group's flags; it follows the leader and catches up.
+- an identity mismatch ("is database X; the leader serves Y"): the node
+  was never a copy of this group's database; move its data directory
+  aside and start it empty;
+- a restore that fails for space or permissions
+  (`chron_restores_total{result="error"}`, `last_error` on `chron info`):
+  fix the cause; the node tries again on its own;
+- a node without peers (`--replicate-from`): see the next runbook.
 
 A leader whose lease keeps expiring (`chron_lease_remaining_seconds` at
 0, `chron_heartbeat_failures_total` rising): the majority cannot be
@@ -99,24 +104,31 @@ reached within a third of the lease. Check the network between the
 nodes before raising `--lease-ttl`; a longer lease is a longer outage
 when a leader is cut off, and more writes on it that will be lost.
 
-## Restoring a replica from a backup
+## Restoring a replica from the leader
 
-1. On the leader (started with `--backup-dir`):
-   `chron --addr $LEADER backup full.chronbak` (per database: `--db NAME`).
-2. Copy `<backup_dir>/<db>/full.chronbak` to the replica host.
-3. `chron restore full.chronbak DIR/<db>` for every database, then
-   `chron verify DIR/<db>`. The directory `DIR` is the data directory;
+With peers nothing to do: a node below the leader's floor fetches the
+leader's backup and restores itself (previous section). Without peers,
+on the replica host:
+
+1. `chron --addr $LEADER backup --fetch full.chronbak --db NAME` for
+   every database (any node serves it; no `--backup-dir` needed; the
+   leader's retention and other backups of that database wait while the
+   transfer runs).
+2. `chron restore full.chronbak DIR/NAME` for each, then
+   `chron verify DIR/NAME`. The directory `DIR` is the data directory;
    each database is a subdirectory, `default` at least.
-4. Remove any `promoted` or `fenced` marker in `DIR`.
-5. `chrond --data-dir DIR --replicate-from $LEADER --replicate-token-file FILE`.
-6. Watch `chron_replication_lag_events` reach 0, or
+3. Remove any `promoted` or `fenced` marker in `DIR`.
+4. `chrond --data-dir DIR --replicate-from $LEADER --replicate-token-file FILE`.
+5. Watch `chron_replication_lag_events` reach 0, or
    `chron --addr $REPLICA status --max-lag 0`.
 
 ## Retention
 
 1. Take a full backup first (above).
-2. Every replica must be caught up (`status --max-lag 0` on each): a
-   replica below the leader's floor cannot resume and must be restored.
+2. Every replica should be caught up (`status --max-lag 0` on each): a
+   replica below the leader's floor cannot resume; with peers it
+   restores itself from the leader over the wire, without peers an
+   operator does (two runbooks above).
 3. `chron --addr $LEADER retain FLOOR`, then the same on each replica.
 4. `chron info` (or `chron_floor`) confirms the floor, which lands on a
    segment boundary at or below FLOOR.
@@ -174,6 +186,8 @@ PromQL:
 - Group commit effectiveness: `rate(chron_transactions_committed_total[5m]) / rate(chron_commit_batches_total[5m])`
 - Gateway error ratio: `sum by (route, status) (rate(chron_http_requests_total{status=~"5.."}[5m]))`
 - Leader changes: `increase(chron_leader_changes_total[1h])`
+- Restores over the wire: `increase(chron_restores_total[1h])`, and an
+  alert on `increase(chron_restores_total{result="error"}[10m]) > 0`
 - Sync wait p99: `histogram_quantile(0.99, sum by (le) (rate(chron_sync_commit_wait_seconds_bucket[5m])))`
 - Confirmation lag on the leader: `chron_head - chron_majority_applied`
 - Lease health on the leader: `min_over_time(chron_lease_remaining_seconds[5m])`

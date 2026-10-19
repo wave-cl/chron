@@ -387,6 +387,17 @@ pub struct FingerprintsResponse {
     #[prost(message, repeated, tag = "1")]
     pub fingerprints: ::prost::alloc::vec::Vec<FingerprintAt>,
 }
+/// A full backup of the database as the archive's bytes, in order: what
+/// `chron restore` reads. Needs no --backup-dir and is served in every
+/// role; the database's Retain and Backup wait while it runs. An admin
+/// call.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FetchBackupRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BackupChunk {
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DiscoverRequest {}
 /// Who leads, as this node knows it. Open to any token.
@@ -1186,6 +1197,30 @@ pub mod chron_client {
             req.extensions_mut().insert(GrpcMethod::new("chron.v1.Chron", "Follow"));
             self.inner.streaming(req, path, codec).await
         }
+        pub async fn fetch_backup(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FetchBackupRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::BackupChunk>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/FetchBackup",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("chron.v1.Chron", "FetchBackup"));
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1360,6 +1395,19 @@ pub mod chron_server {
             &self,
             request: tonic::Request<tonic::Streaming<super::FollowRequest>>,
         ) -> std::result::Result<tonic::Response<Self::FollowStream>, tonic::Status>;
+        /// Server streaming response type for the FetchBackup method.
+        type FetchBackupStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::BackupChunk, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn fetch_backup(
+            &self,
+            request: tonic::Request<super::FetchBackupRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::FetchBackupStream>,
+            tonic::Status,
+        >;
     }
     /// Every database of one daemon over one service. A call names its
     /// database with the metadata `chron-db: <name>` (`[a-z0-9_-]{1,64}`);
@@ -2469,6 +2517,52 @@ pub mod chron_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/FetchBackup" => {
+                    #[allow(non_camel_case_types)]
+                    struct FetchBackupSvc<T: Chron>(pub Arc<T>);
+                    impl<
+                        T: Chron,
+                    > tonic::server::ServerStreamingService<super::FetchBackupRequest>
+                    for FetchBackupSvc<T> {
+                        type Response = super::BackupChunk;
+                        type ResponseStream = T::FetchBackupStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FetchBackupRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::fetch_backup(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FetchBackupSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

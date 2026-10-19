@@ -44,6 +44,7 @@ pub const METHODS: &[(&str, bool)] = &[
     ("/chron.v1.Chron/Discover", false),
     ("/chron.v1.Chron/Fingerprints", false),
     ("/chron.v1.Chron/Follow", true),
+    ("/chron.v1.Chron/FetchBackup", true),
     ("/grpc.health.v1.Health/Check", false),
     ("/grpc.health.v1.Health/Watch", true),
 ];
@@ -130,6 +131,10 @@ pub struct Metrics {
     pub sync_wait: HistogramVec,
     /// Sync commits answered "unconfirmed", by reason.
     pub sync_timeouts: IntCounterVec,
+    /// FetchBackup streams served, by result.
+    pub backup_fetches: IntCounterVec,
+    /// Databases this daemon replaced with a copy fetched from the leader.
+    pub restores: IntCounterVec,
     start_time: IntGauge,
 }
 
@@ -217,6 +222,16 @@ impl Metrics {
             "heartbeats a peer did not answer",
             &["peer"],
         );
+        let backup_fetches = counter(
+            "chron_backup_fetches_total",
+            "FetchBackup streams by result: ok, error, cancelled",
+            &["db", "result"],
+        );
+        let restores = counter(
+            "chron_restores_total",
+            "databases replaced by a copy fetched from the leader, by result: ok, error",
+            &["db", "result"],
+        );
         let build_info = gauge("chron_build_info", "chrond version", &["version"]);
         build_info
             .with_label_values(&[env!("CARGO_PKG_VERSION")])
@@ -246,6 +261,8 @@ impl Metrics {
             Box::new(heartbeat_failures.clone()),
             Box::new(sync_wait.clone()),
             Box::new(sync_timeouts.clone()),
+            Box::new(backup_fetches.clone()),
+            Box::new(restores.clone()),
             Box::new(build_info),
             Box::new(start_time.clone()),
         ] {
@@ -266,6 +283,8 @@ impl Metrics {
             heartbeat_failures,
             sync_wait,
             sync_timeouts,
+            backup_fetches,
+            restores,
             start_time,
         })
     }

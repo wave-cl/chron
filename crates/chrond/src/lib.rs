@@ -503,9 +503,43 @@ fn migrate_layout(data_dir: &Path) -> anyhow::Result<()> {
 
 /// Opens every database directory under `data_dir` (creating `default`
 /// when missing) and settles their epochs on the highest one.
+/// Finishes or undoes a swap a crash interrupted: `<name>.fetched`
+/// without `<name>` is a restored copy whose old directory was already
+/// moved aside, so it takes its place; with `<name>` present it is an
+/// unfinished fetch and goes; a `.<name>.fetched.restore` staging
+/// directory goes. `<name>.replaced-*` directories are never touched.
+fn repair_swaps(data_dir: &Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(data_dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some(stem) = file_name
+            .strip_suffix(".fetched.restore")
+            .and_then(|s| s.strip_prefix('.'))
+        {
+            tracing::warn!(database = %stem, "removing a restore a crash interrupted");
+            std::fs::remove_dir_all(entry.path())?;
+        } else if let Some(name) = file_name.strip_suffix(".fetched") {
+            let target = data_dir.join(name);
+            if target.exists() {
+                tracing::warn!(database = %name, "removing a fetched copy a crash left beside the database");
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                tracing::warn!(database = %name, "completing a swap a crash interrupted: the fetched copy takes the database's place");
+                std::fs::rename(entry.path(), &target)?;
+                std::fs::File::open(data_dir)?.sync_all()?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn open_all(node: &Arc<Node>) -> anyhow::Result<()> {
     std::fs::create_dir_all(&node.data_dir)
         .with_context(|| format!("cannot create {}", node.data_dir.display()))?;
+    repair_swaps(&node.data_dir).context("repair an interrupted restore")?;
     let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&node.data_dir)
         .with_context(|| format!("cannot read {}", node.data_dir.display()))?
@@ -517,6 +551,8 @@ async fn open_all(node: &Arc<Node>) -> anyhow::Result<()> {
         }
         if chron_proto::valid_database_name(&name) {
             names.push(name);
+        } else if name.contains(".replaced-") {
+            tracing::info!(entry = %name, "a database copy kept aside by a restore; remove it when no longer needed");
         } else {
             tracing::warn!(entry = %name, "not a database name; ignored");
         }
@@ -623,6 +659,15 @@ async fn settle_role(node: &Arc<Node>, opts: &Options) -> anyhow::Result<()> {
                 }
                 Err(e @ replica::CheckError::Diverged { .. }) => {
                     anyhow::bail!("cannot replicate {}: {}", dbn.name, e.message())
+                }
+                Err(e @ replica::CheckError::BelowFloor { .. }) => {
+                    anyhow::bail!(
+                        "cannot replicate {}: {}; fetch a backup with `chron --addr LEADER backup --fetch FILE --db {}`, `chron restore FILE DIR/{}`, then start again",
+                        dbn.name,
+                        e.message(),
+                        dbn.name,
+                        dbn.name
+                    )
                 }
             };
             streams.push((dbn, stream));

@@ -339,3 +339,80 @@ fn restore_of_a_retained_db_keeps_the_floor_and_an_empty_db_round_trips() {
     fill(&r, agg(1), 1);
     assert_eq!(r.head(), 1);
 }
+
+#[test]
+fn a_streamed_backup_matches_the_file_and_restores_from_a_reader() {
+    let d = tmp();
+    let db = open_with(d.path(), small());
+    write_some(&db, 0, 40);
+    let file = d.path().join("full.chronbak");
+    let meta_file = db.backup(&file).unwrap();
+    let mut bytes = Vec::new();
+    let meta_stream = db.backup_to(&mut bytes).unwrap();
+    assert_eq!(meta_stream.bytes, bytes.len() as u64);
+    assert_eq!(
+        (
+            meta_stream.head,
+            meta_stream.floor,
+            meta_stream.db_id,
+            meta_stream.files
+        ),
+        (
+            meta_file.head,
+            meta_file.floor,
+            meta_file.db_id,
+            meta_file.files
+        )
+    );
+    // Identical between the header (which carries its own timestamp) and
+    // the crc (which covers the header).
+    let on_disk = std::fs::read(&file).unwrap();
+    let skip = |b: &[u8]| 12 + u32::from_be_bytes(b[8..12].try_into().unwrap()) as usize;
+    assert_eq!(
+        &on_disk[skip(&on_disk)..on_disk.len() - 4],
+        &bytes[skip(&bytes)..bytes.len() - 4]
+    );
+    let target = d.path().join("restored");
+    let meta = chron::restore_backup_from(std::io::Cursor::new(bytes), &target, &small()).unwrap();
+    assert_eq!(meta.head, meta_file.head);
+    let restored = open_with(&target, small());
+    assert_eq!(snapshot(&restored), snapshot(&db));
+}
+
+#[test]
+fn a_damaged_or_truncated_stream_is_refused_and_leaves_nothing() {
+    let d = tmp();
+    let db = open_with(d.path(), small());
+    write_some(&db, 0, 40);
+    let mut bytes = Vec::new();
+    db.backup_to(&mut bytes).unwrap();
+    let target = d.path().join("restored");
+    let staging = d.path().join(".restored.restore");
+    let refused = |bytes: Vec<u8>, what: &str| {
+        let r = chron::restore_backup_from(std::io::Cursor::new(bytes), &target, &small());
+        assert!(matches!(r, Err(Error::Corrupt { .. })), "{what}: {r:?}");
+        assert!(
+            !target.exists() && !staging.exists(),
+            "{what} left a directory"
+        );
+    };
+    // A flipped byte inside the agg_len entry: only the crc can tell.
+    let mut flipped = bytes.clone();
+    let n = flipped.len();
+    flipped[n - 30] ^= 0x01;
+    refused(flipped, "a flipped byte");
+    refused(bytes[..bytes.len() - 3].to_vec(), "a chopped trailer");
+    let mut bad_header = bytes.clone();
+    bad_header[8..12].copy_from_slice(&0xFFFF_FFF0u32.to_be_bytes());
+    refused(bad_header, "an implausible header length");
+    // An entry claiming u64::MAX bytes: refused when the stream ends, not
+    // by allocating that much.
+    let header_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let first_entry = 12 + header_len;
+    let name_len =
+        u16::from_be_bytes(bytes[first_entry + 1..first_entry + 3].try_into().unwrap()) as usize;
+    let len_at = first_entry + 3 + name_len;
+    let mut huge = bytes.clone();
+    huge[len_at..len_at + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+    refused(huge, "a huge entry length");
+}

@@ -40,11 +40,15 @@ pub fn ended(role: Option<Role>) -> Status {
     }
 }
 
-/// The database's token fired: the daemon is stopping, or the database
-/// was dropped.
-pub fn gone(node: &Node) -> Status {
+/// The database's token fired: the daemon is stopping, the database was
+/// replaced by a copy restored from the leader, or it was dropped.
+pub fn gone(node: &Node, dbn: &DbNode) -> Status {
     if node.cancel.is_cancelled() {
         ended(None)
+    } else if dbn.replaced.load(std::sync::atomic::Ordering::Acquire) {
+        Status::unavailable(
+            "the database was replaced by a copy restored from the leader; positions were rewritten, reconnect",
+        )
     } else {
         Status::unavailable("the database was dropped")
     }
@@ -145,7 +149,7 @@ pub fn subscribe(
             let next = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    let _ = tx.send(Err(gone(&node))).await;
+                    let _ = tx.send(Err(gone(&node, &dbn))).await;
                     return;
                 }
                 r = role_lost(&mut role, false) => {
@@ -165,7 +169,7 @@ pub fn subscribe(
                             }
                             s
                         }
-                        Err(_) => gone(&node),
+                        Err(_) => gone(&node, &dbn),
                     };
                     let _ = tx.send(Err(status)).await;
                     return;

@@ -344,6 +344,15 @@ impl Db {
         backup::write_full(&self.inner, archive.as_ref())
     }
 
+    /// [`backup`](Db::backup) to any sink: the archive's bytes, in order,
+    /// as the file would hold them, with `bytes` counting them. Nothing is
+    /// fsynced. The database's maintenance lock is held until the sink has
+    /// taken the last byte, so a slow sink holds up retention and other
+    /// backups of this database, not commits.
+    pub fn backup_to(&self, out: &mut impl std::io::Write) -> Result<BackupMeta> {
+        backup::write_full_to(&self.inner, out, Path::new("<backup stream>"))
+    }
+
     /// Writes an incremental backup holding the events at positions
     /// `since..head`, to be applied with [`apply_backup`](Db::apply_backup)
     /// onto a database whose head is `since`. `since` past the head is

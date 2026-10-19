@@ -34,13 +34,32 @@ pub enum CheckError {
         leader_head: u64,
         leader_floor: u64,
     },
+    /// This replica's head lies below the leader's retention floor (or
+    /// it is empty and the leader retained): nothing to pull from. With
+    /// peers the replica restores itself from the leader's backup;
+    /// otherwise an operator does.
+    BelowFloor {
+        message: String,
+        leader: LeaderFacts,
+    },
+}
+
+/// What `Info` on the leader said, for a restore.
+#[derive(Debug, Clone)]
+pub struct LeaderFacts {
+    pub id: chron::Uuid,
+    pub head: u64,
+    pub floor: u64,
+    pub epoch: u64,
 }
 
 impl CheckError {
     pub fn message(&self) -> &str {
         match self {
             CheckError::Unreachable(m) | CheckError::Refused(m) => m,
-            CheckError::Diverged { message, .. } => message,
+            CheckError::Diverged { message, .. } | CheckError::BelowFloor { message, .. } => {
+                message
+            }
         }
     }
 }
@@ -173,6 +192,12 @@ pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<Followi
     } else {
         None
     };
+    let facts = LeaderFacts {
+        id: leader_id,
+        head: info.head,
+        floor: info.floor,
+        epoch: info.epoch,
+    };
     let diverged = |e: ClientError| match &e {
         ClientError::Fenced { message, .. } if message.starts_with("diverged") => {
             CheckError::Diverged {
@@ -181,6 +206,12 @@ pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<Followi
                 leader_floor: info.floor,
             }
         }
+        ClientError::BelowFloor { position, floor } => CheckError::BelowFloor {
+            message: format!(
+                "{addr}: this replica's head {position} is below the leader's floor {floor}; a backup of the leader is needed"
+            ),
+            leader: facts.clone(),
+        },
         _ => unreachable(addr, e),
     };
     let following = match &node.cluster {
@@ -242,26 +273,49 @@ pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<Followi
 /// backup, the cut and the reset notice run as one task that is always
 /// finished, so a transition cannot leave a half-cut database or an
 /// archive overwritten by a later, empty one. Returns the new head.
+/// Why a resync could not cut back.
+pub enum ResyncError {
+    /// The shared history lies below a retention floor: a cut cannot
+    /// reach it; only a backup of the leader can.
+    NoSharedHistory(String),
+    /// Anything else; retried later.
+    Failed(String),
+}
+
+impl From<String> for ResyncError {
+    fn from(s: String) -> Self {
+        ResyncError::Failed(s)
+    }
+}
+
+impl From<&str> for ResyncError {
+    fn from(s: &str) -> Self {
+        ResyncError::Failed(s.to_string())
+    }
+}
+
 async fn resync(
     node: &Arc<Node>,
     dbn: &Arc<DbNode>,
     leader_head: u64,
     leader_floor: u64,
     cancel: &CancellationToken,
-) -> Result<u64, String> {
-    let up = node.upstream().ok_or("no leader configured")?;
+) -> Result<u64, ResyncError> {
+    let up = node
+        .upstream()
+        .ok_or_else(|| ResyncError::Failed("no leader configured".into()))?;
     let client = connect(&up)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| ResyncError::Failed(e.to_string()))?
         .database(&dbn.name);
     let db = dbn.db.clone();
     let head = db.head();
     let hi = head.min(leader_head);
     let lo = db.floor().max(leader_floor);
     if hi <= lo {
-        return Err(format!(
+        return Err(ResyncError::NoSharedHistory(format!(
             "no shared history above the floors ({lo}); restore this node from a backup of the leader"
-        ));
+        )));
     }
     // Candidate positions, highest first: hi-1, hi-2, hi-4, ... and lo.
     let mut probes = Vec::new();
@@ -309,9 +363,9 @@ async fn resync(
     let same = compare(probes.clone(), theirs).await?;
     // The first probe (highest) that matches, and the lowest that did not.
     let Some(k) = same.iter().position(|m| *m) else {
-        return Err(format!(
+        return Err(ResyncError::NoSharedHistory(format!(
             "no shared history between {lo} and {hi}; restore this node from a backup of the leader"
-        ));
+        )));
     };
     let mut good = probes[k];
     let mut bad = if k == 0 { hi } else { probes[k - 1] };
@@ -328,9 +382,9 @@ async fn resync(
         }
     }
     if bad >= head {
-        return Err(format!(
+        return Err(ResyncError::Failed(format!(
             "the shared history reaches this node's head {head}, yet the leader refused it; restore this node from a backup of the leader"
-        ));
+        )));
     }
     // Positions below `bad` are shared; the cut goes at the transaction
     // boundary at or below `bad`, found by reading backward in pages.
@@ -358,9 +412,9 @@ async fn resync(
     })
     .await?;
     if to >= head {
-        return Err(format!(
+        return Err(ResyncError::Failed(format!(
             "the shared history reaches this node's head {head}, yet the leader refused it; restore this node from a backup of the leader"
-        ));
+        )));
     }
     // The cut itself: not cancellable, awaited whatever happens to the
     // caller, so a transition during a resync finds a whole database.
@@ -402,11 +456,222 @@ async fn resync(
         dbn2.reset.send_replace(Some(to));
         Ok(to)
     });
-    cut.await.map_err(|e| format!("cut task: {e}"))?
+    cut.await
+        .map_err(|e| ResyncError::Failed(format!("cut task: {e}")))?
+        .map_err(ResyncError::Failed)
+}
+
+/// A reader over the chunks of a fetched backup, for the library's
+/// synchronous restore on the blocking pool.
+struct ChannelReader {
+    rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    cur: bytes::Bytes,
+}
+
+impl std::io::Read for ChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.cur.is_empty() {
+            match self.rx.blocking_recv() {
+                Some(b) => self.cur = b,
+                None => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.cur.len());
+        buf[..n].copy_from_slice(&self.cur[..n]);
+        self.cur = self.cur.slice(n..);
+        Ok(n)
+    }
+}
+
+/// Replaces this database with a copy restored from the leader's backup:
+/// the archive streams straight into the library's restore at
+/// `<data_dir>/<name>.fetched` (no file on disk), the copy's identity is
+/// checked, and then, briefly serialised with the other database
+/// operations, the old directory moves to `<name>.replaced-<nanos>` (an
+/// empty one is removed), the copy takes its place, a new `DbNode` with
+/// its own puller replaces this one in the map (`default` is never
+/// absent) and the old node's streams end saying so. A failure before the
+/// swap leaves the old database running. Returns once the new node is
+/// in place; the caller, the old puller, then ends.
+async fn self_restore(
+    node: &Arc<Node>,
+    dbn: &Arc<DbNode>,
+    leader: &LeaderFacts,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    let name = dbn.name.clone();
+    let fetched = node.data_dir.join(format!("{name}.fetched"));
+    let staging = node.data_dir.join(format!(".{name}.fetched.restore"));
+    for leftover in [&fetched, &staging] {
+        if leftover.exists() {
+            std::fs::remove_dir_all(leftover)
+                .map_err(|e| format!("cannot remove {}: {e}", leftover.display()))?;
+        }
+    }
+    let up = node.upstream().ok_or("no leader configured")?;
+    let client = connect(&up)
+        .await
+        .map_err(|e| e.to_string())?
+        .database(&name);
+    let mut stream = client
+        .fetch_backup()
+        .await
+        .map_err(|e| format!("FetchBackup on {}: {e}", up.addr))?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+    let target = fetched.clone();
+    let opts = node.db_opts.clone();
+    let restore = tokio::task::spawn_blocking(move || {
+        chron::restore_backup_from(
+            ChannelReader {
+                rx,
+                cur: bytes::Bytes::new(),
+            },
+            &target,
+            &opts,
+        )
+    });
+    let forwarded: Result<(), String> = async {
+        loop {
+            let item = tokio::select! {
+                _ = cancel.cancelled() => return Err("cancelled during the fetch".to_string()),
+                i = stream.next() => i,
+            };
+            match item {
+                Some(Ok(b)) => {
+                    if tx.send(b).await.is_err() {
+                        return Err("the restore stopped reading".into());
+                    }
+                }
+                Some(Err(e)) => return Err(format!("the backup stream failed: {e}")),
+                None => return Ok(()),
+            }
+        }
+    }
+    .await;
+    drop(tx);
+    let restored = restore.await.map_err(|e| format!("restore task: {e}"))?;
+    let fail = |node: &Node, name: &str, what: String| {
+        node.metrics
+            .restores
+            .with_label_values(&[name, "error"])
+            .inc();
+        let _ = std::fs::remove_dir_all(&fetched);
+        Err(what)
+    };
+    let meta = match (forwarded, restored) {
+        (Err(e), _) => return fail(node, &name, e),
+        (Ok(()), Err(e)) => return fail(node, &name, format!("restore: {e}")),
+        (Ok(()), Ok(m)) => m,
+    };
+    if meta.db_id != Some(leader.id) {
+        return fail(
+            node,
+            &name,
+            format!(
+                "the fetched backup is of database {:?}; this node follows {}",
+                meta.db_id, leader.id
+            ),
+        );
+    }
+    // The swap.
+    let _ops = node.admin_ops.lock().await;
+    let current = node.get(&name);
+    if !current.as_ref().is_some_and(|d| Arc::ptr_eq(d, dbn)) || node.role() != Role::Replica {
+        return fail(
+            node,
+            &name,
+            "the database or the role changed during the fetch; not swapped".into(),
+        );
+    }
+    dbn.replaced
+        .store(true, std::sync::atomic::Ordering::Release);
+    dbn.cancel.cancel();
+    let old_dir = node.database_dir(&name);
+    let (old_head, old_floor, old_epoch) = (dbn.db.head(), dbn.db.floor(), dbn.db.epoch());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let replaced = node.data_dir.join(format!("{name}.replaced-{nanos}"));
+    let data_dir = node.data_dir.clone();
+    let n = node.clone();
+    let name2 = name.clone();
+    let leader_epoch = leader.epoch;
+    let (fetched2, old_dir2, replaced2) = (fetched.clone(), old_dir.clone(), replaced.clone());
+    let opened = tokio::task::spawn_blocking(move || -> Result<chron::Db, String> {
+        if old_head == 0 && old_floor == 0 {
+            std::fs::remove_dir_all(&old_dir2)
+                .map_err(|e| format!("cannot remove the empty {}: {e}", old_dir2.display()))?;
+        } else {
+            std::fs::rename(&old_dir2, &replaced2).map_err(|e| {
+                format!(
+                    "cannot move {} to {}: {e}",
+                    old_dir2.display(),
+                    replaced2.display()
+                )
+            })?;
+        }
+        std::fs::rename(&fetched2, &old_dir2)
+            .map_err(|e| format!("cannot move the restored copy into place: {e}"))?;
+        std::fs::File::open(&data_dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| format!("cannot sync {}: {e}", data_dir.display()))?;
+        let db = n.open_database(&name2).map_err(|e| e.to_string())?;
+        // The copy holds everything the leader held at its election and
+        // more, so the leader's epoch is honest for it.
+        let epoch = leader_epoch.max(old_epoch).max(db.epoch());
+        db.set_epoch(epoch).map_err(|e| e.to_string())?;
+        Ok(db)
+    })
+    .await
+    .map_err(|e| format!("swap task: {e}"))?;
+    let db = match opened {
+        Ok(db) => db,
+        Err(e) => {
+            node.metrics
+                .restores
+                .with_label_values(&[&name, "error"])
+                .inc();
+            return Err(format!(
+                "{e}; the database directory may need a hand: {}",
+                old_dir.display()
+            ));
+        }
+    };
+    let fresh = DbNode::new(name.clone(), db, node);
+    {
+        let mut puller = fresh.puller.lock().await;
+        node.insert(fresh.clone());
+        *puller = Some(spawn(node.clone(), fresh.clone(), None));
+    }
+    node.metrics
+        .restores
+        .with_label_values(&[&name, "ok"])
+        .inc();
+    tracing::warn!(database = %name, old_head, old_floor, head = fresh.db.head(), floor = fresh.db.floor(), leader_head = leader.head, leader_floor = leader.floor, kept = %replaced.display(), "replaced by a copy restored from the leader");
+    Ok(())
 }
 
 /// Records per page when walking back to a transaction boundary.
 const PAGE_BACK: usize = 256;
+
+/// What the leader says about itself, for a restore after a failed cut.
+async fn leader_facts(node: &Arc<Node>, dbn: &DbNode) -> Result<LeaderFacts, String> {
+    let up = node.upstream().ok_or("no leader configured")?;
+    let client = connect(&up)
+        .await
+        .map_err(|e| e.to_string())?
+        .database(&dbn.name);
+    let info = tokio::time::timeout(INFO_TIMEOUT, client.info())
+        .await
+        .map_err(|_| format!("{} did not answer Info", up.addr))?
+        .map_err(|e| format!("Info on {}: {e}", up.addr))?;
+    Ok(LeaderFacts {
+        id: info.db_id,
+        head: info.head,
+        floor: info.floor,
+        epoch: info.epoch,
+    })
+}
 
 /// Stops the discoverer and every database's puller.
 pub async fn stop_all(node: &Arc<Node>) {
@@ -504,9 +769,37 @@ async fn pull(
                                 tracing::warn!(database = %dbn.name, head = to, "cut back to the history shared with the leader; the dropped tail is kept as a backup");
                                 backoff = BACKOFF_MIN;
                             }
+                            Err(ResyncError::NoSharedHistory(e)) => {
+                                record_error(node, dbn, e);
+                                match leader_facts(node, dbn).await {
+                                    Ok(facts) => {
+                                        match self_restore(node, dbn, &facts, cancel).await {
+                                            Ok(()) => return,
+                                            Err(e) => record_error(node, dbn, e),
+                                        }
+                                    }
+                                    Err(e) => record_error(node, dbn, e),
+                                }
+                            }
+                            Err(ResyncError::Failed(e)) => record_error(node, dbn, e),
+                        }
+                    }
+                    Err(CheckError::BelowFloor { message, leader }) if node.cluster.is_some() => {
+                        record_error(node, dbn, message);
+                        match self_restore(node, dbn, &leader, cancel).await {
+                            // The new node has its own puller; this one ends.
+                            Ok(()) => return,
                             Err(e) => record_error(node, dbn, e),
                         }
                     }
+                    Err(CheckError::BelowFloor { message, .. }) => record_error(
+                        node,
+                        dbn,
+                        format!(
+                            "{message}; without peers: chron --addr LEADER backup --fetch FILE --db {}, chron restore FILE DIR/{}, then restart",
+                            dbn.name, dbn.name
+                        ),
+                    ),
                     Err(e) => record_error(node, dbn, e.message().to_string()),
                 }
             },

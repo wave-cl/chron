@@ -267,3 +267,27 @@ async fn database_config_and_rebinding_route_calls() {
     ));
     f.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_backup_to_writes_a_restorable_archive() {
+    let f = Fixture::start().await;
+    for i in 0..3 {
+        let mut t = Transaction::new();
+        t.append_free(vec![NewEvent::new(format!("e{i}"))]);
+        f.client.commit(t).await.unwrap();
+    }
+    let path = f.dir.path().join("fetched.chronbak");
+    let meta = f.client.fetch_backup_to(&path).await.unwrap();
+    let info = f.client.info().await.unwrap();
+    assert_eq!((meta.head, meta.db_id), (3, Some(info.db_id)));
+    assert_eq!(meta.bytes, std::fs::metadata(&path).unwrap().len());
+    assert!(!f.dir.path().join("fetched.chronbak.tmp").exists());
+    let restored = f.dir.path().join("restored");
+    chron::restore_backup(&path, &restored, &chron::Options::new()).unwrap();
+    let db = chron::Db::open(&restored, chron::Options::new().fsync(chron::Fsync::Never)).unwrap();
+    assert_eq!(db.head(), 3);
+    // A second fetch replaces the file through its .tmp and rename.
+    let again = f.client.fetch_backup_to(&path).await.unwrap();
+    assert_eq!(again.head, 3);
+    assert!(!f.dir.path().join("fetched.chronbak.tmp").exists());
+}

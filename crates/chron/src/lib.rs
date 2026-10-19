@@ -34,7 +34,7 @@ mod subscribe;
 mod truncate;
 mod txn;
 
-pub use backup::{BackupKind, BackupMeta, inspect_backup, restore_backup};
+pub use backup::{BackupKind, BackupMeta, inspect_backup, restore_backup, restore_backup_from};
 pub use bytes::Bytes;
 pub use db::{Db, EventIter, Info, Stats, WriterHold};
 pub use error::{Error, Result};

@@ -261,6 +261,13 @@ message FingerprintAt {
 }
 message FingerprintsResponse { repeated FingerprintAt fingerprints = 1; }
 
+// A full backup of the database as the archive's bytes, in order: what
+// `chron restore` reads. Needs no --backup-dir and is served in every
+// role; the database's Retain and Backup wait while it runs. An admin
+// call.
+message FetchBackupRequest {}
+message BackupChunk { bytes data = 1; }
+
 message DiscoverRequest {}
 
 // Who leads, as this node knows it. Open to any token.
@@ -406,4 +413,5 @@ service Chron {
   // each applied head so the leader can confirm sync commits. An admin
   // call; UNIMPLEMENTED on a daemon before 0.4.0.
   rpc Follow(stream FollowRequest) returns (stream ReplicationChunk);
+  rpc FetchBackup(FetchBackupRequest) returns (stream BackupChunk);
 }

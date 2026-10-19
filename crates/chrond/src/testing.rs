@@ -321,7 +321,7 @@ impl Cluster {
                         r.node.role(),
                         r.node.data_epoch(),
                         r.node.floor_epoch(),
-                        r.db.head(),
+                        r.node.default_db().db.head(),
                         r.node.leader_addr(),
                         r.node.lease_remaining(),
                         st.connected,
@@ -421,7 +421,7 @@ impl Cluster {
             self.nodes
                 .iter()
                 .filter_map(|n| n.running.as_ref())
-                .all(|r| r.db.head() == head)
+                .all(|r| r.node.default_db().db.head() == head)
         })
         .await;
     }

@@ -152,10 +152,15 @@ pub async fn flush(conn: &Conn, format: Format) -> anyhow::Result<()> {
 #[derive(Args, Debug)]
 pub struct BackupArgs {
     /// File name under the daemon's backup directory (--backup-dir).
-    archive: String,
+    #[arg(required_unless_present = "fetch", conflicts_with = "fetch")]
+    archive: Option<String>,
     /// Incremental: the events from this position on.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "fetch")]
     since: Option<u64>,
+    /// Download a full backup to this local file instead (the daemon
+    /// needs no --backup-dir; any node of a group serves it).
+    #[arg(long, value_name = "FILE")]
+    fetch: Option<std::path::PathBuf>,
 }
 
 pub fn meta_json(m: &BackupMeta) -> serde_json::Value {
@@ -184,9 +189,21 @@ pub fn meta_human(m: &BackupMeta) -> String {
 }
 
 pub async fn backup(conn: &Conn, format: Format, a: BackupArgs) -> anyhow::Result<()> {
+    if let Some(path) = &a.fetch {
+        let m = client::connect(conn).await?.fetch_backup_to(path).await?;
+        let mut j = meta_json(&m);
+        j["path"] = json!(path.display().to_string());
+        print_value(
+            format,
+            format!("{} -> {}", meta_human(&m), path.display()),
+            j,
+        );
+        return Ok(());
+    }
+    let archive = a.archive.expect("clap requires one of archive and --fetch");
     let m = client::connect(conn)
         .await?
-        .backup(&a.archive, a.since)
+        .backup(&archive, a.since)
         .await?;
     print_value(format, meta_human(&m), meta_json(&m));
     Ok(())

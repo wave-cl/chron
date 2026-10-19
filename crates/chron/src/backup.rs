@@ -88,16 +88,18 @@ fn now_nanos() -> i64 {
     }
 }
 
-/// Hashes everything written through it.
+/// Hashes and counts everything written through it.
 struct Crc<W: Write> {
     inner: W,
     hasher: crc32fast::Hasher,
+    written: u64,
 }
 
 impl<W: Write> Write for Crc<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.inner.write(buf)?;
         self.hasher.update(&buf[..n]);
+        self.written += n as u64;
         Ok(n)
     }
 
@@ -106,52 +108,44 @@ impl<W: Write> Write for Crc<W> {
     }
 }
 
-struct Writer {
-    path: PathBuf,
-    tmp: PathBuf,
-    /// `None` once finished; a dropped unfinished writer removes its file.
-    out: Option<Crc<BufWriter<File>>>,
+/// Writes an archive to any sink: the file-based callers wrap a
+/// temporary file around it and rename it into place when done.
+struct Writer<W: Write> {
+    /// What errors name: the file, or "<backup stream>".
+    what: PathBuf,
+    out: Crc<W>,
 }
 
-impl Drop for Writer {
+/// A temporary file removed on drop unless kept.
+struct TmpFile {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for TmpFile {
     fn drop(&mut self) {
-        if self.out.take().is_some() {
-            let _ = fs::remove_file(&self.tmp);
+        if !self.keep {
+            let _ = fs::remove_file(&self.path);
         }
     }
 }
 
-impl Writer {
-    fn create(archive: &Path, meta: &BackupMeta) -> Result<Self> {
-        let tmp = PathBuf::from(format!(
-            "{}.{}.{}.tmp",
-            archive.display(),
-            std::process::id(),
-            now_nanos()
-        ));
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .map_err(|e| Error::io(&tmp, "create", e))?;
+impl<W: Write> Writer<W> {
+    fn start(out: W, meta: &BackupMeta, what: &Path) -> Result<Self> {
         let header = serde_json::to_vec(meta)
-            .map_err(|e| Error::corrupt(archive, 0, format!("cannot encode the header: {e}")))?;
+            .map_err(|e| Error::corrupt(what, 0, format!("cannot encode the header: {e}")))?;
         let mut w = Writer {
-            path: archive.to_path_buf(),
-            tmp,
-            out: Some(Crc {
-                inner: BufWriter::new(file),
+            what: what.to_path_buf(),
+            out: Crc {
+                inner: out,
                 hasher: crc32fast::Hasher::new(),
-            }),
+                written: 0,
+            },
         };
         w.bytes(MAGIC)?;
         w.bytes(&(header.len() as u32).to_be_bytes())?;
         w.bytes(&header)?;
         Ok(w)
-    }
-
-    fn out(&mut self) -> &mut Crc<BufWriter<File>> {
-        self.out.as_mut().expect("writer not finished")
     }
 
     fn entry_header(&mut self, kind: u8, name: &str, len: u64) -> Result<()> {
@@ -162,10 +156,10 @@ impl Writer {
     }
 
     fn bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let tmp = self.tmp.clone();
-        self.out()
+        let what = self.what.clone();
+        self.out
             .write_all(bytes)
-            .map_err(|e| Error::io(&tmp, "write", e))
+            .map_err(|e| Error::io(&what, "write", e))
     }
 
     /// Copies exactly `len` bytes of `file` from offset 0, by positional
@@ -189,30 +183,61 @@ impl Writer {
         Ok(())
     }
 
-    fn finish(mut self, mut meta: BackupMeta) -> Result<BackupMeta> {
+    /// Writes the end marker and the crc, flushes, and returns the bytes
+    /// written in all.
+    fn finish(mut self) -> Result<u64> {
         self.bytes(&[KIND_END])?;
-        let out = self.out.take().expect("writer not finished");
-        let crc = out.hasher.clone().finalize();
-        let mut file = out.inner;
-        file.write_all(&crc.to_be_bytes())
-            .and_then(|()| file.flush())
-            .map_err(|e| Error::io(&self.tmp, "write", e))?;
-        let file = file
-            .into_inner()
-            .map_err(|e| Error::io(&self.tmp, "flush", e.into_error()))?;
-        file.sync_all()
-            .map_err(|e| Error::io(&self.tmp, "fsync", e))?;
-        meta.bytes = file
-            .metadata()
-            .map_err(|e| Error::io(&self.tmp, "metadata", e))?
-            .len();
-        drop(file);
-        fs::rename(&self.tmp, &self.path).map_err(|e| Error::io(&self.tmp, "rename", e))?;
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            segment::sync_dir(parent)?;
-        }
-        Ok(meta)
+        let crc = self.out.hasher.clone().finalize();
+        let what = self.what.clone();
+        self.out
+            .inner
+            .write_all(&crc.to_be_bytes())
+            .and_then(|()| self.out.inner.flush())
+            .map_err(|e| Error::io(&what, "write", e))?;
+        Ok(self.out.written + 4)
     }
+}
+
+/// Writes the archive `write` produces to `archive` through a temporary
+/// file beside it, fsyncs it and renames it into place; a failure leaves
+/// nothing behind.
+fn write_file(
+    archive: &Path,
+    write: impl FnOnce(&mut BufWriter<File>, &Path) -> Result<BackupMeta>,
+) -> Result<BackupMeta> {
+    let tmp = TmpFile {
+        path: PathBuf::from(format!(
+            "{}.{}.{}.tmp",
+            archive.display(),
+            std::process::id(),
+            now_nanos()
+        )),
+        keep: false,
+    };
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp.path)
+        .map_err(|e| Error::io(&tmp.path, "create", e))?;
+    let mut out = BufWriter::new(file);
+    let mut meta = write(&mut out, &tmp.path)?;
+    let file = out
+        .into_inner()
+        .map_err(|e| Error::io(&tmp.path, "flush", e.into_error()))?;
+    file.sync_all()
+        .map_err(|e| Error::io(&tmp.path, "fsync", e))?;
+    meta.bytes = file
+        .metadata()
+        .map_err(|e| Error::io(&tmp.path, "metadata", e))?
+        .len();
+    drop(file);
+    fs::rename(&tmp.path, archive).map_err(|e| Error::io(&tmp.path, "rename", e))?;
+    let mut tmp = tmp;
+    tmp.keep = true;
+    if let Some(parent) = archive.parent().filter(|p| !p.as_os_str().is_empty()) {
+        segment::sync_dir(parent)?;
+    }
+    Ok(meta)
 }
 
 /// Where the committed bytes of each segment end, with the head and floor
@@ -273,9 +298,20 @@ fn plan(inner: &Inner) -> Result<Plan> {
 }
 
 pub(crate) fn write_full(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
+    write_file(archive, |out, what| write_full_to(inner, out, what))
+}
+
+/// A full backup's bytes to any sink; `meta.bytes` counts them. Holds the
+/// maintenance lock for the duration, so a slow sink holds up retention
+/// and other backups of this database, not commits.
+pub(crate) fn write_full_to(
+    inner: &Inner,
+    out: &mut impl Write,
+    what: &Path,
+) -> Result<BackupMeta> {
     let _m = inner.maintenance.lock().unwrap_or_else(|p| p.into_inner());
     let plan = plan(inner)?;
-    let meta = BackupMeta {
+    let mut meta = BackupMeta {
         format: FORMAT,
         kind: BackupKind::Full,
         base_head: None,
@@ -286,7 +322,7 @@ pub(crate) fn write_full(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
         bytes: 0,
         db_id: Some(*inner.db_id.lock().unwrap_or_else(|p| p.into_inner())),
     };
-    let mut w = Writer::create(archive, &meta)?;
+    let mut w = Writer::start(out, &meta, what)?;
     let lens = inner.index.aggregate_lens()?;
     for (base, path, len) in &plan.segments {
         let name = format!("segments/{}", segment::file_name(*base));
@@ -306,7 +342,8 @@ pub(crate) fn write_full(inner: &Inner, archive: &Path) -> Result<BackupMeta> {
         w.bytes(id.as_bytes())?;
         w.bytes(&len.to_be_bytes())?;
     }
-    w.finish(meta)
+    meta.bytes = w.finish()?;
+    Ok(meta)
 }
 
 /// Decodes an `agg_len` entry.
@@ -381,6 +418,19 @@ pub(crate) fn frames_between(inner: &Inner, from: u64, to: u64) -> Result<Vec<u8
 }
 
 pub(crate) fn write_incremental(inner: &Inner, archive: &Path, since: u64) -> Result<BackupMeta> {
+    write_file(archive, |out, what| {
+        write_incremental_to(inner, out, what, since)
+    })
+}
+
+/// An incremental backup's bytes to any sink (the frames are gathered in
+/// memory first).
+fn write_incremental_to(
+    inner: &Inner,
+    out: &mut impl Write,
+    what: &Path,
+    since: u64,
+) -> Result<BackupMeta> {
     let _m = inner.maintenance.lock().unwrap_or_else(|p| p.into_inner());
     let head = inner.head.load(Ordering::Acquire);
     let floor = inner.floor.load(Ordering::Acquire);
@@ -397,7 +447,7 @@ pub(crate) fn write_incremental(inner: &Inner, archive: &Path, since: u64) -> Re
         });
     }
     let frames = frames_between(inner, since, head)?;
-    let meta = BackupMeta {
+    let mut meta = BackupMeta {
         format: FORMAT,
         kind: BackupKind::Incremental,
         base_head: Some(since),
@@ -408,46 +458,49 @@ pub(crate) fn write_incremental(inner: &Inner, archive: &Path, since: u64) -> Re
         bytes: 0,
         db_id: Some(*inner.db_id.lock().unwrap_or_else(|p| p.into_inner())),
     };
-    let mut w = Writer::create(archive, &meta)?;
+    let mut w = Writer::start(out, &meta, what)?;
     w.entry_header(KIND_RECORDS, "records", frames.len() as u64)?;
     w.bytes(&frames)?;
-    w.finish(meta)
+    meta.bytes = w.finish()?;
+    Ok(meta)
 }
 
-/// Reads an archive front to back, hashing everything after the header.
-struct Reader {
+/// Reads an archive front to back from any source, hashing everything
+/// after the header; the crc trailer is the integrity check, so nothing
+/// here needs the total length.
+struct Reader<R: Read> {
     path: PathBuf,
-    file: BufReader<File>,
+    src: R,
     hasher: crc32fast::Hasher,
     at: u64,
-    len: u64,
 }
 
-impl Reader {
+impl Reader<BufReader<File>> {
     fn open(archive: &Path) -> Result<(Self, BackupMeta)> {
         let file = File::open(archive).map_err(|e| Error::io(archive, "open", e))?;
-        let len = file
-            .metadata()
-            .map_err(|e| Error::io(archive, "metadata", e))?
-            .len();
+        Reader::from_read(BufReader::new(file), archive)
+    }
+}
+
+impl<R: Read> Reader<R> {
+    fn from_read(src: R, what: &Path) -> Result<(Self, BackupMeta)> {
         let mut r = Reader {
-            path: archive.to_path_buf(),
-            file: BufReader::new(file),
+            path: what.to_path_buf(),
+            src,
             hasher: crc32fast::Hasher::new(),
             at: 0,
-            len,
         };
         let mut magic = [0u8; 8];
         r.read_hashed(&mut magic)?;
         if &magic != MAGIC {
-            return Err(Error::corrupt(archive, 0, "not a chron backup"));
+            return Err(Error::corrupt(what, 0, "not a chron backup"));
         }
         let mut len = [0u8; 4];
         r.read_hashed(&mut len)?;
         let len = u32::from_be_bytes(len);
-        if len == 0 || len > MAX_HEADER || u64::from(len) > r.len.saturating_sub(12) {
+        if len == 0 || len > MAX_HEADER {
             return Err(Error::corrupt(
-                archive,
+                what,
                 8,
                 format!("implausible header length {len}"),
             ));
@@ -455,10 +508,10 @@ impl Reader {
         let mut header = vec![0u8; len as usize];
         r.read_hashed(&mut header)?;
         let meta: BackupMeta = serde_json::from_slice(&header)
-            .map_err(|e| Error::corrupt(archive, 12, format!("bad header: {e}")))?;
+            .map_err(|e| Error::corrupt(what, 12, format!("bad header: {e}")))?;
         if meta.format != FORMAT {
             return Err(Error::corrupt(
-                archive,
+                what,
                 12,
                 format!("unknown format {}", meta.format),
             ));
@@ -467,7 +520,7 @@ impl Reader {
     }
 
     fn read_raw(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.file.read_exact(buf).map_err(|e| {
+        self.src.read_exact(buf).map_err(|e| {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 Error::corrupt(&self.path, self.at, "archive ends early")
             } else {
@@ -516,16 +569,18 @@ impl Reader {
         Ok(())
     }
 
+    /// An entry's bytes, read in pieces as they arrive: a bogus length
+    /// fails with "archive ends early" before any large allocation.
     fn read_entry(&mut self, len: u64) -> Result<Vec<u8>> {
-        if len > self.len.saturating_sub(self.at) {
-            return Err(Error::corrupt(
-                &self.path,
-                self.at,
-                format!("entry of {len} bytes exceeds the archive"),
-            ));
+        let mut out = Vec::with_capacity((len as usize).min(COPY_CHUNK));
+        let mut left = len;
+        let mut buf = vec![0u8; COPY_CHUNK];
+        while left > 0 {
+            let n = (left as usize).min(COPY_CHUNK);
+            self.read_hashed(&mut buf[..n])?;
+            out.extend_from_slice(&buf[..n]);
+            left -= n as u64;
         }
-        let mut out = vec![0u8; len as usize];
-        self.read_hashed(&mut out)?;
         Ok(out)
     }
 
@@ -567,11 +622,32 @@ pub fn restore_backup(
     opts: &Options,
 ) -> Result<BackupMeta> {
     let archive = archive.as_ref();
-    let dir = dir.as_ref();
     let (reader, meta) = Reader::open(archive)?;
+    restore_with(reader, meta, dir.as_ref(), opts)
+}
+
+/// [`restore_backup`] from a stream of the archive's bytes (a backup
+/// fetched over the daemon, for one): nothing is written to `dir` before
+/// the whole stream has arrived and its crc has been checked.
+pub fn restore_backup_from(
+    reader: impl Read,
+    dir: impl AsRef<Path>,
+    opts: &Options,
+) -> Result<BackupMeta> {
+    let (reader, meta) = Reader::from_read(reader, Path::new("<backup stream>"))?;
+    restore_with(reader, meta, dir.as_ref(), opts)
+}
+
+fn restore_with<R: Read>(
+    reader: Reader<R>,
+    meta: BackupMeta,
+    dir: &Path,
+    opts: &Options,
+) -> Result<BackupMeta> {
+    let archive = reader.path.clone();
     if meta.kind != BackupKind::Full {
         return Err(Error::WrongBackupKind {
-            archive: archive.to_path_buf(),
+            archive,
             kind: meta.kind,
         });
     }
@@ -605,8 +681,8 @@ pub fn restore_backup(
     result.map(|()| meta)
 }
 
-fn restore_into(
-    mut reader: Reader,
+fn restore_into<R: Read>(
+    mut reader: Reader<R>,
     meta: &BackupMeta,
     staging: &Path,
     opts: &Options,

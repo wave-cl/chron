@@ -53,7 +53,8 @@ enum Commands {
     Status(cmd::admin::StatusArgs),
     /// Make everything committed so far durable.
     Flush,
-    /// Write a backup by name under the daemon's backup directory.
+    /// Write a backup by name under the daemon's backup directory, or
+    /// --fetch one to a local file.
     Backup(cmd::admin::BackupArgs),
     /// Apply an incremental backup by its name under the daemon's backup
     /// directory.

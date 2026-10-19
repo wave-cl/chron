@@ -17,6 +17,16 @@ crates share one version.
 
 ### chrond
 
+- `FetchBackup`: a full backup streamed as the archive's bytes, from any
+  node, needing no `--backup-dir` (admin). A replica with peers whose
+  head or shared history lies below the leader's floor restores itself
+  from it: the copy is restored at `<data_dir>/<db>.fetched`, checked,
+  swapped in, the old directory kept as `<db>.replaced-<nanos>`, and an
+  interrupted swap is finished or undone at the next start. Streams on
+  the replaced database end with "replaced by a copy restored from the
+  leader". `chron_backup_fetches_total{db,result}` and
+  `chron_restores_total{db,result}`. The below-floor refusal of
+  `Replicate` now carries the floor metadata.
 - Synchronous replication: with peers a commit is acknowledged only once
   a majority durably holds it (`--sync-commit majority`, the default;
   `off` for the old behaviour; `--sync-timeout`, the lease ttl by
@@ -65,6 +75,9 @@ crates share one version.
 
 ### chron-db
 
+- `Db::backup_to(&mut impl Write)` and `restore_backup_from(impl Read,
+  dir, opts)`: the archive to and from any sink or source, without a
+  file in between; the path-based calls are unchanged.
 - `Db::truncate_to` publishes the new head and reopens the writer right
   after the index commit, so a later file error leaves a consistent
   database; a `Subscription` that saw the old tail reports a cut
@@ -72,6 +85,9 @@ crates share one version.
 
 ### chron-client
 
+- `Client::fetch_backup` (a byte stream) and `fetch_backup_to(path)`
+  (written through a `.tmp` file, fsynced, renamed; returns the header);
+  `ClientError::Io`.
 - `CommitOptions` and `Client::commit_with` (an epoch token and a sync
   choice), `ClientConfig::sync_commit`, `ClientError::Unconfirmed`
   (never retried), the `Info` fields `majority_applied`, `followers` and
@@ -86,6 +102,8 @@ crates share one version.
 
 ### chron-cli
 
+- `chron backup --fetch FILE` downloads a full backup to a local file
+  from any node; `chron restore` takes it unchanged.
 - `chron append` and `chron commit` take `--sync` or `--async`; an
   unconfirmed commit prints the positions it landed at; `chron info`
   shows the sync default, the majority-applied position and one line per

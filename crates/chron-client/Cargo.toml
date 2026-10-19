@@ -17,7 +17,7 @@ chron-proto = { workspace = true, features = ["convert"] }
 bytes = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["time", "sync"] }
+tokio = { workspace = true, features = ["time", "sync", "fs", "io-util"] }
 tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["tls-native-roots"] }
 tonic-health = { workspace = true }

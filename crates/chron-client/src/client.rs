@@ -319,6 +319,9 @@ pub struct ReplicationChunk {
     pub epoch_base: u64,
 }
 
+/// The bytes of a backup archive fetched from a daemon, in order.
+pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send + 'static>>;
+
 /// A stream of replication chunks.
 pub type ChunkStream =
     Pin<Box<dyn Stream<Item = Result<ReplicationChunk, ClientError>> + Send + 'static>>;
@@ -1131,6 +1134,54 @@ impl Client {
                 .collect(),
             sync_commit: i.sync_commit,
         })
+    }
+
+    /// A full backup of the database as the archive's bytes, exactly what
+    /// `chron restore` reads, from any node (no `--backup-dir` needed);
+    /// the daemon's retention and other backups of the database wait
+    /// while it streams. An admin call.
+    pub async fn fetch_backup(&self) -> Result<ByteStream, ClientError> {
+        let stream = self
+            .admin()
+            .fetch_backup(pb::FetchBackupRequest {})
+            .await?
+            .into_inner();
+        Ok(Box::pin(stream.map(|item| Ok(Bytes::from(item?.data)))))
+    }
+
+    /// [`fetch_backup`](Client::fetch_backup) written to `path` through a
+    /// `.tmp` file beside it, fsynced and renamed into place (an existing
+    /// file at `path` is replaced); a failure leaves nothing new. Returns
+    /// the archive's header.
+    pub async fn fetch_backup_to(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<BackupMeta, ClientError> {
+        use tokio::io::AsyncWriteExt;
+        let path = path.as_ref();
+        let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+        let mut stream = self.fetch_backup().await?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await?;
+        let written: Result<(), ClientError> = async {
+            while let Some(chunk) = stream.next().await {
+                file.write_all(&chunk?).await?;
+            }
+            file.flush().await?;
+            file.sync_all().await?;
+            Ok(())
+        }
+        .await;
+        drop(file);
+        if let Err(e) = written {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        tokio::fs::rename(&tmp, path).await?;
+        chron::inspect_backup(path).map_err(|e| ClientError::Decode(e.to_string()))
     }
 
     /// Replication with acknowledgments (daemon to daemon): the stream of

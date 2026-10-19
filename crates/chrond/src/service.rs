@@ -27,6 +27,7 @@ const CHUNK: usize = 1024;
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send + 'static>>;
 type ChunkStream =
     Pin<Box<dyn Stream<Item = Result<pb::ReplicationChunk, Status>> + Send + 'static>>;
+type ByteStream = Pin<Box<dyn Stream<Item = Result<pb::BackupChunk, Status>> + Send + 'static>>;
 
 pub struct ChronService {
     node: Arc<Node>,
@@ -90,6 +91,56 @@ impl ChronService {
     }
 }
 
+/// Bytes per FetchBackup message.
+const FETCH_CHUNK: usize = 1 << 20;
+
+/// Bridges the library's synchronous backup writer to a response stream:
+/// buffers up to one chunk, then blocks its blocking-pool thread on a
+/// bounded channel, so a few chunks at most are in flight and a client
+/// that stops reading stalls only that thread. A departed client makes
+/// the send fail, which ends the backup and releases the maintenance
+/// lock.
+struct ChunkSink {
+    buf: Vec<u8>,
+    chunk: usize,
+    tx: mpsc::Sender<Result<pb::BackupChunk, Status>>,
+    cancel: CancellationToken,
+}
+
+impl ChunkSink {
+    fn send_buf(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        if self.cancel.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "the database went away",
+            ));
+        }
+        let data = std::mem::take(&mut self.buf);
+        self.tx
+            .blocking_send(Ok(pb::BackupChunk { data }))
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the client went away")
+            })
+    }
+}
+
+impl std::io::Write for ChunkSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(bytes);
+        if self.buf.len() >= self.chunk {
+            self.send_buf()?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.send_buf()
+    }
+}
+
 /// Streams whole-transaction chunks from `from` until the follower goes
 /// away, `cancel` fires, the role is lost or the database goes. With
 /// `open_chunk` the first item is an empty chunk at `from` carrying the
@@ -127,7 +178,7 @@ fn spawn_chunk_stream(
             let db2 = db.clone();
             let chunk = tokio::select! {
                 _ = cancel.cancelled() => {
-                    let _ = tx.send(Err(gone(&node))).await;
+                    let _ = tx.send(Err(gone(&node, &dbn))).await;
                     return;
                 }
                 r = role_lost(&mut role, true) => {
@@ -179,7 +230,7 @@ fn spawn_chunk_stream(
                 None => {
                     tokio::select! {
                         _ = cancel.cancelled() => {
-                            let _ = tx.send(Err(gone(&node))).await;
+                            let _ = tx.send(Err(gone(&node, &dbn))).await;
                             return;
                         }
                         r = role_lost(&mut role, true) => {
@@ -648,6 +699,79 @@ impl Chron for ChronService {
         _req: Request<pb::DiscoverRequest>,
     ) -> Result<Response<pb::DiscoverResponse>, Status> {
         Ok(Response::new(cluster::discover(&self.node)))
+    }
+
+    type FetchBackupStream = ByteStream;
+
+    /// A full backup as the archive's bytes, served in every role and
+    /// without `--backup-dir`; the database's retention and other backups
+    /// wait while it runs.
+    async fn fetch_backup(
+        &self,
+        req: Request<pb::FetchBackupRequest>,
+    ) -> Result<Response<Self::FetchBackupStream>, Status> {
+        self.node.require_admin(req.metadata())?;
+        let dbn = self.db(&req)?;
+        #[cfg(feature = "test-util")]
+        let dbn = {
+            let alias = self
+                .node
+                .fetch_alias
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&dbn.name)
+                .cloned();
+            match alias {
+                Some(other) => self.node.resolve_name(&other)?,
+                None => dbn,
+            }
+        };
+        let chunk = FETCH_CHUNK.min(self.node.max_message_bytes / 2).max(4096);
+        let (tx, rx) = mpsc::channel(4);
+        let node = self.node.clone();
+        let db = dbn.db.clone();
+        let name = dbn.name.clone();
+        let cancel = dbn.cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut sink = ChunkSink {
+                buf: Vec::with_capacity(chunk),
+                chunk,
+                tx: tx.clone(),
+                cancel: cancel.clone(),
+            };
+            let result = db.backup_to(&mut sink).and_then(|m| {
+                std::io::Write::flush(&mut sink)
+                    .map(|()| m)
+                    .map_err(|e| chron::Error::Io {
+                        path: std::path::PathBuf::from("<backup stream>"),
+                        op: "write",
+                        source: e,
+                    })
+            });
+            let label = match result {
+                Ok(_) => "ok",
+                Err(chron::Error::Io { source, .. })
+                    if matches!(
+                        source.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    if cancel.is_cancelled() {
+                        let _ = tx.blocking_send(Err(gone(&node, &dbn)));
+                    }
+                    "cancelled"
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(codec::status(e)));
+                    "error"
+                }
+            };
+            node.metrics
+                .backup_fetches
+                .with_label_values(&[&name, label])
+                .inc();
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn fingerprints(

@@ -937,3 +937,45 @@ fn append_sync_and_async_flags() {
         .success()
         .stdout(predicate::str::contains("head 2"));
 }
+
+#[test]
+fn backup_fetch_then_restore_and_verify() {
+    let d = Daemon::start();
+    d.chron()
+        .args(["append", "free", "-d", "one", "-d", "two"])
+        .assert()
+        .success();
+    let archive = d.dir.path().join("fetched.chronbak");
+    d.chron()
+        .args(["backup", "--fetch", archive.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fetched.chronbak"));
+    assert!(archive.exists());
+    let restored = d.dir.path().join("restored");
+    Command::cargo_bin("chron")
+        .unwrap()
+        .args([
+            "restore",
+            archive.to_str().unwrap(),
+            restored.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("chron")
+        .unwrap()
+        .args(["verify", restored.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("head 2"));
+    d.chron()
+        .args([
+            "backup",
+            "--fetch",
+            archive.to_str().unwrap(),
+            "--since",
+            "1",
+        ])
+        .assert()
+        .code(2);
+}

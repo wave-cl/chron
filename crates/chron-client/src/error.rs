@@ -97,6 +97,9 @@ pub enum ClientError {
     /// The connection could not be established.
     #[error("cannot connect: {0}")]
     Transport(#[from] tonic::transport::Error),
+    /// A local file could not be written (a fetched backup).
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     /// Any other status.
     #[error("{0}")]
     Status(Status),

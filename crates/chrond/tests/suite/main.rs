@@ -4,6 +4,7 @@ mod bin;
 mod commit;
 mod databases;
 mod failover;
+mod fetch;
 mod http;
 mod lifecycle;
 mod metrics;

@@ -175,6 +175,9 @@ pub struct DbNode {
     /// resetting itself); every live stream on the database ends when it
     /// changes, since positions from there on are rewritten.
     pub reset: watch::Sender<Option<u64>>,
+    /// Set when a copy restored from the leader took this database's
+    /// place: its streams end saying so.
+    pub replaced: std::sync::atomic::AtomicBool,
     /// On a leader: the followers' applied positions and the majority.
     pub sync: crate::sync::SyncState,
     /// The head this database had when the node took its epoch, sent
@@ -193,6 +196,7 @@ impl DbNode {
             puller: tokio::sync::Mutex::new(None),
             cancel: node.cancel.child_token(),
             reset: watch::Sender::new(None),
+            replaced: std::sync::atomic::AtomicBool::new(false),
             sync: crate::sync::SyncState::new(quorum),
             epoch_base: std::sync::atomic::AtomicU64::new(0),
         })
@@ -262,6 +266,10 @@ pub struct Node {
     /// Answer Follow with UNIMPLEMENTED, as a daemon before 0.4.0 does.
     #[cfg(feature = "test-util")]
     pub refuse_follow: std::sync::atomic::AtomicBool,
+    /// FetchBackup for a database serves another one instead (the test
+    /// of a fetched backup that is not the database it was asked for).
+    #[cfg(feature = "test-util")]
+    pub fetch_alias: Mutex<HashMap<String, String>>,
     /// How every database is opened.
     pub db_opts: chron::Options,
     databases: RwLock<HashMap<String, Arc<DbNode>>>,
@@ -318,6 +326,8 @@ impl Node {
             hold_apply: watch::Sender::new(false),
             #[cfg(feature = "test-util")]
             refuse_follow: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-util")]
+            fetch_alias: Mutex::new(HashMap::new()),
             db_opts,
             databases: RwLock::new(HashMap::new()),
             admin_ops: tokio::sync::Mutex::new(()),
