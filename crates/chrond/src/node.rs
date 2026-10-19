@@ -888,8 +888,8 @@ impl Node {
         lease_until: Option<Instant>,
     ) -> Result<(u64, u64), Status> {
         let _gate = self.write_gate.write().unwrap_or_else(|p| p.into_inner());
-        if !matches!(self.role(), Role::Replica | Role::Candidate) {
-            return Err(self.refuse("not a replica"));
+        if !matches!(self.role(), Role::Replica | Role::Candidate | Role::Fenced) {
+            return Err(self.refuse("already the leader"));
         }
         let data = self.data_epoch();
         let epoch = match elected {
@@ -911,6 +911,11 @@ impl Node {
         }
         if let Err(e) = self.remove_marker(REPLICA_MARKER) {
             tracing::warn!(error = %e, "cannot remove the replica marker");
+        }
+        // A fenced node elected above the epoch that fenced it leads
+        // again; the marker must not bring the fence back at a restart.
+        if let Err(e) = self.remove_marker(FENCED_MARKER) {
+            tracing::warn!(error = %e, "cannot remove the fenced marker");
         }
         self.with_lease(|l| {
             l.held_until = lease_until;

@@ -140,6 +140,12 @@ impl From<Status> for ClientError {
             Code::Unauthenticated => ClientError::Unauthenticated(s.message().to_string()),
             Code::Unavailable => ClientError::Unavailable(s.message().to_string()),
             Code::ResourceExhausted => ClientError::ResourceExhausted(s.message().to_string()),
+            // The daemon going away mid-call: the HTTP/2 GOAWAY of a
+            // shutdown, or a connection dropped under a call, arrives as an
+            // Internal "h2 protocol error".
+            Code::Internal if s.message().starts_with("h2 protocol error") => {
+                ClientError::Unavailable(s.message().to_string())
+            }
             // A connection-level failure (a TLS handshake refused after the
             // connect, a reset) reaches the caller as this status.
             Code::Unknown if s.message() == "transport error" => {

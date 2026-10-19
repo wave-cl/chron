@@ -644,28 +644,49 @@ async fn followers_wait_out_a_leaders_longer_lease() {
 }
 
 /// A node fenced by an epoch whose leader never reaches it is not stuck:
-/// after a lease of silence it campaigns like a candidate.
+/// after a lease of silence it campaigns like a candidate. Here it holds
+/// writes the one other live node lacks, so that node cannot be elected
+/// and nobody rescues the fenced node with a heartbeat: only its own
+/// campaign gives the group a leader.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fenced_node_campaigns_after_silence() {
     let mut c = Cluster::start(3, TTL).await;
     let l = c.wait_for_leader(SOON).await;
-    for i in (0..3).filter(|i| *i != l) {
-        c.wait_following(i, l, SOON).await;
+    let others: Vec<usize> = (0..3).filter(|i| *i != l).collect();
+    for i in &others {
+        c.wait_following(*i, l, SOON).await;
     }
     let head = fill(&c.client(l).await, 3).await;
     c.wait_heads(head, SOON).await;
     let epoch = c.node(l).data_epoch();
+    for i in &others {
+        c.stop(*i).await;
+    }
+    // Writes the others never see, landed through the library handle
+    // while the leader's lease runs out.
+    {
+        let db = c.nodes[l].running.as_ref().unwrap().db.clone();
+        for i in 0..3 {
+            let mut t = db.transaction();
+            t.append_free(vec![chron::NewEvent::new(format!("only-here-{i}"))]);
+            t.commit().unwrap();
+        }
+    }
     // A fence by an epoch nobody leads under.
     c.client(l).await.fence(epoch + 1).await.unwrap();
     assert_eq!(c.role(l), Some(Role::Fenced));
-    let l2 = c.wait_for_leader(SOON).await;
-    assert!(c.node(l2).data_epoch() > epoch);
-    c.wait("the fenced node following or leading", SOON, || {
-        matches!(c.role(l), Some(Role::Replica) | Some(Role::Leader))
+    // One follower comes back: it is behind, so the fenced node refuses
+    // its votes, and with the third node down a majority needs the fenced
+    // node's own campaign.
+    let f = others[0];
+    c.restart(f).await;
+    c.wait("the fenced node leading again", 3 * SOON, || {
+        c.leader() == Some(l)
     })
     .await;
-    let head = fill(&c.client(c.leader().unwrap()).await, 2).await;
-    c.wait_heads(head, SOON).await;
+    assert!(c.node(l).data_epoch() > epoch + 1);
+    c.wait_following(f, l, SOON).await;
+    c.wait_heads(head + 3, SOON).await;
     c.stop_all().await;
 }
 
