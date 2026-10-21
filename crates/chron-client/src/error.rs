@@ -73,6 +73,16 @@ pub enum ClientError {
     /// The daemon is fenced, stopping, or the connection failed.
     #[error("unavailable: {0}")]
     Unavailable(String),
+    /// A live stream ended because the database was cut back to
+    /// `position` to follow its leader: what was delivered from there on
+    /// is being rewritten; subscribe again from `position`.
+    #[error("cut back to {position}: {message}")]
+    CutBack {
+        /// The position the database was cut back to.
+        position: u64,
+        /// The daemon's message.
+        message: String,
+    },
     /// No seed of [`Client::connect_any`](crate::Client::connect_any)
     /// named a reachable leader.
     #[error("no leader: {0}")]
@@ -209,6 +219,14 @@ impl From<Status> for ClientError {
                 ClientError::BoundTimeout {
                     position,
                     head,
+                    message: s.message().to_string(),
+                }
+            }
+            Code::Unavailable
+                if let Some(position) = header::<u64>(&s, chron_proto::POSITION_HEADER) =>
+            {
+                ClientError::CutBack {
+                    position,
                     message: s.message().to_string(),
                 }
             }

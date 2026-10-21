@@ -29,6 +29,8 @@ pub type Killer = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = bool> + Send
 /// the groups this tool is run against must use a ttl of a second or
 /// more, as the daemon's default (10 s) and the tests (1 s) do.
 const SLACK: Duration = Duration::from_millis(500);
+/// How many subscribed events are remembered for the rewrite check.
+const SEEN_CAP: usize = 200_000;
 
 /// What one run does.
 #[derive(Clone)]
@@ -116,6 +118,16 @@ pub struct Report {
     /// Commits the leader answered with an earlier landing because the
     /// client resent them under their commit id.
     pub duplicates: u64,
+    /// Subscriber streams that ended "cut back": the node they followed
+    /// was cut back to follow a new leader, and they resubscribed from
+    /// there. Expected across a failover, never a violation.
+    pub cut_backs: u64,
+    /// Events the subscribers saw (and remember by hash).
+    pub seen_events: u64,
+    /// Positions a subscriber saw twice with different payloads, or saw
+    /// and then found changed or missing in the final log: a confirmed
+    /// event that was erased. Always a violation.
+    pub rewritten: u64,
     /// Seconds the writers ran.
     pub wall_s: f64,
     pub transactions_per_s: f64,
@@ -143,6 +155,8 @@ impl Report {
             "replica_head": self.replica_head, "kills": self.kills, "lost_acks": self.lost_acks,
             "failover_errors": self.failover_errors, "unconfirmed": self.unconfirmed,
             "duplicates": self.duplicates,
+            "cut_backs": self.cut_backs, "seen_events": self.seen_events,
+            "rewritten": self.rewritten,
             "wall_s": self.wall_s, "transactions_per_s": self.transactions_per_s,
             "events_per_s": self.events_per_s, "writers": self.writers,
             "in_flight": self.in_flight, "fsync": self.fsync,
@@ -192,6 +206,13 @@ struct Shared {
     failover_errors: AtomicU64,
     unconfirmed: AtomicU64,
     duplicates: AtomicU64,
+    cut_backs: AtomicU64,
+    rewritten: AtomicU64,
+    seen_total: AtomicU64,
+    /// What the subscribers saw: (position, payload hash), the last
+    /// `SEEN_CAP` of them. A position seen with another hash later, or
+    /// changed or missing in the final log, was rewritten.
+    seen: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>,
     /// Kill mode: every acknowledged write as (position, payload hash,
     /// when).
     acks: std::sync::Mutex<Vec<(u64, u64, Instant)>>,
@@ -236,6 +257,27 @@ impl Shared {
         }
         self.errors.fetch_add(1, Ordering::Relaxed);
         self.violation(format!("{what}: unexpected error: {e}"));
+    }
+
+    /// A subscriber saw `payload` at `position`: remembered, and compared
+    /// with an earlier sighting of the position.
+    fn saw(&self, who: &str, position: u64, payload: &[u8]) {
+        let h = hash(payload);
+        self.seen_total.fetch_add(1, Ordering::Relaxed);
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, earlier)) = seen.iter().rev().find(|(p, _)| *p == position)
+            && *earlier != h
+        {
+            self.rewritten.fetch_add(1, Ordering::Relaxed);
+            self.violation(format!(
+                "{who}: position {position} was delivered again with another payload"
+            ));
+            return;
+        }
+        if seen.len() >= SEEN_CAP {
+            seen.pop_front();
+        }
+        seen.push_back((position, h));
     }
 
     fn ack(&self, position: u64, payload: &[u8]) {
@@ -590,8 +632,25 @@ async fn subscriber(client: Client, shared: Arc<Shared>, s: usize) {
             match item {
                 Ok(Some(Ok(ev))) => {
                     check_event(&shared, &format!("subscriber {s}"), &ev, Some(next));
+                    shared.saw(&format!("subscriber {s}"), ev.position, &ev.payload);
                     next = ev.position + 1;
                     shared.subscribed.fetch_add(1, Ordering::Relaxed);
+                }
+                // The node was cut back to follow a new leader: the
+                // stream resumes from the cut, and whatever it had
+                // delivered from there on must come again unchanged
+                // (`saw` says otherwise).
+                Ok(Some(Err(ClientError::CutBack { position, .. }))) => {
+                    shared.cut_backs.fetch_add(1, Ordering::Relaxed);
+                    next = position.min(next);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue 'outer;
+                }
+                Ok(Some(Err(ClientError::Unavailable(m)))) if m.contains("replaced by a copy") => {
+                    shared.cut_backs.fetch_add(1, Ordering::Relaxed);
+                    next = shared.floor.load(Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue 'outer;
                 }
                 Ok(Some(Err(e))) => {
                     shared.error("subscriber", &e);
@@ -739,6 +798,62 @@ async fn check_acks(shared: &Shared, leader: &Client) -> Result<u64, ClientError
         }
     }
     Ok(lost)
+}
+
+/// Every position a subscriber saw, at or above the floor, must be in
+/// the final log with the same payload: a subscriber sees only confirmed
+/// events (the daemon's default under sync commits), and a confirmed
+/// event is never erased, whatever was killed.
+async fn check_seen(shared: &Shared, leader: &Client) -> Result<u64, ClientError> {
+    let mut seen: Vec<(u64, u64)> = shared
+        .seen
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .copied()
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+    let floor = leader.info().await?.floor;
+    let head = leader.head().await?;
+    let mut rewritten = 0;
+    let mut i = seen.partition_point(|(p, _)| *p < floor);
+    let mut from = floor;
+    while from < head && i < seen.len() {
+        let page = leader.read_all(from, 4096).await?;
+        if page.is_empty() {
+            break;
+        }
+        for ev in &page {
+            while i < seen.len() && seen[i].0 < ev.position {
+                rewritten += 1;
+                shared.violation(format!(
+                    "subscribed position {} is no longer in the log",
+                    seen[i].0
+                ));
+                i += 1;
+            }
+            let h = hash(&ev.payload);
+            while i < seen.len() && seen[i].0 == ev.position {
+                if seen[i].1 != h {
+                    rewritten += 1;
+                    shared.violation(format!(
+                        "subscribed position {} holds another payload now",
+                        ev.position
+                    ));
+                }
+                i += 1;
+            }
+        }
+        from = page.last().map_or(head, |e| e.position + 1);
+    }
+    for (p, _) in &seen[i..] {
+        if *p < head {
+            rewritten += 1;
+            shared.violation(format!("subscribed position {p} is no longer in the log"));
+        }
+    }
+    Ok(rewritten)
 }
 
 /// Backups restored and checked offline, and retention, on their timers.
@@ -900,6 +1015,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         failover_errors: AtomicU64::new(0),
         unconfirmed: AtomicU64::new(0),
         duplicates: AtomicU64::new(0),
+        cut_backs: AtomicU64::new(0),
+        rewritten: AtomicU64::new(0),
+        seen_total: AtomicU64::new(0),
+        seen: std::sync::Mutex::new(std::collections::VecDeque::new()),
         acks: std::sync::Mutex::new(Vec::new()),
         kill_log: std::sync::Mutex::new(Vec::new()),
     });
@@ -960,6 +1079,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
     } else {
         0
     };
+    let rewritten_at_end = check_seen(&shared, &leader).await?;
     let final_head = leader.head().await?;
     let mut replica_head = None;
     if let Some(addr) = &cfg.replica {
@@ -1042,6 +1162,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         failover_errors: shared.failover_errors.load(Ordering::Relaxed),
         unconfirmed: shared.unconfirmed.load(Ordering::Relaxed),
         duplicates: shared.duplicates.load(Ordering::Relaxed),
+        cut_backs: shared.cut_backs.load(Ordering::Relaxed),
+        seen_events: shared.seen_total.load(Ordering::Relaxed),
+        rewritten: shared.rewritten.load(Ordering::Relaxed) + rewritten_at_end,
         wall_s: wall,
         transactions_per_s: shared.transactions.load(Ordering::Relaxed) as f64 / wall.max(1e-9),
         events_per_s: shared.events.load(Ordering::Relaxed) as f64 / wall.max(1e-9),

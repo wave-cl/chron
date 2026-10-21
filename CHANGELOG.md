@@ -111,6 +111,13 @@ crates share one version.
 ### tools
 
 - `chron-load --local` reads and subscribes under the local consistency.
+- `chron-load`'s subscribers remember what they saw and report
+  `rewritten` (a position delivered twice with different payloads, or
+  seen and then changed or missing in the final log: a confirmed event
+  erased, always a violation), `seen_events` and `cut_backs` (streams
+  that ended "cut back" across a failover and resumed from the cut:
+  expected, never a violation). The kill run asserts `rewritten == 0`,
+  and a run that removes the leader under load ends `ok`.
 
 ### examples
 

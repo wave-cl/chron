@@ -148,6 +148,11 @@ async fn a_run_with_the_leader_killed_finds_no_violation() {
                 "{mode}: an acknowledged write was lost"
             );
         }
+        assert_eq!(
+            report.rewritten, 0,
+            "{mode}: a subscribed (confirmed) event was rewritten"
+        );
+        assert!(report.seen_events > 100, "{mode}: {report:?}");
         // Wait for the last restart before tearing down.
         tokio::time::sleep(Duration::from_secs(3)).await;
         cluster.lock().await.stop_all().await;
@@ -193,4 +198,58 @@ async fn a_short_pipelined_run_finds_no_violation() {
     assert!(report.transactions > 100 && report.transactions_per_s > 0.0);
     assert!(report.ok(), "{:#?}", report.violations);
     leader.shutdown().await.unwrap();
+}
+
+/// The leader removed from the membership under load: the old leader
+/// steps down and is cut back, the subscribers' streams end "cut back"
+/// and resume from the cut, nothing confirmed is rewritten, and the run
+/// ends ok.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_with_the_leader_removed_finds_no_violation() {
+    use chrond::testing::Cluster;
+    let cluster = Cluster::start_fsync(3, Duration::from_secs(1), fsync()).await;
+    let l = cluster.wait_for_leader(Duration::from_secs(6)).await;
+    let addrs: Vec<String> = (0..3).map(|i| cluster.addr(i)).collect();
+    let leader_addr = cluster.addr(l);
+    let remover = {
+        let addrs = addrs.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let client = chron_client::Client::connect_any(addrs, Default::default())
+                .await
+                .unwrap();
+            client.remove_member(&leader_addr).await.unwrap()
+        })
+    };
+    let report = chron_load::run(chron_load::Config {
+        addr: addrs.join(","),
+        replica: None,
+        token: None,
+        database: None,
+        duration: Duration::from_secs(12),
+        writers: 4,
+        readers: 1,
+        subscribers: 2,
+        aggregates: 8,
+        events_per_txn: 2,
+        payload_bytes: 120,
+        backup_dir: None,
+        backup_every: None,
+        retain_every: None,
+        seed: 17,
+        kill_every: None,
+        killer: None,
+        sync: Some(true),
+        in_flight: 2,
+        local: false,
+    })
+    .await
+    .unwrap();
+    eprintln!("{}", report.to_json());
+    let (_, committed) = remover.await.unwrap();
+    assert!(committed || report.transactions > 100, "{report:?}");
+    assert_eq!(report.rewritten, 0, "{report:?}");
+    assert!(report.ok(), "{:#?}", report.violations);
+    let mut c = cluster;
+    c.stop_all().await;
 }

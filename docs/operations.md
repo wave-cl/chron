@@ -257,6 +257,13 @@ so only file contents change.
    Clients last: a 0.4.0 daemon drops the id, and a 0.5.0 client's wider
    retry rule would then write twice, so until every daemon runs 0.5.0
    keep clients on `commit_ids: false`.
+6. 0.6.0 only adds fields: a 0.5.0 client reads at the daemon's default
+   consistency and never asks for a cursor; a 0.5.0 follower drops the
+   cursor states a 0.6.0 leader sends and the options of a database it
+   mirrors (it opens them with its own flags), so run every node on
+   0.6.0 before relying on cursors or per-database options, and expect
+   confirmed reads to serve fewer positions than before on a node with
+   peers (`--read-consistency local` restores the old reads).
 
 ## Reading the metrics
 
