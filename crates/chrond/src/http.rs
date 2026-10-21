@@ -50,6 +50,9 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/db/{db}/head"),
     ("GET", "/v1/db/{db}/info"),
     ("GET", "/v1/db/{db}/tail"),
+    ("GET", "/v1/db/{db}/cursors"),
+    ("DELETE", "/v1/db/{db}/cursors/{name}"),
+    ("POST", "/v1/db/{db}/cursors/{name}/ack"),
     ("POST", "/v1/db/{db}/flush"),
     ("POST", "/v1/db/{db}/retain"),
     ("GET", "/v1/databases"),
@@ -102,6 +105,9 @@ pub fn router(
         .route("/db/{db}/head", get(head))
         .route("/db/{db}/info", get(info))
         .route("/db/{db}/tail", get(tail))
+        .route("/db/{db}/cursors", get(list_cursors))
+        .route("/db/{db}/cursors/{name}", delete(delete_cursor))
+        .route("/db/{db}/cursors/{name}/ack", post(ack_cursor))
         .route("/db/{db}/flush", post(flush))
         .route("/db/{db}/retain", post(retain))
         .route("/databases", get(list_databases).post(create_database))
@@ -232,7 +238,14 @@ async fn page(st: &HttpState, dbn: &DbNode, read: Read, q: ReadQuery) -> Result<
         .read_mode(consistency_from_query(q.consistency.as_deref()).map_err(ApiError)?);
     ops::wait_requested(&st.node, dbn, mode, q.at_least, q.wait_ms).await?;
     let read = Arc::new(read);
-    let events = ops::read_page(dbn, read.clone(), from, limit, ops::cap(dbn, mode)).await?;
+    let events = ops::read_page(
+        dbn,
+        read.clone(),
+        from,
+        limit,
+        ops::cap(&st.node, dbn, mode),
+    )
+    .await?;
     let next = events.last().and_then(|l| read.next_cursor(l));
     Ok(Json(json!({
         "events": events.iter().map(event_json).collect::<Vec<_>>(),
@@ -359,6 +372,9 @@ struct TailQuery {
     tag_base64: Option<String>,
     /// `local` or `confirmed`; absent for the daemon's default.
     consistency: Option<String>,
+    /// A durable cursor's name: the first SSE item is then `event:
+    /// session` with `{"session", "from"}`.
+    cursor: Option<String>,
 }
 
 async fn tail(
@@ -375,15 +391,37 @@ async fn tail(
     let mode = st
         .node
         .read_mode(consistency_from_query(q.consistency.as_deref()).map_err(ApiError)?);
-    let rx = ops::subscribe(st.node.clone(), dbn, q.from.unwrap_or(0), tag, mode);
-    let stream = rx.map(|item| {
+    let mut mode = mode;
+    let mut from = q.from.unwrap_or(0);
+    let mut first = None;
+    let cursor = match q.cursor {
+        None => None,
+        Some(name) => {
+            let (start, session, cancel) =
+                ops::register_cursor(&st.node, &dbn, &name, from).await?;
+            mode = ops::Mode::Confirmed;
+            from = start;
+            first = Some(
+                SseEvent::default()
+                    .event("session")
+                    .data(json!({ "session": session, "from": start }).to_string()),
+            );
+            Some(ops::CursorSub {
+                name,
+                session,
+                cancel,
+            })
+        }
+    };
+    let rx = ops::subscribe(st.node.clone(), dbn, from, tag, mode, cursor);
+    let stream = tokio_stream::iter(first.into_iter().map(Ok)).chain(rx.map(|item| {
         Ok(match item {
             Ok(ev) => SseEvent::default().data(event_json(&ev).to_string()),
             Err(s) => SseEvent::default()
                 .event("error")
                 .data(error_json(&s).to_string()),
         })
-    });
+    }));
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -414,6 +452,47 @@ async fn retain(
     let floor = b.floor;
     let r = ops::blocking(&dbn.db, "retain", move |db| db.retain_from(floor)).await?;
     Ok(Json(retained_json(&r)))
+}
+
+async fn list_cursors(
+    State(st): State<HttpState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>> {
+    let dbn = db(&st, &name)?;
+    let l = ops::list_cursors(&st.node, &dbn).await?;
+    Ok(Json(json!({
+        "cursors": l.cursors.iter().map(|c| json!({ "name": c.name, "next": c.next, "session": c.session })).collect::<Vec<_>>(),
+        "confirmed": l.confirmed,
+    })))
+}
+
+async fn delete_cursor(
+    State(st): State<HttpState>,
+    Path((name, cursor)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    admin(&st, &headers)?;
+    let dbn = db(&st, &name)?;
+    let existed = ops::delete_cursor(&st.node, &dbn, &cursor).await?;
+    Ok(Json(json!({ "existed": existed })))
+}
+
+/// `{"next": N, "session": S}`.
+#[derive(Deserialize)]
+struct AckJson {
+    next: u64,
+    session: u64,
+}
+
+async fn ack_cursor(
+    State(st): State<HttpState>,
+    Path((name, cursor)): Path<(String, String)>,
+    body: std::result::Result<Json<AckJson>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Value>> {
+    let dbn = db(&st, &name)?;
+    let Json(a) = body.map_err(json_rejection)?;
+    let next = ops::ack(&st.node, &dbn, &cursor, a.next, a.session).await?;
+    Ok(Json(json!({ "next": next })))
 }
 
 async fn list_databases(State(st): State<HttpState>, headers: HeaderMap) -> Result<Json<Value>> {

@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use chron::{Committed, Event, Uuid};
-use chron_client::{Client, ClientError, Transaction};
+use chron_client::{Client, ClientError, Cursor, Transaction};
 use futures::Stream;
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event, StoreError>> + Send>>;
@@ -66,6 +66,17 @@ pub trait Store: Clone + Send + Sync + 'static {
         tag: &str,
         from: u64,
     ) -> impl Future<Output = Result<EventStream, StoreError>> + Send;
+    /// Like `subscribe_tag`, through a durable cursor the store keeps
+    /// under `name` when it can: a daemon resumes at the last
+    /// acknowledgment and hands back the cursor to acknowledge with; an
+    /// embedded database has no cursor and starts at `from_if_new` (the
+    /// caller keeps its own checkpoint).
+    fn subscribe_cursor(
+        &self,
+        name: &str,
+        tag: &str,
+        from_if_new: u64,
+    ) -> impl Future<Output = Result<(EventStream, Option<Cursor>), StoreError>> + Send;
 }
 
 /// An embedded database.
@@ -136,6 +147,15 @@ impl Store for Embedded {
             },
         )))
     }
+
+    async fn subscribe_cursor(
+        &self,
+        _name: &str,
+        tag: &str,
+        from_if_new: u64,
+    ) -> Result<(EventStream, Option<Cursor>), StoreError> {
+        Ok((self.subscribe_tag(tag, from_if_new).await?, None))
+    }
 }
 
 impl Store for Client {
@@ -164,6 +184,21 @@ impl Store for Client {
         use futures::StreamExt;
         let stream = Client::subscribe_tag(self, tag.to_string(), from).await?;
         Ok(Box::pin(stream.map(|r| r.map_err(StoreError::from))))
+    }
+
+    async fn subscribe_cursor(
+        &self,
+        name: &str,
+        tag: &str,
+        from_if_new: u64,
+    ) -> Result<(EventStream, Option<Cursor>), StoreError> {
+        use futures::StreamExt;
+        let (stream, cursor) =
+            Client::subscribe_cursor(self, name, from_if_new, Some(tag.to_string().into())).await?;
+        Ok((
+            Box::pin(stream.map(|r| r.map_err(StoreError::from))),
+            Some(cursor),
+        ))
     }
 }
 

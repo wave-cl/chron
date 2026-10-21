@@ -29,6 +29,9 @@ pub(crate) const META_BYTES: TableDefinition<&str, &[u8]> = TableDefinition::new
 /// carried it. Absent on an index written before 0.5.0, which reads as
 /// empty; the first write creates it.
 pub(crate) const TXN_ID: TableDefinition<&[u8; 16], (u64, u64)> = TableDefinition::new("txn_id");
+/// Durable cursors: name -> (next, session). Absent on an index from
+/// before 0.6.0, which reads as empty.
+pub(crate) const CURSOR: TableDefinition<&str, (u64, u64)> = TableDefinition::new("cursor");
 
 pub(crate) const DB_ID_KEY: &str = "db_id";
 /// `"epoch"` → the fencing epoch; absent means 0.
@@ -137,6 +140,7 @@ impl Index {
             txn.open_table(POS)?;
             txn.open_table(TAG)?;
             txn.open_table(TXN_ID)?;
+            txn.open_table(CURSOR)?;
         }
         txn.commit()?;
         Ok(())
@@ -218,6 +222,65 @@ impl Index {
             Err(e) => return Err(e.into()),
         };
         Ok(table.get(id)?.map(|v| v.value()))
+    }
+
+    /// A cursor's `(next, session)`, if it exists.
+    pub(crate) fn cursor(&self, name: &str) -> Result<Option<(u64, u64)>> {
+        let txn = self.begin_read()?;
+        let table = match txn.open_table(CURSOR) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(table.get(name)?.map(|v| v.value()))
+    }
+
+    /// Every cursor as `(name, next, session)`, by name.
+    pub(crate) fn cursors(&self) -> Result<Vec<(String, u64, u64)>> {
+        let txn = self.begin_read()?;
+        let table = match txn.open_table(CURSOR) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            let (next, session) = v.value();
+            out.push((k.value().to_string(), next, session));
+        }
+        Ok(out)
+    }
+
+    /// Stores cursors. Not durable by itself: a cursor is made durable
+    /// by the next durable index commit or the close (a lost
+    /// acknowledgment is a redelivery, never a loss).
+    pub(crate) fn set_cursors(&self, list: &[(String, u64, u64)]) -> Result<()> {
+        let txn = self.begin_write_with(Durability::None)?;
+        {
+            let mut table = txn.open_table(CURSOR)?;
+            for (name, next, session) in list {
+                table.insert(name.as_str(), (*next, *session))?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Deletes the cursor table (for tests of an index from before it).
+    pub(crate) fn drop_cursor_table(&self) -> Result<()> {
+        let txn = self.begin_write_durable()?;
+        txn.delete_table(CURSOR)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Removes a cursor; whether it existed.
+    pub(crate) fn remove_cursor(&self, name: &str) -> Result<bool> {
+        let txn = self.begin_write_with(Durability::None)?;
+        let existed = txn.open_table(CURSOR)?.remove(name)?.is_some();
+        txn.commit()?;
+        Ok(existed)
     }
 
     /// The identity, minting and durably storing one if absent.

@@ -915,3 +915,127 @@ async fn consistency_parameters_on_the_gateway() {
     assert_eq!(v["read_consistency"], "local");
     s.stop().await;
 }
+
+/// The cursor routes: list, acknowledge (with the refusals as HTTP
+/// statuses) and delete (admin).
+#[tokio::test(flavor = "multi_thread")]
+async fn cursor_routes_answer() {
+    let s = Server::start_with(|o| {
+        o.http_listen = Some("127.0.0.1:0".parse().unwrap());
+        o.token = Some("user".into());
+        o.admin_token = Some("admin".into());
+    })
+    .await;
+    let addr = s.running.as_ref().unwrap().http_addr.unwrap();
+    let user = vec![("Authorization", "Bearer user".to_string())];
+    let admin = vec![("Authorization", "Bearer admin".to_string())];
+    for i in 0..3 {
+        let mut t = s.running.as_ref().unwrap().db.transaction();
+        t.append_free(vec![chron::NewEvent::new(format!("e{i}"))]);
+        t.commit().unwrap();
+    }
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/cursors".into(),
+        user.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (
+            code,
+            v["cursors"].as_array().unwrap().len(),
+            v["confirmed"].as_u64()
+        ),
+        (200, 0, Some(3))
+    );
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/cursors/p/ack".into(),
+        user.clone(),
+        Some(json!({"next": 1, "session": 1}).to_string()),
+    )
+    .await;
+    assert_eq!((code, v["code"].as_str()), (404, Some("NotFound")));
+    // A cursor made through gRPC.
+    let client = chron_client::Client::connect(
+        s.addr(),
+        chron_client::ClientConfig {
+            token: Some("user".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (_stream, cursor) = client.subscribe_cursor("p", 0, None).await.unwrap();
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/cursors/p/ack".into(),
+        user.clone(),
+        Some(json!({"next": 2, "session": cursor.session()}).to_string()),
+    )
+    .await;
+    assert_eq!((code, v["next"].as_u64()), (200, Some(2)), "{v}");
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/cursors/p/ack".into(),
+        user.clone(),
+        Some(json!({"next": 9, "session": cursor.session()}).to_string()),
+    )
+    .await;
+    assert_eq!((code, v["position"].as_u64()), (400, Some(3)), "{v}");
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/cursors/p/ack".into(),
+        user.clone(),
+        Some(json!({"next": 3, "session": cursor.session() + 7}).to_string()),
+    )
+    .await;
+    assert_eq!(
+        (code, v["session"].as_u64()),
+        (409, Some(cursor.session())),
+        "{v}"
+    );
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/cursors".into(),
+        user.clone(),
+        None,
+    )
+    .await;
+    assert_eq!((code, v["cursors"][0]["next"].as_u64()), (200, Some(2)));
+    let (code, _, _) = call(
+        addr,
+        "DELETE",
+        "/v1/db/default/cursors/p".into(),
+        user.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(code, 403, "delete is an admin call");
+    let (code, v, _) = call(
+        addr,
+        "DELETE",
+        "/v1/db/default/cursors/p".into(),
+        admin.clone(),
+        None,
+    )
+    .await;
+    assert_eq!((code, v["existed"].as_bool()), (200, Some(true)));
+    let (code, v, _) = call(
+        addr,
+        "DELETE",
+        "/v1/db/default/cursors/p".into(),
+        admin,
+        None,
+    )
+    .await;
+    assert_eq!((code, v["existed"].as_bool()), (200, Some(false)));
+    s.stop().await;
+}

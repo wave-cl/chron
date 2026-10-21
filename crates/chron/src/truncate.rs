@@ -10,6 +10,8 @@ use uuid::Uuid;
 use crate::db::{Inner, Layout};
 use crate::error::{Error, Result};
 use crate::event::FLAG_FIRST_IN_TXN;
+use redb::ReadableTable;
+
 use crate::index::{
     AGG_INDEX, AGG_LEN, HEAD_KEY, Index, META, POS, TAG, TRUNCATE_INTENT_KEY, TXN_ID,
 };
@@ -156,6 +158,18 @@ pub(crate) fn truncate_with(inner: &Inner, to: u64, marker_only: bool) -> Result
         let mut txn_ids = txn.open_table(TXN_ID)?;
         for id in &ids {
             txn_ids.remove(id)?;
+        }
+        // A cursor past the cut points at records being rewritten: it
+        // restarts at the cut.
+        let mut cursors = txn.open_table(crate::index::CURSOR)?;
+        let past: Vec<(String, u64)> = cursors
+            .iter()?
+            .filter_map(|item| item.ok())
+            .filter(|(_, v)| v.value().0 > to)
+            .map(|(k, v)| (k.value().to_string(), v.value().1))
+            .collect();
+        for (name, session) in &past {
+            cursors.insert(name.as_str(), (to, *session))?;
         }
         let mut meta = txn.open_table(META)?;
         meta.insert(HEAD_KEY, to)?;

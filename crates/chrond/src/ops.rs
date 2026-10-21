@@ -10,6 +10,7 @@ use chron::{Committed, Db, Event, Uuid};
 use chron_proto::v1 as pb;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
 use crate::codec;
@@ -89,19 +90,22 @@ impl Mode {
 
 /// The exclusive cap a read under `mode` is served below: none for
 /// local, the confirmed bound clamped to the head otherwise (a
-/// follower learns the bound before it holds the positions).
-pub fn cap(dbn: &DbNode, mode: Mode) -> u64 {
+/// follower learns the bound before it holds the positions). Without
+/// peers the confirmed bound is the head: a lone node is its own
+/// majority.
+pub fn cap(node: &Node, dbn: &DbNode, mode: Mode) -> u64 {
     match mode {
         Mode::Local => u64::MAX,
+        Mode::Confirmed if node.cluster.is_none() => u64::MAX,
         Mode::Confirmed => dbn.confirmed().min(dbn.db.head()),
     }
 }
 
 /// What `Head` answers under `mode`: the head, or the confirmed cap.
-pub fn bound(dbn: &DbNode, mode: Mode) -> u64 {
+pub fn bound(node: &Node, dbn: &DbNode, mode: Mode) -> u64 {
     match mode {
         Mode::Local => dbn.db.head(),
-        Mode::Confirmed => cap(dbn, mode),
+        Mode::Confirmed => cap(node, dbn, mode).min(dbn.db.head()),
     }
 }
 
@@ -110,6 +114,7 @@ pub fn bound(dbn: &DbNode, mode: Mode) -> u64 {
 /// past it with the bound in `chron-position` and the head in
 /// `chron-head`.
 pub async fn wait_bound(
+    node: &Node,
     dbn: &DbNode,
     mode: Mode,
     at_least: u64,
@@ -119,7 +124,7 @@ pub async fn wait_bound(
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
     loop {
-        let b = bound(dbn, mode);
+        let b = bound(node, dbn, mode);
         if b >= at_least {
             return Ok(b);
         }
@@ -163,7 +168,239 @@ pub async fn wait_requested(
         return Ok(());
     };
     let timeout = wait_timeout_ms.map_or_else(|| node.sync_timeout(), Duration::from_millis);
-    wait_bound(dbn, mode, p, timeout).await.map(|_| ())
+    wait_bound(node, dbn, mode, p, timeout).await.map(|_| ())
+}
+
+/// A durable cursor's subscription, as `subscribe` drives it.
+pub struct CursorSub {
+    pub name: String,
+    pub session: u64,
+    /// Cancelled by a takeover or a delete: the stream ends.
+    pub cancel: CancellationToken,
+}
+
+/// Where the daemon keeps cursors: the leader of a group, or a node
+/// without peers.
+fn cursor_host(node: &Node) -> Result<(), Status> {
+    if node.cluster.is_some() && node.role() != Role::Leader {
+        return Err(node.refuse("cursors are kept on the leader"));
+    }
+    Ok(())
+}
+
+fn valid_cursor(name: &str) -> Result<(), Status> {
+    if chron_proto::valid_database_name(name) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(format!(
+            "cursor {name:?}: 1 to 64 characters of a-z, 0-9, _ and -"
+        )))
+    }
+}
+
+/// Registers a subscription on the cursor `name`: starts at the stored
+/// position (at `from` for a new cursor), clamped to the floor, under a
+/// new session that is persisted before the first event goes out; any
+/// earlier subscription on the cursor is ended. Returns the start, the
+/// session and the token that ends this stream.
+pub async fn register_cursor(
+    node: &Arc<Node>,
+    dbn: &Arc<DbNode>,
+    name: &str,
+    from: u64,
+) -> Result<(u64, u64, CancellationToken), Status> {
+    valid_cursor(name)?;
+    cursor_host(node)?;
+    let n = name.to_string();
+    let stored = blocking(&dbn.db, "cursor", move |db| db.cursor(&n)).await?;
+    let floor = dbn.db.floor();
+    let (start, session) = match stored {
+        Some(c) => (c.next.max(floor), c.session + 1),
+        None => (from.max(floor), 1),
+    };
+    let n = name.to_string();
+    blocking(&dbn.db, "set_cursor", move |db| {
+        db.set_cursor(&n, start, session)
+    })
+    .await?;
+    let cancel = dbn.cancel.child_token();
+    {
+        let mut live = dbn
+            .cursor_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(old) = live.insert(
+            name.to_string(),
+            crate::node::ActiveCursor {
+                session,
+                cancel: cancel.clone(),
+            },
+        ) {
+            old.cancel.cancel();
+        }
+    }
+    dbn.log_cursor(pb::CursorState {
+        name: name.to_string(),
+        next: start,
+        session,
+        deleted: false,
+    });
+    cursor_gauges(node, dbn, name, start).await;
+    Ok((start, session, cancel))
+}
+
+/// Acknowledges a cursor's progress (see `AckRequest`).
+pub async fn ack(
+    node: &Arc<Node>,
+    dbn: &Arc<DbNode>,
+    name: &str,
+    next: u64,
+    session: u64,
+) -> Result<u64, Status> {
+    let result = ack_inner(node, dbn, name, next, session).await;
+    let label = match &result {
+        Ok((_, label)) => *label,
+        Err((label, _)) => *label,
+    };
+    node.metrics
+        .cursor_acks
+        .with_label_values(&[&dbn.name, label])
+        .inc();
+    match result {
+        Ok((next, _)) => Ok(next),
+        Err((_, s)) => Err(s),
+    }
+}
+
+async fn ack_inner(
+    node: &Arc<Node>,
+    dbn: &Arc<DbNode>,
+    name: &str,
+    next: u64,
+    session: u64,
+) -> Result<(u64, &'static str), (&'static str, Status)> {
+    valid_cursor(name).map_err(|s| ("refused", s))?;
+    cursor_host(node).map_err(|s| ("refused", s))?;
+    let n = name.to_string();
+    let stored = blocking(&dbn.db, "cursor", move |db| db.cursor(&n))
+        .await
+        .map_err(|s| ("refused", s))?;
+    let Some(stored) = stored else {
+        return Err((
+            "not_found",
+            Status::not_found(format!("cursor {name:?} does not exist")),
+        ));
+    };
+    if session != stored.session {
+        let mut s = Status::failed_precondition(format!(
+            "cursor {name:?} was taken over by session {}",
+            stored.session
+        ));
+        if let Ok(v) = stored.session.to_string().parse() {
+            s.metadata_mut().insert(chron_proto::SESSION_HEADER, v);
+        }
+        return Err(("taken_over", s));
+    }
+    if next <= stored.next {
+        return Ok((stored.next, "noop"));
+    }
+    let bound = cap(node, dbn, Mode::Confirmed).min(dbn.db.head());
+    if next > bound {
+        let mut s = Status::invalid_argument(format!(
+            "cursor {name:?}: {next} is past the confirmed bound {bound}"
+        ));
+        if let Ok(v) = bound.to_string().parse() {
+            s.metadata_mut().insert(chron_proto::POSITION_HEADER, v);
+        }
+        return Err(("ahead", s));
+    }
+    let n = name.to_string();
+    blocking(&dbn.db, "set_cursor", move |db| {
+        db.set_cursor(&n, next, session)
+    })
+    .await
+    .map_err(|s| ("refused", s))?;
+    dbn.log_cursor(pb::CursorState {
+        name: name.to_string(),
+        next,
+        session,
+        deleted: false,
+    });
+    cursor_gauges(node, dbn, name, next).await;
+    Ok((next, "ok"))
+}
+
+/// Every cursor and the confirmed bound.
+pub async fn list_cursors(
+    node: &Arc<Node>,
+    dbn: &Arc<DbNode>,
+) -> Result<pb::ListCursorsResponse, Status> {
+    let cursors = blocking(&dbn.db, "cursors", |db| db.cursors()).await?;
+    Ok(pb::ListCursorsResponse {
+        cursors: cursors
+            .into_iter()
+            .map(|c| pb::CursorState {
+                name: c.name,
+                next: c.next,
+                session: c.session,
+                deleted: false,
+            })
+            .collect(),
+        confirmed: bound(node, dbn, Mode::Confirmed),
+    })
+}
+
+/// Removes a cursor (the caller checked the admin token); its live
+/// subscription ends.
+pub async fn delete_cursor(
+    node: &Arc<Node>,
+    dbn: &Arc<DbNode>,
+    name: &str,
+) -> Result<bool, Status> {
+    valid_cursor(name)?;
+    cursor_host(node)?;
+    if let Some(live) = dbn
+        .cursor_sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(name)
+    {
+        live.cancel.cancel();
+    }
+    let n = name.to_string();
+    let existed = blocking(&dbn.db, "remove_cursor", move |db| db.remove_cursor(&n)).await?;
+    if existed {
+        dbn.log_cursor(pb::CursorState {
+            name: name.to_string(),
+            next: 0,
+            session: 0,
+            deleted: true,
+        });
+        let _ = node
+            .metrics
+            .cursor_lag
+            .remove_label_values(&[&dbn.name, name]);
+        cursor_gauges(node, dbn, "", 0).await;
+    }
+    Ok(existed)
+}
+
+/// Updates the cursor gauges after a change (`name` empty: the count
+/// only).
+async fn cursor_gauges(node: &Node, dbn: &DbNode, name: &str, next: u64) {
+    if let Ok(all) = blocking(&dbn.db, "cursors", |db| db.cursors()).await {
+        node.metrics
+            .cursors
+            .with_label_values(&[&dbn.name])
+            .set(all.len() as i64);
+    }
+    if !name.is_empty() {
+        let lag = bound(node, dbn, Mode::Confirmed).saturating_sub(next);
+        node.metrics
+            .cursor_lag
+            .with_label_values(&[&dbn.name, name])
+            .set(lag as i64);
+    }
 }
 
 /// One finite read, paged through the library.
@@ -235,6 +472,7 @@ pub fn subscribe(
     from: u64,
     tag: Option<Vec<u8>>,
     mode: Mode,
+    cursor: Option<CursorSub>,
 ) -> ReceiverStream<Result<Event, Status>> {
     // The reset watch is taken before the subscription so a cut between
     // the two is not missed.
@@ -247,17 +485,31 @@ pub fn subscribe(
     .batch(PAGE);
     let (tx, rx) = mpsc::channel(PAGE);
     let cancel = dbn.cancel.clone();
+    let cursor_cancel = cursor
+        .as_ref()
+        .map_or_else(CancellationToken::new, |c| c.cancel.clone());
     let mut role = node.watch_role();
     tokio::spawn(async move {
+        // The registry entry goes when this stream ends, unless a later
+        // session already took the cursor over.
+        let _registered = cursor.as_ref().map(|c| CursorGuard {
+            dbn: dbn.clone(),
+            name: c.name.clone(),
+            session: c.session,
+        });
         loop {
             // Under the confirmed consistency the subscription is driven
             // below the cap and, once it has delivered everything below
             // it, waits for the bound to rise before asking again.
-            let upto = cap(&dbn, mode);
+            let upto = cap(&node, &dbn, mode);
             let next = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     let _ = tx.send(Err(gone(&node, &dbn))).await;
+                    return;
+                }
+                _ = cursor_cancel.cancelled() => {
+                    let _ = tx.send(Err(cursor_ended(&dbn, cursor.as_ref()))).await;
                     return;
                 }
                 r = role_lost(&mut role, false) => {
@@ -297,6 +549,10 @@ pub fn subscribe(
                             let _ = tx.send(Err(gone(&node, &dbn))).await;
                             return;
                         }
+                        _ = cursor_cancel.cancelled() => {
+                            let _ = tx.send(Err(cursor_ended(&dbn, cursor.as_ref()))).await;
+                            return;
+                        }
                         r = role_lost(&mut role, false) => {
                             let _ = tx.send(Err(ended(Some(r)))).await;
                             return;
@@ -328,6 +584,58 @@ pub fn subscribe(
 /// sender is gone (the database was dropped).
 async fn confirmed_above(rx: &mut watch::Receiver<u64>, upto: u64) -> bool {
     rx.wait_for(|c| *c > upto).await.is_ok()
+}
+
+/// Why a cursor subscription ended: the cursor was taken over by a newer
+/// subscription (which now owns the session) or deleted.
+fn cursor_ended(dbn: &DbNode, cursor: Option<&CursorSub>) -> Status {
+    let name = cursor.map_or("", |c| c.name.as_str());
+    let live = cursor.and_then(|c| {
+        dbn.cursor_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&c.name)
+            .map(|a| a.session)
+            .filter(|s| *s != c.session)
+    });
+    match live {
+        Some(s) => {
+            let mut st = Status::unavailable(format!(
+                "cursor {name:?} was taken over by session {s}; this subscription ends"
+            ));
+            if let Ok(v) = s.to_string().parse() {
+                st.metadata_mut().insert(chron_proto::SESSION_HEADER, v);
+            }
+            st
+        }
+        None => Status::unavailable(format!(
+            "cursor {name:?} was deleted; this subscription ends"
+        )),
+    }
+}
+
+/// Removes a cursor's registry entry when its stream ends, unless a
+/// newer session holds it.
+struct CursorGuard {
+    dbn: Arc<DbNode>,
+    name: String,
+    session: u64,
+}
+
+impl Drop for CursorGuard {
+    fn drop(&mut self) {
+        let mut live = self
+            .dbn
+            .cursor_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if live
+            .get(&self.name)
+            .is_some_and(|a| a.session == self.session)
+        {
+            live.remove(&self.name);
+        }
+    }
 }
 
 /// The whole commit: the guarded write on the blocking pool, then, when
@@ -450,7 +758,10 @@ pub async fn info(node: &Node, dbn: &DbNode) -> Result<pb::InfoResponse, Status>
             Vec::new()
         },
         sync_commit: node.wants_sync(None),
-        confirmed: node.cluster.is_some().then(|| cap(dbn, Mode::Confirmed)),
+        confirmed: node
+            .cluster
+            .is_some()
+            .then(|| cap(node, dbn, Mode::Confirmed)),
         read_consistency: node.read_mode(pb::Consistency::Unspecified).wire() as i32,
         members_version: members.current.version,
         members_epoch: members.current.epoch,

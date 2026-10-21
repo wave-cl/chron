@@ -106,8 +106,11 @@ fn rebuild_from(
     let segments = validated_segments(&dir)?;
     // Only after the segments passed: opening the old index may rewrite
     // its file, and a refused rebuild must leave it untouched.
-    let (id, seed) = match id {
-        IdSource::Given(id) => (id, seed),
+    // The old index is the only place cursors live: they are copied
+    // with the identity and the aggregate lengths. A seeded rebuild (a
+    // restore) starts without any.
+    let (id, seed, cursors) = match id {
+        IdSource::Given(id) => (id, seed, Vec::new()),
         IdSource::Existing => {
             let index_file = layout.index_file();
             let old = if index_file.exists() {
@@ -119,14 +122,18 @@ fn rebuild_from(
                 Some(old) => (
                     old.db_id().unwrap_or(None),
                     old.aggregate_lens().unwrap_or_default(),
+                    old.cursors().unwrap_or_default(),
                 ),
-                None => (None, Vec::new()),
+                None => (None, Vec::new(), Vec::new()),
             }
         }
     };
     let identity_kept = id.is_some();
 
     let index = Index::create(&tmp, Fsync::Never)?;
+    if !cursors.is_empty() {
+        index.set_cursors(&cursors)?;
+    }
     let floor = segments.first().map_or(0, |(b, _)| *b);
     // An aggregate first seen above a floor may start at any index: its
     // earlier events were dropped.

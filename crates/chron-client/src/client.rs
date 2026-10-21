@@ -136,6 +136,69 @@ pub struct ReadOptions {
     pub wait_timeout: Option<Duration>,
 }
 
+/// A durable cursor's handle for one subscription (see
+/// [`Client::subscribe_cursor`]).
+#[derive(Debug, Clone)]
+pub struct Cursor {
+    client: Client,
+    name: String,
+    session: u64,
+    /// Where this subscription started.
+    pub from: u64,
+}
+
+impl Cursor {
+    /// The cursor's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The session this subscription owns the cursor under.
+    pub fn session(&self) -> u64 {
+        self.session
+    }
+
+    /// Acknowledges everything below `next` (the position after the last
+    /// event processed). Answers the stored position: `next` when it
+    /// moved, the earlier one when `next` was not past it. Past the
+    /// confirmed bound it is [`ClientError::InvalidArgument`]; from a
+    /// session that was taken over, [`ClientError::TakenOver`].
+    pub async fn ack(&self, next: u64) -> Result<u64, ClientError> {
+        Ok(self
+            .client
+            .rpc()
+            .ack(pb::AckRequest {
+                cursor: self.name.clone(),
+                next,
+                session: self.session,
+            })
+            .await?
+            .into_inner()
+            .next)
+    }
+}
+
+/// One durable cursor as [`Client::cursors`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorInfo {
+    /// The cursor's name.
+    pub name: String,
+    /// The position after the last acknowledged event.
+    pub next: u64,
+    /// The session that owns it.
+    pub session: u64,
+}
+
+/// [`Client::cursors`]: the cursors and the confirmed bound (a cursor's
+/// lag is `confirmed - next`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorList {
+    /// Every cursor, by name.
+    pub cursors: Vec<CursorInfo>,
+    /// The confirmed bound.
+    pub confirmed: u64,
+}
+
 /// What [`Client::head_with`] answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Head {
@@ -462,6 +525,21 @@ pub struct ReplicationChunk {
     /// The highest position a majority durably held when the chunk was
     /// cut: a follower's confirmed bound.
     pub confirmed: u64,
+    /// Durable cursors that changed (every one on the opening chunk).
+    pub cursors: Vec<CursorChange>,
+}
+
+/// A durable cursor's state as the replication stream carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorChange {
+    /// The cursor's name.
+    pub name: String,
+    /// The position after the last acknowledged event.
+    pub next: u64,
+    /// The session that owns it.
+    pub session: u64,
+    /// The cursor was deleted (`next` and `session` are then 0).
+    pub deleted: bool,
 }
 
 /// The bytes of a backup archive fetched from a daemon, in order.
@@ -1419,10 +1497,101 @@ impl Client {
                 from,
                 tag: tag.map(|t| t.to_vec()),
                 consistency: consistency.unwrap_or(self.config.consistency).wire() as i32,
+                cursor: String::new(),
             })
             .await?
             .into_inner();
         Ok(events(stream))
+    }
+
+    /// Subscribes on a durable cursor: the daemon keeps the position under
+    /// `name`, so the stream resumes after a crash or a failover from the
+    /// last acknowledged position (`from_if_new` for a new cursor; the
+    /// floor when below it). Delivery is confirmed-only. The newest
+    /// subscription on a cursor owns it: an older stream ends with
+    /// [`ClientError::Unavailable`] "taken over", and its acknowledgments
+    /// are refused as [`ClientError::TakenOver`]. Cursors are kept on the
+    /// leader; a client made by [`connect_any`](Client::connect_any) tries
+    /// the leader it finds next once when a node refuses. Acknowledge with
+    /// [`Cursor::ack`]; the stream delivers again from the last
+    /// acknowledgment, so processing is at least once.
+    pub async fn subscribe_cursor(
+        &self,
+        name: &str,
+        from_if_new: u64,
+        tag: Option<Bytes>,
+    ) -> Result<(EventStream, Cursor), ClientError> {
+        let req = pb::SubscribeRequest {
+            from: from_if_new,
+            tag: tag.map(|t| t.to_vec()),
+            consistency: pb::Consistency::Confirmed as i32,
+            cursor: name.to_string(),
+        };
+        let resp = match self.rpc().subscribe(req.clone()).await {
+            Ok(r) => r,
+            Err(s)
+                if s.code() == tonic::Code::FailedPrecondition
+                    && self.rediscover().await.is_ok() =>
+            {
+                self.rpc().subscribe(req).await?
+            }
+            Err(s) => return Err(s.into()),
+        };
+        let session = resp
+            .metadata()
+            .get(chron_proto::SESSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| ClientError::Decode("a cursor stream without a session".into()))?;
+        let from = resp
+            .metadata()
+            .get(chron_proto::CURSOR_FROM_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(from_if_new);
+        Ok((
+            events(resp.into_inner()),
+            Cursor {
+                client: self.clone(),
+                name: name.to_string(),
+                session,
+                from,
+            },
+        ))
+    }
+
+    /// Every durable cursor of the database and the confirmed bound.
+    pub async fn cursors(&self) -> Result<CursorList, ClientError> {
+        let l = self
+            .rpc()
+            .list_cursors(pb::ListCursorsRequest {})
+            .await?
+            .into_inner();
+        Ok(CursorList {
+            cursors: l
+                .cursors
+                .into_iter()
+                .map(|c| CursorInfo {
+                    name: c.name,
+                    next: c.next,
+                    session: c.session,
+                })
+                .collect(),
+            confirmed: l.confirmed,
+        })
+    }
+
+    /// Removes a durable cursor (admin); its live subscription ends.
+    /// Whether it existed.
+    pub async fn delete_cursor(&self, name: &str) -> Result<bool, ClientError> {
+        Ok(self
+            .admin()
+            .delete_cursor(pb::DeleteCursorRequest {
+                cursor: name.to_string(),
+            })
+            .await?
+            .into_inner()
+            .existed)
     }
 
     /// Syncs everything committed so far to disk.
@@ -1819,6 +1988,16 @@ fn chunks(stream: tonic::Streaming<pb::ReplicationChunk>) -> ChunkStream {
             epoch: c.epoch,
             epoch_base: c.epoch_base,
             confirmed: c.confirmed,
+            cursors: c
+                .cursors
+                .into_iter()
+                .map(|s| CursorChange {
+                    name: s.name,
+                    next: s.next,
+                    session: s.session,
+                    deleted: s.deleted,
+                })
+                .collect(),
         })
     }))
 }

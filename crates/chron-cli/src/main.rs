@@ -77,6 +77,12 @@ enum Commands {
         #[command(subcommand)]
         cmd: Option<MembersCommands>,
     },
+    /// The database's durable cursors (see `tail --cursor`); list or
+    /// delete one.
+    Cursors {
+        #[command(subcommand)]
+        cmd: Option<CursorCommands>,
+    },
     /// Create, list or drop the daemon's databases.
     Db {
         #[command(subcommand)]
@@ -103,6 +109,17 @@ enum Commands {
     },
     /// Offline: print a backup's header.
     Inspect { archive: std::path::PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+enum CursorCommands {
+    /// Every cursor with its position, session and lag (the default).
+    List,
+    /// Remove a cursor (admin); its live subscription ends.
+    Delete {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -189,6 +206,10 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
             MembersCommands::Remove { member } => {
                 cmd::admin::members_remove(conn, format, &member).await
             }
+        },
+        Commands::Cursors { cmd } => match cmd.unwrap_or(CursorCommands::List) {
+            CursorCommands::List => cmd::admin::cursors(conn, format).await,
+            CursorCommands::Delete { name } => cmd::admin::cursor_delete(conn, format, &name).await,
         },
         Commands::Db { cmd } => match cmd {
             DbCommands::Create { name } => cmd::admin::db_create(conn, format, &name).await,

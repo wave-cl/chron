@@ -303,6 +303,46 @@ fn members_value(m: &chron_client::Members) -> serde_json::Value {
     json!({ "epoch": m.epoch, "version": m.version, "addrs": m.addrs })
 }
 
+pub async fn cursors(conn: &Conn, format: Format) -> anyhow::Result<()> {
+    let l = client::connect(conn).await?.cursors().await?;
+    let human = if l.cursors.is_empty() {
+        format!("no cursors  confirmed {}", l.confirmed)
+    } else {
+        l.cursors
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}  next {}  session {}  lag {}",
+                    c.name,
+                    c.next,
+                    c.session,
+                    l.confirmed.saturating_sub(c.next)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    print_value(
+        format,
+        human,
+        json!({
+            "cursors": l.cursors.iter().map(|c| json!({ "name": c.name, "next": c.next, "session": c.session })).collect::<Vec<_>>(),
+            "confirmed": l.confirmed,
+        }),
+    );
+    Ok(())
+}
+
+pub async fn cursor_delete(conn: &Conn, format: Format, name: &str) -> anyhow::Result<()> {
+    let existed = client::connect(conn).await?.delete_cursor(name).await?;
+    print_value(
+        format,
+        if existed { "deleted" } else { "no such cursor" }.to_string(),
+        json!({ "existed": existed }),
+    );
+    Ok(())
+}
+
 pub async fn members(conn: &Conn, format: Format) -> anyhow::Result<()> {
     let m = client::connect_one(conn, &conn.addrs()[0])
         .await?

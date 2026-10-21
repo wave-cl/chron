@@ -42,7 +42,7 @@ mod txn;
 
 pub use backup::{BackupKind, BackupMeta, inspect_backup, restore_backup, restore_backup_from};
 pub use bytes::Bytes;
-pub use db::{Db, EventIter, FSYNC_BUCKET_BOUNDS, Info, Stats, WriterHold};
+pub use db::{CursorState, Db, EventIter, FSYNC_BUCKET_BOUNDS, Info, Stats, WriterHold};
 pub use error::{Error, Result};
 pub use event::{
     Event, FLAG_COMMIT_ID, FLAG_FIRST_IN_TXN, FLAG_FREE, FLAG_LAST_IN_TXN, MAX_TAG_BYTES,

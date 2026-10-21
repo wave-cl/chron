@@ -311,6 +311,7 @@ pub fn error_json(s: &Status) -> Value {
     for (key, name) in [
         (chron_proto::EPOCH_HEADER, "epoch"),
         (chron_proto::POSITION_HEADER, "position"),
+        (chron_proto::SESSION_HEADER, "session"),
         (chron_proto::FLOOR_HEADER, "floor"),
         (chron_proto::HEAD_HEADER, "head"),
         (chron_proto::COMMITTED_FIRST_HEADER, "committed_first"),

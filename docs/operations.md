@@ -146,6 +146,24 @@ its directory: `--advertise` is its identity, so remove the old address,
 start the daemon under the new one with `--peer` any member, and add the
 new address.
 
+## Cursors
+
+A consumer that subscribes with a cursor (`chron tail --cursor NAME`,
+`Client::subscribe_cursor`, `/tail?cursor=`) leaves its position on the
+leader; `chron cursors` lists every cursor with its `next`, the session
+that owns it and its lag behind the confirmed bound
+(`chron_cursor_lag_events{db,cursor}` is the same number). A lag that
+only grows means the consumer stopped acknowledging; the newest
+subscription on a cursor owns it, so restarting the consumer is enough,
+and the stream it replaces ends with "taken over". A cursor nobody will
+resume stays listed until `chron cursors delete NAME` (admin): delete
+it, since every cursor rides on every replication chunk. Cursors survive
+a leader change (they replicate with the chunks) and an index rebuild;
+a restore from a backup on a standalone node starts without them (a
+group member gets them back from the leader), so note each consumer's
+position before restoring. Cursors are accepted on the leader only: a
+client made by `connect_any` finds it.
+
 ## Restoring a replica from the leader
 
 With peers nothing to do: a node below the leader's floor fetches the

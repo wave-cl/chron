@@ -326,6 +326,31 @@ pub struct DbNode {
     /// leader's chunks and heartbeats do. Reads under the confirmed
     /// consistency are capped at `min(confirmed, head)`.
     pub confirmed: Arc<watch::Sender<u64>>,
+    /// On a leader: the live subscription per durable cursor (the
+    /// session that owns it and the token a takeover or a delete ends
+    /// its stream with).
+    pub cursor_sessions: Mutex<HashMap<String, ActiveCursor>>,
+    /// Cursor changes for the replication streams: every change bumps
+    /// the generation; a stream sends the entries above the generation
+    /// it last sent.
+    pub cursor_log: Mutex<CursorLog>,
+    /// The cursor log's generation, for streams idling with no new
+    /// events.
+    pub cursor_notify: watch::Sender<u64>,
+}
+
+/// A durable cursor's live subscription on a leader.
+pub struct ActiveCursor {
+    pub session: u64,
+    pub cancel: CancellationToken,
+}
+
+/// Cursor changes not yet sent on every replication stream.
+#[derive(Default)]
+pub struct CursorLog {
+    pub generation: u64,
+    /// Per cursor: its latest state and the generation it changed at.
+    pub entries: HashMap<String, (pb::CursorState, u64)>,
 }
 
 impl DbNode {
@@ -343,7 +368,37 @@ impl DbNode {
             sync: crate::sync::SyncState::with_confirmed(confirmed.clone()),
             epoch_base: std::sync::atomic::AtomicU64::new(0),
             confirmed,
+            cursor_sessions: Mutex::new(HashMap::new()),
+            cursor_log: Mutex::new(CursorLog::default()),
+            cursor_notify: watch::Sender::new(0),
         })
+    }
+
+    /// Records a cursor change for the replication streams and wakes
+    /// them.
+    pub fn log_cursor(&self, state: pb::CursorState) {
+        let generation = {
+            let mut log = self.cursor_log.lock().unwrap_or_else(|p| p.into_inner());
+            log.generation += 1;
+            let g = log.generation;
+            log.entries.insert(state.name.clone(), (state, g));
+            g
+        };
+        self.cursor_notify.send_replace(generation);
+    }
+
+    /// The cursor changes above generation `since`, and the generation
+    /// they bring a stream to.
+    pub fn cursor_changes(&self, since: u64) -> (Vec<pb::CursorState>, u64) {
+        let log = self.cursor_log.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out: Vec<(u64, pb::CursorState)> = log
+            .entries
+            .values()
+            .filter(|(_, g)| *g > since)
+            .map(|(s, g)| (*g, s.clone()))
+            .collect();
+        out.sort_by_key(|(g, _)| *g);
+        (out.into_iter().map(|(_, s)| s).collect(), log.generation)
     }
 
     /// Raises the confirmed bound to `p` if that is higher.

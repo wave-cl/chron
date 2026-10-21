@@ -15,9 +15,17 @@ crates share one version.
   answers `None` once nothing more lies under it, resuming where it
   stopped when the cap rises. The daemon's confirmed reads are built on
   them. Existing reads are unchanged.
+- Durable cursors: `Db::set_cursor`, `cursor`, `remove_cursor`,
+  `cursors` keep a named consumer position (`next`, `session`) in the
+  index (a new `cursor` table; an older index reads as empty). A
+  truncation clamps cursors to the cut, a rebuilt index keeps them, a
+  restored backup starts without them.
 
 ### chron-proto
 
+- `CursorState`, `SubscribeRequest.cursor`, `ReplicationChunk.cursors`,
+  `Ack`, `ListCursors`, `DeleteCursor`; headers `chron-session` and
+  `chron-cursor-from`.
 - `Consistency` (`LOCAL`, `CONFIRMED`, unspecified for the daemon's
   default); `consistency`, `at_least` and `wait_timeout_ms` on the read
   requests and `HeadRequest`; `HeadResponse { head, confirmed, local }`;
@@ -39,9 +47,22 @@ crates share one version.
   `wait_ms` on the read, head and tail routes; `/head` answers `head`,
   `confirmed` and `local`; `/info` adds `confirmed` and
   `read_consistency`.
+- Durable cursors: `Subscribe` with `cursor` keeps the position on the
+  leader under a session, starts at the stored position (the floor when
+  below it), delivers confirmed events only and takes the cursor over
+  from an older subscription; `Ack` moves it (no-op below, refused past
+  the confirmed bound or from a taken-over session); `ListCursors`,
+  `DeleteCursor` (admin). Cursors replicate on the chunks, so the next
+  leader resumes them. Gateway `GET /v1/db/{db}/cursors`, `DELETE
+  /v1/db/{db}/cursors/{name}`, `POST /v1/db/{db}/cursors/{name}/ack`,
+  `/tail?cursor=`. Metrics `chron_cursors`, `chron_cursor_lag_events`,
+  `chron_cursor_acks_total`.
 
 ### chron-client
 
+- `Client::subscribe_cursor` → `(EventStream, Cursor)`, `Cursor::ack`,
+  `cursors`, `delete_cursor`, `ClientError::TakenOver`;
+  `ReplicationChunk.cursors`.
 - `Consistency`, `ClientConfig::consistency`, `ReadOptions`, the `_with`
   reads, `head_with` (`Head { head, confirmed, local }`),
   `subscribe_with`, `ClientError::BoundTimeout`; `Info.confirmed` and
@@ -50,6 +71,8 @@ crates share one version.
 
 ### chron-cli
 
+- `tail --cursor NAME [--ack-every N]`, `chron cursors [list | delete
+  NAME]`.
 - `--local` / `--confirmed` on every command, `--at-least P [--wait
   SECS]` on `all`, `read`, `tag` and `head`; `head --json` carries both
   bounds.
@@ -57,6 +80,13 @@ crates share one version.
 ### tools
 
 - `chron-load --local` reads and subscribes under the local consistency.
+
+### examples
+
+- The bank's `balances --follow` runs on the durable cursor `balances`
+  against a daemon (`Store::subscribe_cursor`,
+  `Balances::follow_durable`); `apply` skips an event below the
+  checkpoint, so a redelivery changes nothing.
 
 ## 0.5.0 - 2026-10-19
 

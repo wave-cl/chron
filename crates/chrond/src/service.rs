@@ -160,7 +160,26 @@ fn spawn_chunk_stream(
     let max_bytes = limit / 2;
     tokio::spawn(async move {
         let mut cursor = from;
+        // Cursors ride on the chunks: every one on the opening chunk,
+        // then the changes since the generation last sent.
+        let mut cursor_rx = dbn.cursor_notify.subscribe();
+        let mut sent_gen = {
+            let (_, g) = dbn.cursor_changes(u64::MAX);
+            g
+        };
         if open_chunk {
+            let db2 = db.clone();
+            let all = match tokio::task::spawn_blocking(move || db2.cursors()).await {
+                Ok(Ok(all)) => all,
+                Ok(Err(e)) => {
+                    let _ = tx.send(Err(codec::status(e))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(codec::join("cursors", e))).await;
+                    return;
+                }
+            };
             let item = pb::ReplicationChunk {
                 db_id: db.id().as_bytes().to_vec(),
                 from: cursor,
@@ -170,6 +189,15 @@ fn spawn_chunk_stream(
                 epoch: db.epoch(),
                 epoch_base: dbn.epoch_base.load(std::sync::atomic::Ordering::Acquire),
                 confirmed: dbn.sync.majority(),
+                cursors: all
+                    .into_iter()
+                    .map(|c| pb::CursorState {
+                        name: c.name,
+                        next: c.next,
+                        session: c.session,
+                        deleted: false,
+                    })
+                    .collect(),
             };
             if tx.send(Ok(item)).await.is_err() {
                 return;
@@ -216,6 +244,8 @@ fn spawn_chunk_stream(
                             .await;
                         return;
                     }
+                    let (cursors, g) = dbn.cursor_changes(sent_gen);
+                    sent_gen = g;
                     let item = pb::ReplicationChunk {
                         db_id: db.id().as_bytes().to_vec(),
                         from: c.from,
@@ -225,6 +255,7 @@ fn spawn_chunk_stream(
                         epoch: db.epoch(),
                         epoch_base: dbn.epoch_base.load(std::sync::atomic::Ordering::Acquire),
                         confirmed: dbn.sync.majority(),
+                        cursors,
                     };
                     cursor = c.to;
                     if tx.send(Ok(item)).await.is_err() {
@@ -256,6 +287,32 @@ fn spawn_chunk_stream(
                         }
                         _ = tx.closed() => return,
                         _ = db.wait_for_async(cursor + 1) => {}
+                        r = cursor_rx.changed() => {
+                            // A cursor changed with no new events: an
+                            // empty chunk carries it.
+                            if r.is_err() {
+                                return;
+                            }
+                            let (cursors, g) = dbn.cursor_changes(sent_gen);
+                            sent_gen = g;
+                            if cursors.is_empty() {
+                                continue;
+                            }
+                            let item = pb::ReplicationChunk {
+                                db_id: db.id().as_bytes().to_vec(),
+                                from: cursor,
+                                to: cursor,
+                                frames: Vec::new(),
+                                head: db.head(),
+                                epoch: db.epoch(),
+                                epoch_base: dbn.epoch_base.load(std::sync::atomic::Ordering::Acquire),
+                                confirmed: dbn.sync.majority(),
+                                cursors,
+                            };
+                            if tx.send(Ok(item)).await.is_err() {
+                                return;
+                            }
+                        }
                     }
                     woke = std::time::Instant::now();
                 }
@@ -361,7 +418,7 @@ impl Chron for ChronService {
             read,
             r.from_index,
             r.limit,
-            ops::cap(&dbn, mode),
+            ops::cap(&self.node, &dbn, mode),
             dbn.cancel.clone(),
         )))
     }
@@ -376,7 +433,7 @@ impl Chron for ChronService {
         let r = req.into_inner();
         let mode = self.node.read_mode(r.consistency());
         ops::wait_requested(&self.node, &dbn, mode, r.at_least, r.wait_timeout_ms).await?;
-        let upto = ops::cap(&dbn, mode);
+        let upto = ops::cap(&self.node, &dbn, mode);
         if !r.backward {
             // A bad starting position is the call's status, not the
             // stream's first item.
@@ -419,7 +476,7 @@ impl Chron for ChronService {
             read,
             r.from,
             r.limit,
-            ops::cap(&dbn, mode),
+            ops::cap(&self.node, &dbn, mode),
             dbn.cancel.clone(),
         )))
     }
@@ -453,11 +510,60 @@ impl Chron for ChronService {
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let dbn = self.db(&req)?;
         let r = req.into_inner();
-        let mode = self.node.read_mode(r.consistency());
-        let rx = ops::subscribe(self.node.clone(), dbn, r.from, r.tag, mode);
-        Ok(Response::new(Box::pin(
-            rx.map(|item| item.map(codec::event_to_wire)),
-        )))
+        let mut mode = self.node.read_mode(r.consistency());
+        let mut from = r.from;
+        let mut meta = Vec::new();
+        let cursor = if r.cursor.is_empty() {
+            None
+        } else {
+            // A durable cursor: confirmed delivery whatever was asked,
+            // from the stored position, under a fresh session.
+            let (start, session, cancel) =
+                ops::register_cursor(&self.node, &dbn, &r.cursor, r.from).await?;
+            mode = ops::Mode::Confirmed;
+            from = start;
+            meta.push((chron_proto::SESSION_HEADER, session));
+            meta.push((chron_proto::CURSOR_FROM_HEADER, start));
+            Some(ops::CursorSub {
+                name: r.cursor,
+                session,
+                cancel,
+            })
+        };
+        let rx = ops::subscribe(self.node.clone(), dbn, from, r.tag, mode, cursor);
+        let mut resp: Response<Self::SubscribeStream> =
+            Response::new(Box::pin(rx.map(|item| item.map(codec::event_to_wire))));
+        for (key, v) in meta {
+            if let Ok(v) = v.to_string().parse() {
+                resp.metadata_mut().insert(key, v);
+            }
+        }
+        Ok(resp)
+    }
+
+    async fn ack(&self, req: Request<pb::AckRequest>) -> Result<Response<pb::AckResponse>, Status> {
+        let dbn = self.db(&req)?;
+        let r = req.into_inner();
+        let next = ops::ack(&self.node, &dbn, &r.cursor, r.next, r.session).await?;
+        Ok(Response::new(pb::AckResponse { next }))
+    }
+
+    async fn list_cursors(
+        &self,
+        req: Request<pb::ListCursorsRequest>,
+    ) -> Result<Response<pb::ListCursorsResponse>, Status> {
+        let dbn = self.db(&req)?;
+        Ok(Response::new(ops::list_cursors(&self.node, &dbn).await?))
+    }
+
+    async fn delete_cursor(
+        &self,
+        req: Request<pb::DeleteCursorRequest>,
+    ) -> Result<Response<pb::DeleteCursorResponse>, Status> {
+        self.node.require_admin(req.metadata())?;
+        let dbn = self.db(&req)?;
+        let existed = ops::delete_cursor(&self.node, &dbn, &req.into_inner().cursor).await?;
+        Ok(Response::new(pb::DeleteCursorResponse { existed }))
     }
 
     async fn flush(

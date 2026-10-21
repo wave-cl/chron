@@ -80,6 +80,10 @@ pub struct Options {
     /// the library's default (256). `1` makes every batch's index
     /// commit durable: two fsyncs per batch, the pre-0.5 behaviour.
     pub index_checkpoint_batches: Option<usize>,
+    /// Bytes at which a segment rolls; `None` for the library's default
+    /// (256 MiB). Retention drops whole segments, so a small value lets
+    /// a test raise the floor.
+    pub segment_max_bytes: Option<u64>,
     /// Serve TLS; `None` is plaintext.
     pub tls: Option<Tls>,
     /// Every `chron.v1.Chron` call must carry `authorization: Bearer
@@ -181,6 +185,7 @@ impl Options {
             group_commit_max_txns: None,
             group_commit_max_bytes: None,
             index_checkpoint_batches: None,
+            segment_max_bytes: None,
             tls: None,
             token: None,
             admin_token: None,
@@ -245,6 +250,9 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
     }
     if let Some(n) = opts.group_commit_max_bytes {
         db_opts = db_opts.group_commit_max_bytes(n);
+    }
+    if let Some(n) = opts.segment_max_bytes {
+        db_opts = db_opts.segment_max_bytes(n);
     }
     if let Some(n) = opts.index_checkpoint_batches {
         db_opts = db_opts.index_checkpoint_batches(n);

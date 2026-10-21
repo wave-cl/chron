@@ -102,7 +102,9 @@ async fn run<S: Store>(
             b.save(projection)?;
             print_balances(&b);
             if follow {
-                b.follow(&store, |b| {
+                // Through a daemon the cursor `balances` keeps the position
+                // (the file is still written for the next `balances`).
+                b.follow_durable(&store, "balances", |b| {
                     print_balances(b);
                     if let Err(e) = b.save(projection) {
                         eprintln!("bank: {e}");

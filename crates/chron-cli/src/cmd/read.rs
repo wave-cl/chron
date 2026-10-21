@@ -143,6 +143,16 @@ pub struct TailArgs {
     /// Only events carrying this tag.
     #[arg(long)]
     tag: Option<String>,
+    /// Follow through a durable cursor of this name: the daemon keeps
+    /// the position (--from applies to a new cursor only) and every
+    /// event is acknowledged once printed, so a restart resumes where
+    /// this one stopped. Confirmed delivery; the newest `tail` on a
+    /// cursor takes it over.
+    #[arg(long)]
+    cursor: Option<String>,
+    /// With --cursor: acknowledge every N events instead of every one.
+    #[arg(long, default_value_t = 1, requires = "cursor")]
+    ack_every: u64,
 }
 
 pub async fn tail(conn: &Conn, format: Format, a: TailArgs) -> anyhow::Result<()> {
@@ -152,6 +162,30 @@ pub async fn tail(conn: &Conn, format: Format, a: TailArgs) -> anyhow::Result<()
         (false, Some(from)) => from,
         (false, None) => c.info().await?.floor,
     };
+    if let Some(name) = a.cursor {
+        let (mut stream, cursor) = c
+            .subscribe_cursor(&name, from, a.tag.map(Into::into))
+            .await?;
+        if matches!(format, Format::Human) {
+            eprintln!(
+                "cursor {name}: session {} from {}",
+                cursor.session(),
+                cursor.from
+            );
+        }
+        let every = a.ack_every.max(1);
+        let mut since_ack = 0u64;
+        while let Some(item) = stream.next().await {
+            let ev = item?;
+            print_event(format, &ev);
+            since_ack += 1;
+            if since_ack >= every {
+                cursor.ack(ev.position + 1).await?;
+                since_ack = 0;
+            }
+        }
+        return Ok(());
+    }
     let stream = match a.tag {
         Some(tag) => c.subscribe_tag(tag, from).await?,
         None => c.subscribe(from).await?,

@@ -11,7 +11,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::account::{AccountEvent, BankError, TAG};
-use crate::store::Store;
+use crate::store::{Store, StoreError};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Balances {
@@ -24,6 +24,11 @@ impl Balances {
     /// Applies one event. A closed account leaves the map; an event that
     /// does not decode changes nothing, not even the checkpoint.
     pub fn apply(&mut self, ev: &Event) -> Result<(), BankError> {
+        // An event already applied (delivered again after a crash between
+        // a save and its acknowledgment) changes nothing.
+        if ev.position < self.checkpoint {
+            return Ok(());
+        }
         if let Some(id) = ev.aggregate {
             let event = AccountEvent::decode(ev)?;
             match event {
@@ -64,6 +69,33 @@ impl Balances {
         let mut stream = store.subscribe_tag(TAG, self.checkpoint).await?;
         while let Some(item) = stream.next().await {
             self.apply(&item?)?;
+            on_change(self);
+        }
+        Ok(())
+    }
+
+    /// Follows the tag through the store's durable cursor `name` (see
+    /// `Store::subscribe_cursor`), acknowledging every event once applied,
+    /// so a restart resumes where this run stopped without a file. On a
+    /// store without cursors it is `follow` from the checkpoint.
+    pub async fn follow_durable<S: Store>(
+        &mut self,
+        store: &S,
+        name: &str,
+        mut on_change: impl FnMut(&Balances),
+    ) -> Result<(), BankError> {
+        let (mut stream, cursor) = store.subscribe_cursor(name, TAG, self.checkpoint).await?;
+        if let Some(c) = &cursor {
+            // The cursor's position is the checkpoint; what lies between
+            // the file's and it was processed by an earlier run.
+            self.checkpoint = self.checkpoint.max(c.from);
+        }
+        while let Some(item) = stream.next().await {
+            let ev = item?;
+            self.apply(&ev)?;
+            if let Some(c) = &cursor {
+                c.ack(ev.position + 1).await.map_err(StoreError::from)?;
+            }
             on_change(self);
         }
         Ok(())

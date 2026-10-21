@@ -177,7 +177,51 @@ message SubscribeRequest {
   uint64 from = 1;
   optional bytes tag = 2;
   Consistency consistency = 3;
+  // A durable cursor: the daemon keeps the subscription's position
+  // under this name (see Ack). The stream starts at the cursor's stored
+  // next (at `from` when the cursor is new; at the floor when below
+  // it), delivers confirmed events only, and takes over from any
+  // earlier stream on the cursor, which ends UNAVAILABLE. The response
+  // metadata carries `chron-session` (this stream's session) and
+  // `chron-cursor-from` (where it starts). Leader only.
+  string cursor = 4;
 }
+
+// What the daemon keeps per cursor: `next` is the position after the
+// last acknowledged event, `session` the live subscription's (a new
+// one takes `session + 1`); `deleted` marks a removal on the
+// replication stream.
+message CursorState {
+  string name = 1;
+  uint64 next = 2;
+  uint64 session = 3;
+  bool deleted = 4;
+}
+
+// Acknowledges a cursor's progress: `next` is the position after the
+// last event processed. Below the stored next it is a no-op (the
+// stored value is answered); above the confirmed bound it is
+// INVALID_ARGUMENT with the bound in `chron-position`; with a session
+// other than the live one FAILED_PRECONDITION "taken over", carrying
+// the live session in `chron-session`; an unknown cursor is NOT_FOUND.
+// Leader only.
+message AckRequest {
+  string cursor = 1;
+  uint64 next = 2;
+  uint64 session = 3;
+}
+message AckResponse { uint64 next = 1; }
+
+message ListCursorsRequest {}
+message ListCursorsResponse {
+  repeated CursorState cursors = 1;
+  // The confirmed bound, so a cursor's lag is `confirmed - next`.
+  uint64 confirmed = 2;
+}
+
+// Removes a cursor (admin); its live stream ends UNAVAILABLE.
+message DeleteCursorRequest { string cursor = 1; }
+message DeleteCursorResponse { bool existed = 1; }
 
 message FlushRequest {}
 message FlushResponse {}
@@ -476,6 +520,9 @@ message ReplicationChunk {
   // The highest position a majority durably held when the chunk was
   // cut: the follower's confirmed bound.
   uint64 confirmed = 8;
+  // Cursors that changed since the previous chunk (every cursor on the
+  // opening chunk); a follower stores them after applying the events.
+  repeated CursorState cursors = 9;
 }
 
 message PromoteRequest {}
@@ -524,6 +571,9 @@ service Chron {
   rpc AggregateLen(AggregateLenRequest) returns (AggregateLenResponse);
   rpc Head(HeadRequest) returns (HeadResponse);
   rpc Subscribe(SubscribeRequest) returns (stream Event);
+  rpc Ack(AckRequest) returns (AckResponse);
+  rpc ListCursors(ListCursorsRequest) returns (ListCursorsResponse);
+  rpc DeleteCursor(DeleteCursorRequest) returns (DeleteCursorResponse);
   rpc Flush(FlushRequest) returns (FlushResponse);
   rpc Info(InfoRequest) returns (InfoResponse);
   rpc Backup(BackupRequest) returns (BackupMeta);

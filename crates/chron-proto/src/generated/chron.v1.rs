@@ -227,6 +227,72 @@ pub struct SubscribeRequest {
     pub tag: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     #[prost(enumeration = "Consistency", tag = "3")]
     pub consistency: i32,
+    /// A durable cursor: the daemon keeps the subscription's position
+    /// under this name (see Ack). The stream starts at the cursor's stored
+    /// next (at `from` when the cursor is new; at the floor when below
+    /// it), delivers confirmed events only, and takes over from any
+    /// earlier stream on the cursor, which ends UNAVAILABLE. The response
+    /// metadata carries `chron-session` (this stream's session) and
+    /// `chron-cursor-from` (where it starts). Leader only.
+    #[prost(string, tag = "4")]
+    pub cursor: ::prost::alloc::string::String,
+}
+/// What the daemon keeps per cursor: `next` is the position after the
+/// last acknowledged event, `session` the live subscription's (a new
+/// one takes `session + 1`); `deleted` marks a removal on the
+/// replication stream.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CursorState {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub next: u64,
+    #[prost(uint64, tag = "3")]
+    pub session: u64,
+    #[prost(bool, tag = "4")]
+    pub deleted: bool,
+}
+/// Acknowledges a cursor's progress: `next` is the position after the
+/// last event processed. Below the stored next it is a no-op (the
+/// stored value is answered); above the confirmed bound it is
+/// INVALID_ARGUMENT with the bound in `chron-position`; with a session
+/// other than the live one FAILED_PRECONDITION "taken over", carrying
+/// the live session in `chron-session`; an unknown cursor is NOT_FOUND.
+/// Leader only.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AckRequest {
+    #[prost(string, tag = "1")]
+    pub cursor: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub next: u64,
+    #[prost(uint64, tag = "3")]
+    pub session: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AckResponse {
+    #[prost(uint64, tag = "1")]
+    pub next: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListCursorsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListCursorsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub cursors: ::prost::alloc::vec::Vec<CursorState>,
+    /// The confirmed bound, so a cursor's lag is `confirmed - next`.
+    #[prost(uint64, tag = "2")]
+    pub confirmed: u64,
+}
+/// Removes a cursor (admin); its live stream ends UNAVAILABLE.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteCursorRequest {
+    #[prost(string, tag = "1")]
+    pub cursor: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteCursorResponse {
+    #[prost(bool, tag = "1")]
+    pub existed: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FlushRequest {}
@@ -665,7 +731,7 @@ pub struct ReplicateRequest {
 /// Positions \[from, to) as back-to-back frames exactly as the leader's
 /// segments hold them; `to` ends a transaction. `head` and `epoch` are the
 /// leader's when the chunk was cut. Never ends on its own.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReplicationChunk {
     #[prost(bytes = "vec", tag = "1")]
     pub db_id: ::prost::alloc::vec::Vec<u8>,
@@ -689,6 +755,10 @@ pub struct ReplicationChunk {
     /// cut: the follower's confirmed bound.
     #[prost(uint64, tag = "8")]
     pub confirmed: u64,
+    /// Cursors that changed since the previous chunk (every cursor on the
+    /// opening chunk); a follower stores them after applying the events.
+    #[prost(message, repeated, tag = "9")]
+    pub cursors: ::prost::alloc::vec::Vec<CursorState>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PromoteRequest {}
@@ -1060,6 +1130,72 @@ pub mod chron_client {
             let mut req = request.into_request();
             req.extensions_mut().insert(GrpcMethod::new("chron.v1.Chron", "Subscribe"));
             self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn ack(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AckRequest>,
+        ) -> std::result::Result<tonic::Response<super::AckResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/chron.v1.Chron/Ack");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("chron.v1.Chron", "Ack"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_cursors(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListCursorsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListCursorsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/ListCursors",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("chron.v1.Chron", "ListCursors"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn delete_cursor(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteCursorRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteCursorResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/DeleteCursor",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("chron.v1.Chron", "DeleteCursor"));
+            self.inner.unary(req, path, codec).await
         }
         pub async fn flush(
             &mut self,
@@ -1545,6 +1681,24 @@ pub mod chron_server {
             &self,
             request: tonic::Request<super::SubscribeRequest>,
         ) -> std::result::Result<tonic::Response<Self::SubscribeStream>, tonic::Status>;
+        async fn ack(
+            &self,
+            request: tonic::Request<super::AckRequest>,
+        ) -> std::result::Result<tonic::Response<super::AckResponse>, tonic::Status>;
+        async fn list_cursors(
+            &self,
+            request: tonic::Request<super::ListCursorsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListCursorsResponse>,
+            tonic::Status,
+        >;
+        async fn delete_cursor(
+            &self,
+            request: tonic::Request<super::DeleteCursorRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteCursorResponse>,
+            tonic::Status,
+        >;
         async fn flush(
             &self,
             request: tonic::Request<super::FlushRequest>,
@@ -2082,6 +2236,137 @@ pub mod chron_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/Ack" => {
+                    #[allow(non_camel_case_types)]
+                    struct AckSvc<T: Chron>(pub Arc<T>);
+                    impl<T: Chron> tonic::server::UnaryService<super::AckRequest>
+                    for AckSvc<T> {
+                        type Response = super::AckResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AckRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::ack(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AckSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/ListCursors" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListCursorsSvc<T: Chron>(pub Arc<T>);
+                    impl<T: Chron> tonic::server::UnaryService<super::ListCursorsRequest>
+                    for ListCursorsSvc<T> {
+                        type Response = super::ListCursorsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListCursorsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::list_cursors(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListCursorsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/DeleteCursor" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteCursorSvc<T: Chron>(pub Arc<T>);
+                    impl<
+                        T: Chron,
+                    > tonic::server::UnaryService<super::DeleteCursorRequest>
+                    for DeleteCursorSvc<T> {
+                        type Response = super::DeleteCursorResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteCursorRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::delete_cursor(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteCursorSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

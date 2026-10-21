@@ -94,6 +94,11 @@ fn append_then_read_prints_human_lines() {
         .stdout(predicate::str::contains("shipped").and(predicate::str::contains("placed").not()));
     d.chron().args(["len", A]).assert().success().stdout("2\n");
     d.chron().args(["head"]).assert().success().stdout("2\n");
+    d.chron()
+        .args(["cursors"])
+        .assert()
+        .success()
+        .stdout("no cursors  confirmed 2\n");
 }
 
 #[test]

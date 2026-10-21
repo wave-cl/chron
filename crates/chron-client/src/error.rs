@@ -77,6 +77,16 @@ pub enum ClientError {
     /// named a reachable leader.
     #[error("no leader: {0}")]
     NoLeader(String),
+    /// An acknowledgment from a cursor subscription that a newer one took
+    /// over: `session` is the live one. Stop; the other consumer owns the
+    /// cursor now.
+    #[error("the cursor was taken over by session {session}: {message}")]
+    TakenOver {
+        /// The session that owns the cursor.
+        session: u64,
+        /// The daemon's message.
+        message: String,
+    },
     /// A read with `at_least` waited its timeout out: the bound under the
     /// read's consistency stayed at `position`, below what was asked
     /// (`head` is the node's head). Nothing was read.
@@ -131,6 +141,14 @@ fn header<T: std::str::FromStr>(s: &Status, key: &str) -> Option<T> {
 impl From<Status> for ClientError {
     fn from(s: Status) -> Self {
         match s.code() {
+            Code::FailedPrecondition
+                if let Some(session) = header::<u64>(&s, chron_proto::SESSION_HEADER) =>
+            {
+                ClientError::TakenOver {
+                    session,
+                    message: s.message().to_string(),
+                }
+            }
             Code::FailedPrecondition => {
                 if let (Some(aggregate), Some(actual)) = (
                     header::<Uuid>(&s, chron_proto::CONFLICT_AGGREGATE_HEADER),

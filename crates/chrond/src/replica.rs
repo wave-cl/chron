@@ -906,6 +906,7 @@ async fn tail(
                     c.chunk.frames.extend_from_slice(&n.chunk.frames);
                     c.head = c.head.max(n.head);
                     c.confirmed = c.confirmed.max(n.confirmed);
+                    c.cursors.extend(n.cursors);
                     merged += 1;
                 }
                 other => {
@@ -940,6 +941,24 @@ async fn tail(
             acks.applied(new_head)
                 .await
                 .map_err(|_| "the leader stopped reading acknowledgments".to_string())?;
+        }
+        // The leader's cursor changes, after the events they may point
+        // into: a copy promoted later holds at least what its cursors
+        // name (reads clamp at the confirmed bound anyway).
+        if !c.cursors.is_empty() {
+            let db = db.clone();
+            let changes = std::mem::take(&mut c.cursors);
+            blocking(move || {
+                for s in changes {
+                    if s.deleted {
+                        db.remove_cursor(&s.name)?;
+                    } else {
+                        db.set_cursor(&s.name, s.next, s.session)?;
+                    }
+                }
+                Ok(())
+            })
+            .await?;
         }
         last_round_end = std::time::Instant::now();
         // What the leader said a majority held when it cut the chunk; it

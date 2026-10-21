@@ -116,15 +116,11 @@ pub fn head(
     dbn: &crate::node::DbNode,
     mode: crate::ops::Mode,
 ) -> pb::HeadResponse {
-    use crate::ops::{Mode, bound, cap};
+    use crate::ops::{Mode, bound};
     let local = dbn.db.head();
     pb::HeadResponse {
-        head: bound(dbn, mode),
-        confirmed: if node.cluster.is_some() {
-            cap(dbn, Mode::Confirmed)
-        } else {
-            local
-        },
+        head: bound(node, dbn, mode),
+        confirmed: bound(node, dbn, Mode::Confirmed),
         local,
     }
 }

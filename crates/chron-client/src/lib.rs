@@ -29,9 +29,10 @@ pub use chron::{
     Options, Retained, Uuid,
 };
 pub use client::{
-    ByteStream, ChunkStream, Client, ClientConfig, CommitOptions, Consistency, DatabaseInfo,
-    Discovered, EventStream, FollowAcks, FollowerStatus, Head, Identity, Info, Members,
-    MembersStatus, Promoted, ReadOptions, ReplicationChunk, Role, TlsConfig,
+    ByteStream, ChunkStream, Client, ClientConfig, CommitOptions, Consistency, Cursor,
+    CursorChange, CursorInfo, CursorList, DatabaseInfo, Discovered, EventStream, FollowAcks,
+    FollowerStatus, Head, Identity, Info, Members, MembersStatus, Promoted, ReadOptions,
+    ReplicationChunk, Role, TlsConfig,
 };
 pub use error::ClientError;
 pub use txn::{Append, Transaction};

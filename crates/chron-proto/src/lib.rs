@@ -32,6 +32,12 @@ pub const HEAD_HEADER: &str = "chron-head";
 pub const COMMITTED_FIRST_HEADER: &str = "chron-committed-first";
 /// On the same status: the head after that transaction.
 pub const COMMITTED_NEXT_HEADER: &str = "chron-committed-next";
+/// On a `Subscribe` stream with a cursor: the stream's session, which
+/// its acknowledgments must carry; on the `FAILED_PRECONDITION` of an
+/// acknowledgment from another session, the live one.
+pub const SESSION_HEADER: &str = "chron-session";
+/// On a `Subscribe` stream with a cursor: the position it starts at.
+pub const CURSOR_FROM_HEADER: &str = "chron-cursor-from";
 /// Request metadata naming the database a call is for; absent means
 /// [`DEFAULT_DATABASE`].
 pub const DATABASE_HEADER: &str = "chron-db";

@@ -1154,6 +1154,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "follow through a durable cursor of this name (confirmed delivery from its stored position; --from applies to a new cursor); the first SSE item is then `event: session` with {\"session\", \"from\"}; leader only",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "description": " The stream is text/event-stream: one data: line of JSON per event, a `: heartbeat` comment every 15 s, and a final event: error when the database is dropped, cut back to an earlier position (a diverged node resetting; its JSON carries position), the node fenced or the daemon stops."
@@ -1520,6 +1529,165 @@
               "text/plain": {
                 "schema": {
                   "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/db/{db}/cursors": {
+      "get": {
+        "summary": "The database's durable cursors and the confirmed bound (a cursor's lag is confirmed minus next)",
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "cursors": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "next": {
+                            "type": "integer",
+                            "description": "the position after the last acknowledged event"
+                          },
+                          "session": {
+                            "type": "integer",
+                            "description": "the session that owns it"
+                          }
+                        }
+                      }
+                    },
+                    "confirmed": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/db/{db}/cursors/{name}": {
+      "delete": {
+        "summary": "Remove a durable cursor (admin); its live subscription ends",
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "the cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "existed": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/db/{db}/cursors/{name}/ack": {
+      "post": {
+        "summary": "Acknowledge a cursor's progress: next is the position after the last event processed; below the stored next a no-op, past the confirmed bound 400 with the bound in position, from a session that was taken over 412 with the live session in session; unknown cursor 404; leader only",
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "the cursor",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "next",
+                  "session"
+                ],
+                "properties": {
+                  "next": {
+                    "type": "integer"
+                  },
+                  "session": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "next": {
+                      "type": "integer",
+                      "description": "the stored position"
+                    }
+                  }
                 }
               }
             }

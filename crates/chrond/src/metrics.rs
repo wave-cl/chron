@@ -35,6 +35,9 @@ pub const METHODS: &[(&str, bool)] = &[
     ("/chron.v1.Chron/AggregateLen", false),
     ("/chron.v1.Chron/Head", false),
     ("/chron.v1.Chron/Subscribe", true),
+    ("/chron.v1.Chron/Ack", false),
+    ("/chron.v1.Chron/ListCursors", false),
+    ("/chron.v1.Chron/DeleteCursor", false),
     ("/chron.v1.Chron/Flush", false),
     ("/chron.v1.Chron/Info", false),
     ("/chron.v1.Chron/Backup", false),
@@ -147,6 +150,13 @@ pub struct Metrics {
     pub restores: IntCounterVec,
     /// Membership generations this node committed as the leader.
     pub member_changes: IntCounter,
+    /// Durable cursors per database.
+    pub cursors: IntGaugeVec,
+    /// Per cursor: the confirmed bound minus its next, at its last
+    /// acknowledgment or registration.
+    pub cursor_lag: IntGaugeVec,
+    /// Acknowledgments by outcome.
+    pub cursor_acks: IntCounterVec,
     start_time: IntGauge,
 }
 
@@ -230,6 +240,21 @@ impl Metrics {
             "campaigns this node started (pre-vote included)",
         )
         .expect("valid metric");
+        let cursors = gauge(
+            "chron_cursors",
+            "durable cursors kept on the database",
+            &["db"],
+        );
+        let cursor_lag = gauge(
+            "chron_cursor_lag_events",
+            "confirmed bound minus the cursor's next, at its last acknowledgment",
+            &["db", "cursor"],
+        );
+        let cursor_acks = counter(
+            "chron_cursor_acks_total",
+            "cursor acknowledgments by outcome (ok, noop, taken_over, ahead, not_found, refused)",
+            &["db", "result"],
+        );
         let member_changes = IntCounter::new(
             "chron_member_changes_total",
             "membership generations this node committed as the leader (its own republish included)",
@@ -281,6 +306,9 @@ impl Metrics {
             Box::new(http_requests.clone()),
             Box::new(elections.clone()),
             Box::new(member_changes.clone()),
+            Box::new(cursors.clone()),
+            Box::new(cursor_lag.clone()),
+            Box::new(cursor_acks.clone()),
             Box::new(leader_changes.clone()),
             Box::new(heartbeat_failures.clone()),
             Box::new(sync_wait.clone()),
@@ -304,6 +332,9 @@ impl Metrics {
             http_requests,
             elections,
             member_changes,
+            cursors,
+            cursor_lag,
+            cursor_acks,
             leader_changes,
             heartbeat_failures,
             sync_wait,

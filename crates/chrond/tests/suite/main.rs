@@ -3,6 +3,7 @@ mod common;
 mod bin;
 mod commit;
 mod consistency;
+mod cursors;
 mod databases;
 mod failover;
 mod fetch;

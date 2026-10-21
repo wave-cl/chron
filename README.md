@@ -699,6 +699,36 @@ and `head`. A 0.5.0 client reads at the daemon's default. The library
 itself serves the cap through the `_upto` reads and
 `Subscription::next_async_upto`.
 
+#### Durable cursors
+
+A subscription may run on a **cursor**: a name under which the daemon
+keeps the subscription's position, so a consumer resumes after a crash
+or a failover where it last acknowledged, without a checkpoint file of
+its own. `Subscribe` with `cursor` (gateway `/tail?cursor=NAME`,
+`chron tail --cursor NAME`, `Client::subscribe_cursor`) starts at the
+cursor's stored position (at `from` for a new cursor, at the floor when
+below it), delivers **confirmed** events only, so an acknowledged
+position can never be cut back, and takes the cursor over: the newest
+subscription owns it under a new session, an older stream ends with
+UNAVAILABLE "taken over" and its acknowledgments are refused
+(FAILED_PRECONDITION "taken over by session N"). The stream's metadata
+carries `chron-session` and `chron-cursor-from`. `Ack(cursor, next,
+session)` (`POST /v1/db/{db}/cursors/{name}/ack`, `Cursor::ack`) moves
+the position to `next`, the one after the last event processed: below
+the stored position it is a no-op, past the confirmed bound
+INVALID_ARGUMENT. Delivery is at least once: whatever was processed but
+not acknowledged comes again. Cursors are kept on the leader and
+replicate with the chunks (every cursor on the opening chunk, the
+changes after), so the next leader resumes them; they live in the index
+and survive a rebuild, are clamped by a truncation, and a restore from a
+backup starts without them (a group member refreshed from the leader
+receives them again). `ListCursors` (`GET /v1/db/{db}/cursors`, `chron
+cursors`) shows each cursor's position, session and lag;
+`DeleteCursor` (admin) ends its stream. Metrics: `chron_cursors{db}`,
+`chron_cursor_lag_events{db,cursor}`, `chron_cursor_acks_total{db,
+result}`. The bank example's `balances --follow` runs on the cursor
+`balances` against a daemon.
+
 With `--sync-commit off` (or `sync=false`) a leader acknowledges a write
 once it is on its own disk, so writes acknowledged by a dead leader
 after the last transaction its successor had pulled are **lost**: the

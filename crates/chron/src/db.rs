@@ -130,6 +130,17 @@ pub struct Db {
     pub(crate) inner: Arc<Inner>,
 }
 
+/// A durable cursor as [`Db::set_cursor`] stores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorState {
+    /// The cursor's name.
+    pub name: String,
+    /// The position after the last event the consumer processed.
+    pub next: u64,
+    /// The session that owns it; a new subscription takes the next one.
+    pub session: u64,
+}
+
 impl Db {
     /// Opens the database at `path`, creating it if there is none, and
     /// recovers it: anything in the segment files past the committed head
@@ -301,6 +312,13 @@ impl Db {
     #[doc(hidden)]
     pub fn debug_forget_id(&self) -> Result<()> {
         self.inner.index.forget_db_id()
+    }
+
+    /// Removes the cursor table: the state of an index written before
+    /// cursors existed. For tests of the upgrade path.
+    #[doc(hidden)]
+    pub fn debug_drop_cursor_table(&self) -> Result<()> {
+        self.inner.index.drop_cursor_table()
     }
 
     /// Head, floor, and what the segment directory holds.
@@ -908,6 +926,55 @@ impl Db {
     /// if one did and retention or truncation has not dropped it.
     pub fn lookup_commit(&self, id: [u8; 16]) -> Result<Option<(u64, u64)>> {
         self.inner.index.lookup_commit(&id)
+    }
+
+    /// The cursor named `name`, if one was stored (see
+    /// [`set_cursor`](Db::set_cursor)).
+    pub fn cursor(&self, name: &str) -> Result<Option<CursorState>> {
+        Ok(self
+            .inner
+            .index
+            .cursor(name)?
+            .map(|(next, session)| CursorState {
+                name: name.to_string(),
+                next,
+                session,
+            }))
+    }
+
+    /// Stores a durable cursor: a consumer's position (`next`, the one
+    /// after the last event it processed) and the session that owns it.
+    /// Cursors live in the index: a daemon keeps and replicates them so a
+    /// consumer resumes after a crash or a failover. The write is made
+    /// durable by the next durable index commit or the close, which is
+    /// enough since a lost cursor update means a redelivery, never a loss.
+    /// Truncation clamps a cursor to the cut; retention leaves it (a
+    /// consumer below the floor restarts at the floor); a rebuilt index
+    /// keeps cursors, a restored backup starts without any.
+    pub fn set_cursor(&self, name: &str, next: u64, session: u64) -> Result<()> {
+        self.inner
+            .index
+            .set_cursors(&[(name.to_string(), next, session)])
+    }
+
+    /// Removes a cursor; whether it existed.
+    pub fn remove_cursor(&self, name: &str) -> Result<bool> {
+        self.inner.index.remove_cursor(name)
+    }
+
+    /// Every cursor, by name.
+    pub fn cursors(&self) -> Result<Vec<CursorState>> {
+        Ok(self
+            .inner
+            .index
+            .cursors()?
+            .into_iter()
+            .map(|(name, next, session)| CursorState {
+                name,
+                next,
+                session,
+            })
+            .collect())
     }
 
     /// Rebuilds `index.redb` from the segment files alone, for a database
