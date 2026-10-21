@@ -1195,7 +1195,19 @@ async fn a_tombstone_survives_the_leaders_death() {
     // (a tombstone names the identity, not the name).
     let mut t = chron_client::Transaction::new();
     t.append_free(vec![NewEvent::new("x".to_string())]);
-    client.database("tmp").commit(t).await.unwrap();
+    // Landed locally: the mirrors are not attached yet, so a sync
+    // commit would wait for them first.
+    client
+        .database("tmp")
+        .commit_with(
+            t,
+            chron_client::CommitOptions {
+                sync: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     c.wait("the mirrors of tmp", SOON, || {
         (0..3).all(|i| {
             c.node(i)

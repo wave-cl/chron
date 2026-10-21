@@ -747,13 +747,13 @@ async fn check_acks(shared: &Shared, leader: &Client) -> Result<u64, ClientError
         .unwrap_or_else(|p| p.into_inner())
         .clone();
     let floor = leader.info().await?.floor;
-    let head = leader.head().await?;
+    let head = local_head(leader).await?;
     let mut lost = 0;
     let mut i = acks.partition_point(|(p, _, _)| *p < floor);
     let mut missing: Vec<(u64, u64, Instant)> = Vec::new();
     let mut from = floor;
     while from < head {
-        let page = leader.read_all(from, 4096).await?;
+        let page = leader.read_all_with(from, 4096, local()).await?;
         if page.is_empty() {
             break;
         }
@@ -800,6 +800,22 @@ async fn check_acks(shared: &Shared, leader: &Client) -> Result<u64, ClientError
     Ok(lost)
 }
 
+/// What a node holds, whatever a majority confirmed: the end-of-run
+/// checks compare acknowledgments and sightings with the log itself (a
+/// freshly elected leader's confirmed bound lags its head until its
+/// followers re-attach, which would report its own log as missing).
+fn local() -> chron_client::ReadOptions {
+    chron_client::ReadOptions {
+        consistency: Some(chron_client::Consistency::Local),
+        ..Default::default()
+    }
+}
+
+/// A node's own head.
+async fn local_head(c: &Client) -> Result<u64, ClientError> {
+    Ok(c.head_with(local()).await?.local)
+}
+
 /// Every position a subscriber saw, at or above the floor, must be in
 /// the final log with the same payload: a subscriber sees only confirmed
 /// events (the daemon's default under sync commits), and a confirmed
@@ -815,12 +831,12 @@ async fn check_seen(shared: &Shared, leader: &Client) -> Result<u64, ClientError
     seen.sort_unstable();
     seen.dedup();
     let floor = leader.info().await?.floor;
-    let head = leader.head().await?;
+    let head = local_head(leader).await?;
     let mut rewritten = 0;
     let mut i = seen.partition_point(|(p, _)| *p < floor);
     let mut from = floor;
     while from < head && i < seen.len() {
-        let page = leader.read_all(from, 4096).await?;
+        let page = leader.read_all_with(from, 4096, local()).await?;
         if page.is_empty() {
             break;
         }
@@ -1080,13 +1096,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<Report> {
         0
     };
     let rewritten_at_end = check_seen(&shared, &leader).await?;
-    let final_head = leader.head().await?;
+    let final_head = local_head(&leader).await?;
     let mut replica_head = None;
     if let Some(addr) = &cfg.replica {
         let replica = connect(&cfg, addr).await?;
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let h = replica.head().await?;
+            let h = local_head(&replica).await?;
             if h >= final_head {
                 replica_head = Some(h);
                 break;
