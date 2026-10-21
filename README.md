@@ -131,7 +131,10 @@ Tags are stored sorted and deduplicated.
   watch a stop flag; `position()` is the checkpoint to resume from. A
   subscription keeps the database open. Starting below the retention
   floor, `subscribe` yields one `Error::BelowFloor` and ends;
-  `subscribe_tag` starts at the floor.
+  `subscribe_tag` starts at the floor. `next_async_upto(cap)` and the
+  `read_*_upto` reads serve only positions below a cap chosen by the
+  caller (the daemon's confirmed bound), applied inside the index
+  snapshot.
 
 ## Limits
 
@@ -661,6 +664,41 @@ so upgrade followers first and the leader last, or run the leader with
 replicates without reports. Manual `--replicate-from` replicas are
 unchanged.
 
+#### Confirmed reads
+
+A read, head or subscription has a **consistency**: `local`, everything
+the node holds, or `confirmed`, only positions a majority of the group
+durably holds, which a leader's death cannot erase. On a node with
+peers the default is confirmed whenever sync commits are in effect
+(`--read-consistency local|confirmed` overrides it; `chron info` shows
+`read_consistency`); without peers, or with `--sync-commit off`, the
+default is local, and asking for confirmed on a node without peers is
+the same as local (a lone node is its own majority). A leader's
+confirmed bound is its majority-applied position; a follower learns the
+leader's with every replication chunk and, when nothing flows, with
+every heartbeat, so a quiet group converges within a third of the
+lease; a node keeps the bound it learned as a follower through its own
+promotion. The bound only rises, and a read is served below
+`min(confirmed, head)`: a reader never sees a position and then loses
+it, which is what a subscriber on a leader could see before 0.6.0. A
+request may also ask to read **at least** a position: the call waits
+until the bound reaches it, at most `wait_timeout` (the daemon's
+`--sync-timeout` by default; zero fails at once), then answers
+`DEADLINE_EXCEEDED` with the bound in `chron-position` and the head in
+`chron-head` (504 on the gateway, `position` in the body). A commit's
+`next` is the token for reading one's own write anywhere in the group,
+including a replica that has not applied it yet. On the wire the
+requests carry `consistency`, `at_least` and `wait_timeout_ms`;
+`HeadResponse` carries `head` (the bound asked for), `confirmed` and
+`local`; the gateway takes `?consistency=`, `?at_least=` and
+`?wait_ms=` on the read, head and tail routes; the client has
+`ClientConfig::consistency`, `ReadOptions` on the `_with` reads,
+`head_with` and `subscribe_with`; the CLI has `--local` /
+`--confirmed` everywhere and `--at-least P [--wait SECS]` on the reads
+and `head`. A 0.5.0 client reads at the daemon's default. The library
+itself serves the cap through the `_upto` reads and
+`Subscription::next_async_upto`.
+
 With `--sync-commit off` (or `sync=false`) a leader acknowledges a write
 once it is on its own disk, so writes acknowledged by a dead leader
 after the last transaction its successor had pulled are **lost**: the
@@ -706,7 +744,9 @@ may have landed, so it is sent again only when every append names an
 aggregate with an exact or `new` expectation (a second landing is then
 a conflict, possibly reporting the caller's own write), and otherwise
 returned to the caller; the search goes on for `failover_timeout`
-(30 s), long enough for an election. Reads are not redirected. The CLI
+(30 s), long enough for an election. Reads are not redirected, and any
+node serves them (confirmed by default, see above; `at_least` with a
+commit's `next` reads your own write on a replica). The CLI
 takes the same list in `--addr` (one scheme for all), and `chron
 discover` asks every listed node and prints a line each. `chron info` and `chron status` show the leader, the lease
 left, the peers and the last vote; `status` is degraded on a candidate

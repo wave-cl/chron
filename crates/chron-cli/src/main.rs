@@ -42,7 +42,7 @@ enum Commands {
     /// How many events an aggregate has.
     Len { aggregate: String },
     /// The next global position.
-    Head,
+    Head(cmd::admin::HeadArgs),
     /// Path, head, floor, segments and options of the served database.
     Info,
     /// Who leads, as the daemon at --addr knows it (any node of a group).
@@ -170,7 +170,7 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Tag(a) => cmd::read::tag(conn, format, a).await,
         Commands::Tail(a) => cmd::read::tail(conn, format, a).await,
         Commands::Len { aggregate } => cmd::admin::len(conn, format, &aggregate).await,
-        Commands::Head => cmd::admin::head(conn, format).await,
+        Commands::Head(a) => cmd::admin::head(conn, format, a).await,
         Commands::Info => cmd::admin::info(conn, format).await,
         Commands::Discover => cmd::admin::discover(conn, format).await,
         Commands::Status(a) => cmd::admin::status(conn, format, a).await,

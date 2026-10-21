@@ -28,8 +28,9 @@ use tower::ServiceExt;
 
 use crate::auth::BearerAuth;
 use crate::http_json::{
-    ApiError, TxnJson, appends_from_json, commit_id_from_json, committed_json, database_json,
-    error_json, event_json, info_json, members_json, retained_json, role_name,
+    ApiError, TxnJson, appends_from_json, commit_id_from_json, committed_json,
+    consistency_from_query, database_json, error_json, event_json, info_json, members_json,
+    retained_json, role_name,
 };
 use crate::metrics::Metrics;
 use crate::node::{DbNode, Node};
@@ -200,7 +201,7 @@ fn bad(e: impl std::fmt::Display) -> ApiError {
     ApiError(Status::invalid_argument(e.to_string()))
 }
 
-/// `?from&limit&backward` of a finite read.
+/// `?from&limit&backward` of a finite read, and its consistency.
 #[derive(Deserialize, Default)]
 struct ReadQuery {
     from: Option<u64>,
@@ -208,9 +209,16 @@ struct ReadQuery {
     backward: Option<bool>,
     /// A binary tag, base64; the path's tag is then `-`.
     tag_base64: Option<String>,
+    /// `local` or `confirmed`; absent for the daemon's default.
+    consistency: Option<String>,
+    /// Wait until the bound reaches this position (a commit's `next`).
+    at_least: Option<u64>,
+    /// How long `at_least` may wait; absent for the daemon's sync
+    /// timeout, 0 for none.
+    wait_ms: Option<u64>,
 }
 
-async fn page(dbn: &DbNode, read: Read, q: ReadQuery) -> Result<Json<Value>> {
+async fn page(st: &HttpState, dbn: &DbNode, read: Read, q: ReadQuery) -> Result<Json<Value>> {
     let backward = q.backward.unwrap_or(false);
     let from = q.from.unwrap_or(if backward { u64::MAX } else { 0 });
     // 0 means "as many as a page holds", as the gRPC calls' 0 means all.
@@ -219,8 +227,12 @@ async fn page(dbn: &DbNode, read: Read, q: ReadQuery) -> Result<Json<Value>> {
         Some(0) => MAX_LIMIT,
         Some(n) => n.min(MAX_LIMIT),
     } as usize;
+    let mode = st
+        .node
+        .read_mode(consistency_from_query(q.consistency.as_deref()).map_err(ApiError)?);
+    ops::wait_requested(&st.node, dbn, mode, q.at_least, q.wait_ms).await?;
     let read = Arc::new(read);
-    let events = ops::read_page(dbn, read.clone(), from, limit).await?;
+    let events = ops::read_page(dbn, read.clone(), from, limit, ops::cap(dbn, mode)).await?;
     let next = events.last().and_then(|l| read.next_cursor(l));
     Ok(Json(json!({
         "events": events.iter().map(event_json).collect::<Vec<_>>(),
@@ -270,7 +282,7 @@ async fn read_all(
     let dbn = db(&st, &name)?;
     let Query(q) = q.map_err(bad)?;
     let backward = q.backward.unwrap_or(false);
-    page(&dbn, Read::All { backward }, q).await
+    page(&st, &dbn, Read::All { backward }, q).await
 }
 
 async fn read_aggregate(
@@ -282,7 +294,7 @@ async fn read_aggregate(
     let id = uuid(&id)?;
     let Query(q) = q.map_err(bad)?;
     let backward = q.backward.unwrap_or(false);
-    page(&dbn, Read::Aggregate { id, backward }, q).await
+    page(&st, &dbn, Read::Aggregate { id, backward }, q).await
 }
 
 async fn read_tag(
@@ -297,7 +309,7 @@ async fn read_tag(
         Some(b) => Bytes::from(crate::http_json::decode_base64(b, "tag_base64").map_err(ApiError)?),
         None => Bytes::from(tag),
     };
-    page(&dbn, Read::Tag { tag, backward }, q).await
+    page(&st, &dbn, Read::Tag { tag, backward }, q).await
 }
 
 async fn aggregate_len(
@@ -310,9 +322,29 @@ async fn aggregate_len(
     Ok(Json(json!({ "len": len })))
 }
 
-async fn head(State(st): State<HttpState>, Path(name): Path<String>) -> Result<Json<Value>> {
+/// `?consistency&at_least&wait_ms` of `/head`.
+#[derive(Deserialize, Default)]
+struct HeadQuery {
+    consistency: Option<String>,
+    at_least: Option<u64>,
+    wait_ms: Option<u64>,
+}
+
+async fn head(
+    State(st): State<HttpState>,
+    Path(name): Path<String>,
+    q: std::result::Result<Query<HeadQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<Value>> {
     let dbn = db(&st, &name)?;
-    Ok(Json(json!({ "head": dbn.db.head() })))
+    let Query(q) = q.map_err(bad)?;
+    let mode = st
+        .node
+        .read_mode(consistency_from_query(q.consistency.as_deref()).map_err(ApiError)?);
+    ops::wait_requested(&st.node, &dbn, mode, q.at_least, q.wait_ms).await?;
+    let h = crate::codec::head(&st.node, &dbn, mode);
+    Ok(Json(
+        json!({ "head": h.head, "confirmed": h.confirmed, "local": h.local }),
+    ))
 }
 
 async fn info(State(st): State<HttpState>, Path(name): Path<String>) -> Result<Json<Value>> {
@@ -325,6 +357,8 @@ struct TailQuery {
     from: Option<u64>,
     tag: Option<String>,
     tag_base64: Option<String>,
+    /// `local` or `confirmed`; absent for the daemon's default.
+    consistency: Option<String>,
 }
 
 async fn tail(
@@ -338,7 +372,10 @@ async fn tail(
         (Some(b), _) => Some(crate::http_json::decode_base64(b, "tag_base64").map_err(ApiError)?),
         (None, t) => t.map(String::into_bytes),
     };
-    let rx = ops::subscribe(st.node.clone(), dbn, q.from.unwrap_or(0), tag);
+    let mode = st
+        .node
+        .read_mode(consistency_from_query(q.consistency.as_deref()).map_err(ApiError)?);
+    let rx = ops::subscribe(st.node.clone(), dbn, q.from.unwrap_or(0), tag, mode);
     let stream = rx.map(|item| {
         Ok(match item {
             Ok(ev) => SseEvent::default().data(event_json(&ev).to_string()),

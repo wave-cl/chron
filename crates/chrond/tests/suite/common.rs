@@ -156,6 +156,7 @@ pub async fn read_all_payloads(client: &mut ChronClient<Channel>) -> Vec<String>
                 from: 0,
                 limit: 0,
                 backward: false,
+                ..Default::default()
             })
             .await
             .unwrap()

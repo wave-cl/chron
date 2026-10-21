@@ -66,6 +66,10 @@ struct Cli {
     /// Return once a commit is on the leader's disk.
     #[arg(long = "async")]
     r#async: bool,
+    /// Read and subscribe under the local consistency (everything the
+    /// node holds), not the daemon's default.
+    #[arg(long)]
+    local: bool,
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -160,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
             _ => None,
         },
         in_flight: cli.in_flight.max(1),
+        local: cli.local,
     })
     .await?;
     if cli.json {

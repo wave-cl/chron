@@ -61,6 +61,9 @@ pub struct Config {
     /// Wait for a majority (`Some(true)`), do not (`Some(false)`), or
     /// take the daemon's default (`None`).
     pub sync: Option<bool>,
+    /// Read and subscribe under the local consistency (everything the
+    /// node holds) instead of the daemon's default.
+    pub local: bool,
     /// Commits each writer keeps in flight at once, on distinct
     /// aggregates (at least 1, at most `aggregates`). `writers *
     /// in_flight` should stay under the daemon's concurrency per
@@ -333,6 +336,11 @@ fn client_config(cfg: &Config) -> ClientConfig {
         connect_timeout: Duration::from_secs(2),
         request_timeout: Some(Duration::from_secs(30)),
         sync_commit: cfg.sync,
+        consistency: if cfg.local {
+            chron_client::Consistency::Local
+        } else {
+            chron_client::Consistency::Default
+        },
         ..ClientConfig::default()
     }
 }

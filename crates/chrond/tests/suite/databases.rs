@@ -28,7 +28,11 @@ async fn commit_in(c: &mut DbClient, payload: &str) -> u64 {
 }
 
 async fn head_in(c: &mut DbClient) -> u64 {
-    c.head(pb::HeadRequest {}).await.unwrap().into_inner().head
+    c.head(pb::HeadRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .head
 }
 
 async fn create(s: &mut Server, name: &str) -> pb::DatabaseInfo {
@@ -78,7 +82,7 @@ async fn unknown_and_bad_names_are_refused() {
     let mut s = Server::start().await;
     let addr = s.running.as_ref().unwrap().local_addr;
     let mut orders = with_db(plain_channel(addr).await, "orders");
-    let err = orders.head(pb::HeadRequest {}).await.unwrap_err();
+    let err = orders.head(pb::HeadRequest::default()).await.unwrap_err();
     assert_eq!(err.code(), Code::NotFound);
     assert!(
         err.message().contains("chron db create orders"),
@@ -87,7 +91,7 @@ async fn unknown_and_bad_names_are_refused() {
     );
     for bad in ["Orders", "a/b", "..", "", "déf", &"a".repeat(65), "a b"] {
         let mut c = with_db(plain_channel(addr).await, bad);
-        let err = c.head(pb::HeadRequest {}).await.unwrap_err();
+        let err = c.head(pb::HeadRequest::default()).await.unwrap_err();
         assert_eq!(
             err.code(),
             Code::InvalidArgument,
@@ -142,7 +146,11 @@ async fn create_list_drop_over_rpc() {
     );
     assert_eq!(names(&mut s).await, ["default"]);
     assert_eq!(
-        orders.head(pb::HeadRequest {}).await.unwrap_err().code(),
+        orders
+            .head(pb::HeadRequest::default())
+            .await
+            .unwrap_err()
+            .code(),
         Code::NotFound
     );
     let err = s
@@ -189,6 +197,7 @@ async fn databases_are_isolated_and_dropping_ends_only_its_streams() {
                 from: 0,
                 limit: 0,
                 backward: false,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -199,13 +208,21 @@ async fn databases_are_isolated_and_dropping_ends_only_its_streams() {
     assert_eq!(payloads(&got), ["o0", "o1"]);
 
     let mut on_orders = orders
-        .subscribe(pb::SubscribeRequest { from: 2, tag: None })
+        .subscribe(pb::SubscribeRequest {
+            from: 2,
+            tag: None,
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner();
     let mut on_default = s
         .client
-        .subscribe(pb::SubscribeRequest { from: 3, tag: None })
+        .subscribe(pb::SubscribeRequest {
+            from: 3,
+            tag: None,
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner();
@@ -368,8 +385,13 @@ async fn promotion_raises_every_database() {
         let mut d = replica.client.clone();
         let mut o = rorders.clone();
         async move {
-            d.head(pb::HeadRequest {}).await.unwrap().into_inner().head == 1
-                && o.head(pb::HeadRequest {})
+            d.head(pb::HeadRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .head
+                == 1
+                && o.head(pb::HeadRequest::default())
                     .await
                     .map(|h| h.into_inner().head)
                     .ok()
@@ -464,8 +486,13 @@ async fn a_replica_mirrors_every_database_and_discovers_new_ones() {
         let mut d = replica.client.clone();
         let mut o = rorders.clone();
         async move {
-            d.head(pb::HeadRequest {}).await.unwrap().into_inner().head == 2
-                && o.head(pb::HeadRequest {})
+            d.head(pb::HeadRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .head
+                == 2
+                && o.head(pb::HeadRequest::default())
                     .await
                     .map(|h| h.into_inner().head)
                     .ok()
@@ -484,7 +511,7 @@ async fn a_replica_mirrors_every_database_and_discovers_new_ones() {
     wait_until("billing to appear and catch up on the replica", || {
         let mut b = rbilling.clone();
         async move {
-            b.head(pb::HeadRequest {})
+            b.head(pb::HeadRequest::default())
                 .await
                 .map(|h| h.into_inner().head)
                 .ok()
@@ -500,6 +527,7 @@ async fn a_replica_mirrors_every_database_and_discovers_new_ones() {
                 from: 0,
                 limit: 0,
                 backward: false,
+                ..Default::default()
             })
             .await
             .unwrap()

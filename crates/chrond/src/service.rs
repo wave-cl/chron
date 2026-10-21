@@ -169,6 +169,7 @@ fn spawn_chunk_stream(
                 head: db.head(),
                 epoch: db.epoch(),
                 epoch_base: dbn.epoch_base.load(std::sync::atomic::Ordering::Acquire),
+                confirmed: dbn.sync.majority(),
             };
             if tx.send(Ok(item)).await.is_err() {
                 return;
@@ -223,6 +224,7 @@ fn spawn_chunk_stream(
                         head: db.head(),
                         epoch: db.epoch(),
                         epoch_base: dbn.epoch_base.load(std::sync::atomic::Ordering::Acquire),
+                        confirmed: dbn.sync.majority(),
                     };
                     cursor = c.to;
                     if tx.send(Ok(item)).await.is_err() {
@@ -267,7 +269,14 @@ fn spawn_chunk_stream(
 /// blocking pool, one page at a time, and feeds a bounded channel. A slow
 /// or departed client stalls or ends only its own task, and holds no
 /// blocking thread while it waits.
-fn finite(db: Db, read: Read, from: u64, limit: u64, cancel: CancellationToken) -> EventStream {
+fn finite(
+    db: Db,
+    read: Read,
+    from: u64,
+    limit: u64,
+    upto: u64,
+    cancel: CancellationToken,
+) -> EventStream {
     let (tx, rx) = mpsc::channel(PAGE);
     tokio::spawn(async move {
         let read = Arc::new(read);
@@ -286,7 +295,7 @@ fn finite(db: Db, read: Read, from: u64, limit: u64, cancel: CancellationToken) 
                     return;
                 }
                 _ = tx.closed() => return,
-                p = tokio::task::spawn_blocking(move || read2.page(&db2, cursor, n)) => p,
+                p = tokio::task::spawn_blocking(move || read2.page(&db2, cursor, n, upto)) => p,
             };
             let page = match page {
                 Ok(Ok(p)) => p,
@@ -341,6 +350,8 @@ impl Chron for ChronService {
         let dbn = self.db(&req)?;
         let r = req.into_inner();
         let id = codec::aggregate(&r.aggregate)?;
+        let mode = self.node.read_mode(r.consistency());
+        ops::wait_requested(&self.node, &dbn, mode, r.at_least, r.wait_timeout_ms).await?;
         let read = Read::Aggregate {
             id,
             backward: r.backward,
@@ -350,6 +361,7 @@ impl Chron for ChronService {
             read,
             r.from_index,
             r.limit,
+            ops::cap(&dbn, mode),
             dbn.cancel.clone(),
         )))
     }
@@ -362,11 +374,18 @@ impl Chron for ChronService {
     ) -> Result<Response<Self::ReadAllStream>, Status> {
         let dbn = self.db(&req)?;
         let r = req.into_inner();
+        let mode = self.node.read_mode(r.consistency());
+        ops::wait_requested(&self.node, &dbn, mode, r.at_least, r.wait_timeout_ms).await?;
+        let upto = ops::cap(&dbn, mode);
         if !r.backward {
             // A bad starting position is the call's status, not the
             // stream's first item.
             let from = r.from;
-            blocking(&dbn.db, "read_all", move |db| db.read_all(from, 1)).await?;
+            blocking(&dbn.db, "read_all", move |db| {
+                let max_bytes = db.options().page_max_bytes;
+                db.read_all_bounded_upto(from, 1, max_bytes, upto)
+            })
+            .await?;
         }
         let read = Read::All {
             backward: r.backward,
@@ -376,6 +395,7 @@ impl Chron for ChronService {
             read,
             r.from,
             r.limit,
+            upto,
             dbn.cancel.clone(),
         )))
     }
@@ -388,6 +408,8 @@ impl Chron for ChronService {
     ) -> Result<Response<Self::ReadTagStream>, Status> {
         let dbn = self.db(&req)?;
         let r = req.into_inner();
+        let mode = self.node.read_mode(r.consistency());
+        ops::wait_requested(&self.node, &dbn, mode, r.at_least, r.wait_timeout_ms).await?;
         let read = Read::Tag {
             tag: Bytes::from(r.tag),
             backward: r.backward,
@@ -397,6 +419,7 @@ impl Chron for ChronService {
             read,
             r.from,
             r.limit,
+            ops::cap(&dbn, mode),
             dbn.cancel.clone(),
         )))
     }
@@ -416,9 +439,10 @@ impl Chron for ChronService {
         req: Request<pb::HeadRequest>,
     ) -> Result<Response<pb::HeadResponse>, Status> {
         let dbn = self.db(&req)?;
-        Ok(Response::new(pb::HeadResponse {
-            head: dbn.db.head(),
-        }))
+        let r = req.into_inner();
+        let mode = self.node.read_mode(r.consistency());
+        ops::wait_requested(&self.node, &dbn, mode, r.at_least, r.wait_timeout_ms).await?;
+        Ok(Response::new(codec::head(&self.node, &dbn, mode)))
     }
 
     type SubscribeStream = EventStream;
@@ -429,7 +453,8 @@ impl Chron for ChronService {
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let dbn = self.db(&req)?;
         let r = req.into_inner();
-        let rx = ops::subscribe(self.node.clone(), dbn, r.from, r.tag);
+        let mode = self.node.read_mode(r.consistency());
+        let rx = ops::subscribe(self.node.clone(), dbn, r.from, r.tag, mode);
         Ok(Response::new(Box::pin(
             rx.map(|item| item.map(codec::event_to_wire)),
         )))

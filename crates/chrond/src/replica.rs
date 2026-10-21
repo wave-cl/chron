@@ -905,6 +905,7 @@ async fn tail(
                     c.chunk.to = n.chunk.to;
                     c.chunk.frames.extend_from_slice(&n.chunk.frames);
                     c.head = c.head.max(n.head);
+                    c.confirmed = c.confirmed.max(n.confirmed);
                     merged += 1;
                 }
                 other => {
@@ -941,6 +942,9 @@ async fn tail(
                 .map_err(|_| "the leader stopped reading acknowledgments".to_string())?;
         }
         last_round_end = std::time::Instant::now();
+        // What the leader said a majority held when it cut the chunk; it
+        // may exceed this copy's head until the next chunk, readers clamp.
+        dbn.raise_confirmed(c.confirmed);
         // Timing of the replication path (see docs/operations.md, "Where
         // a sync commit's time goes"): how long this follower waited for
         // the chunk, applied it (segment write, fsync, index commit) and

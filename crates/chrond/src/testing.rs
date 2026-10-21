@@ -139,6 +139,15 @@ pub fn free_port() -> u16 {
         .port()
 }
 
+/// Read options for what a node holds, whatever a majority confirmed:
+/// the tests of replication and recovery look at local copies.
+pub fn local_read() -> chron_client::ReadOptions {
+    chron_client::ReadOptions {
+        consistency: Some(chron_client::Consistency::Local),
+        ..Default::default()
+    }
+}
+
 impl Cluster {
     pub async fn start(n: usize, ttl: Duration) -> Cluster {
         Self::start_with(n, ttl, |_| {}).await

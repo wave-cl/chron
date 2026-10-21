@@ -38,10 +38,10 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
 
-pub use crate::node::SyncCommit;
 use crate::node::{
     ClusterConfig, DbNode, FENCED_MARKER, Node, PROMOTED_MARKER, REPLICA_MARKER, Role, Upstream,
 };
+pub use crate::node::{ReadConsistency, SyncCommit};
 
 /// The health service name that is SERVING only while this node is the
 /// leader (`chron.v1.Chron` itself is SERVING in every role).
@@ -135,6 +135,11 @@ pub struct Options {
     /// majority that cannot apply within a lease cannot keep the lease
     /// either, so longer waits only wait for the step-down.
     pub sync_timeout: Option<Duration>,
+    /// What reads, head and subscriptions see when the request does not
+    /// say: `None` (the default) is confirmed (only positions a majority
+    /// of the group durably holds) when sync commits are in effect,
+    /// local (this node's head) otherwise; set to force one.
+    pub read_consistency: Option<ReadConsistency>,
     /// Peers this node neither calls nor answers from the start (a
     /// simulated partition for tests).
     #[cfg(feature = "test-util")]
@@ -192,6 +197,7 @@ impl Options {
             advertise: None,
             lease_ttl: Duration::from_secs(10),
             sync_commit: SyncCommit::Majority,
+            read_consistency: None,
             sync_timeout: None,
             #[cfg(feature = "test-util")]
             partition: Vec::new(),
@@ -354,6 +360,7 @@ pub async fn start(opts: Options) -> anyhow::Result<Running> {
         cluster,
         opts.max_message_bytes,
         db_opts,
+        opts.read_consistency,
         opts.discover_interval,
         metrics.clone(),
         cancel.clone(),

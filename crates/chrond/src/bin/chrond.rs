@@ -153,6 +153,14 @@ struct Cli {
     /// "unconfirmed" (default: the lease ttl).
     #[arg(long, env = "CHROND_SYNC_TIMEOUT")]
     sync_timeout: Option<f64>,
+    /// What reads, head and subscriptions see when the request does not
+    /// say: only positions a majority of the group durably holds
+    /// (confirmed) or everything this node holds (local). Default:
+    /// confirmed with --sync-commit majority, local otherwise. Per
+    /// request: ReadAllRequest.consistency, ?consistency=, chron --local
+    /// / --confirmed.
+    #[arg(long, env = "CHROND_READ_CONSISTENCY", value_enum)]
+    read_consistency: Option<ConsistencyArg>,
     /// Log lines as human text or one JSON object per line.
     #[arg(long, env = "CHROND_LOG_FORMAT", value_enum, default_value_t = chrond::logging::LogFormat::Text)]
     log_format: chrond::logging::LogFormat,
@@ -162,6 +170,12 @@ struct Cli {
 enum SyncArg {
     Off,
     Majority,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ConsistencyArg {
+    Local,
+    Confirmed,
 }
 
 fn read(path: &PathBuf, what: &str) -> anyhow::Result<Vec<u8>> {
@@ -241,6 +255,10 @@ async fn main() -> anyhow::Result<()> {
     opts.sync_timeout = cli
         .sync_timeout
         .map(|s| std::time::Duration::from_secs_f64(s.max(0.0)));
+    opts.read_consistency = cli.read_consistency.map(|c| match c {
+        ConsistencyArg::Local => chrond::ReadConsistency::Local,
+        ConsistencyArg::Confirmed => chrond::ReadConsistency::Confirmed,
+    });
     opts.max_message_bytes = cli.max_message_bytes;
     opts.group_commit_max_txns = cli.group_commit_max_txns.map(|n| n as usize);
     opts.group_commit_max_bytes = cli.group_commit_max_bytes.map(|n| n as usize);

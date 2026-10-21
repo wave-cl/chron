@@ -205,6 +205,14 @@ pub async fn heartbeat_round(node: &Arc<Node>, cfg: &ClusterConfig) {
         head: node.default_db().db.head(),
         lease_ttl_ms: ms(cfg.lease_ttl),
         members: Some(st.current.to_wire()),
+        confirmed: node
+            .databases()
+            .iter()
+            .map(|d| pb::DatabaseHead {
+                name: d.name.clone(),
+                head: d.sync.majority(),
+            })
+            .collect(),
     };
     let targets = node.fanout();
     let answers = futures_join(targets.iter().map(|peer| {
@@ -698,6 +706,13 @@ pub async fn handle_heartbeat(
             follow(node, &req.leader_addr).await?;
         }
     }
+    // An accepted heartbeat carries the leader's confirmed bounds: a
+    // quiet group converges without a chunk.
+    for d in &req.confirmed {
+        if let Some(dbn) = node.get(&d.name) {
+            dbn.raise_confirmed(d.head);
+        }
+    }
     Ok(answer(true, node))
 }
 
@@ -954,6 +969,7 @@ async fn count_holding(node: &Arc<Node>, cfg: &ClusterConfig, m: &Members) -> us
         head: node.default_db().db.head(),
         lease_ttl_ms: ms(cfg.lease_ttl),
         members: Some(m.to_wire()),
+        confirmed: Vec::new(),
     };
     let targets = m.others(&cfg.advertise);
     let answers = futures_join(targets.iter().map(|peer| {

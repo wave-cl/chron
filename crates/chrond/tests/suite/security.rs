@@ -50,7 +50,7 @@ where
     <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
 {
     client
-        .head(pb::HeadRequest {})
+        .head(pb::HeadRequest::default())
         .await
         .map(|r| r.into_inner().head)
 }
@@ -132,7 +132,11 @@ async fn token_missing_or_wrong_is_unauthenticated() {
         Code::Unauthenticated
     );
     let stream = bare
-        .subscribe(pb::SubscribeRequest { from: 0, tag: None })
+        .subscribe(pb::SubscribeRequest {
+            from: 0,
+            tag: None,
+            ..Default::default()
+        })
         .await;
     assert_eq!(stream.unwrap_err().code(), Code::Unauthenticated);
     let mut right = with_token(channel.clone(), "s3cret");
@@ -225,7 +229,7 @@ async fn oversized_message_is_refused_and_nothing_written() {
     );
     assert_eq!(
         s.client
-            .head(pb::HeadRequest {})
+            .head(pb::HeadRequest::default())
             .await
             .unwrap()
             .into_inner()
@@ -235,7 +239,7 @@ async fn oversized_message_is_refused_and_nothing_written() {
     fill(&mut s.client, agg(1), 1).await;
     assert_eq!(
         s.client
-            .head(pb::HeadRequest {})
+            .head(pb::HeadRequest::default())
             .await
             .unwrap()
             .into_inner()
@@ -261,7 +265,11 @@ async fn request_timeout_does_not_cut_streams() {
     let mut s = Server::start_with(|o| o.request_timeout = Some(Duration::from_millis(200))).await;
     let mut stream = s
         .client
-        .subscribe(pb::SubscribeRequest { from: 0, tag: None })
+        .subscribe(pb::SubscribeRequest {
+            from: 0,
+            tag: None,
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner();

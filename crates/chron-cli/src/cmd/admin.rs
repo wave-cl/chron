@@ -13,10 +13,29 @@ pub async fn len(conn: &Conn, format: Format, aggregate: &str) -> anyhow::Result
     Ok(())
 }
 
-pub async fn head(conn: &Conn, format: Format) -> anyhow::Result<()> {
-    let head = client::connect(conn).await?.head().await?;
-    print_value(format, head.to_string(), json!({ "head": head }));
+pub async fn head(conn: &Conn, format: Format, a: HeadArgs) -> anyhow::Result<()> {
+    let h = client::connect(conn)
+        .await?
+        .head_with(crate::cmd::read::read_options(a.at_least, a.wait))
+        .await?;
+    // One number for scripts; the JSON form carries both bounds.
+    print_value(
+        format,
+        h.head.to_string(),
+        json!({ "head": h.head, "confirmed": h.confirmed, "local": h.local }),
+    );
     Ok(())
+}
+
+#[derive(clap::Args, Debug)]
+pub struct HeadArgs {
+    /// Wait until the bound reaches this position first (a commit's
+    /// `next`).
+    #[arg(long)]
+    pub at_least: Option<u64>,
+    /// Seconds --at-least may wait (default: the daemon's sync timeout).
+    #[arg(long, requires = "at_least")]
+    pub wait: Option<f64>,
 }
 
 pub async fn info(conn: &Conn, format: Format) -> anyhow::Result<()> {

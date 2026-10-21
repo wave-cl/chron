@@ -107,3 +107,24 @@ pub fn status(e: Error) -> Status {
 pub fn join(op: &str, e: tokio::task::JoinError) -> Status {
     Status::internal(format!("{op} task: {e}"))
 }
+
+/// The `Head` answer under `mode`: the bound asked for, and both bounds
+/// (without peers the confirmed bound is the head: a lone node is its
+/// own majority).
+pub fn head(
+    node: &crate::node::Node,
+    dbn: &crate::node::DbNode,
+    mode: crate::ops::Mode,
+) -> pb::HeadResponse {
+    use crate::ops::{Mode, bound, cap};
+    let local = dbn.db.head();
+    pb::HeadResponse {
+        head: bound(dbn, mode),
+        confirmed: if node.cluster.is_some() {
+            cap(dbn, Mode::Confirmed)
+        } else {
+            local
+        },
+        local,
+    }
+}

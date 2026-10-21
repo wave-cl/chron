@@ -94,7 +94,7 @@ impl Subscription {
     /// from an async task without blocking it on reads.
     pub fn catch_up(&mut self) -> Result<usize> {
         if self.buffer.is_empty() {
-            self.fill()?;
+            self.fill(u64::MAX)?;
         }
         Ok(self.buffer.len())
     }
@@ -126,13 +126,30 @@ impl Subscription {
     /// lower [`batch`](Subscription::batch) when records are very large.
     #[cfg(feature = "tokio")]
     pub async fn next_async(&mut self) -> Result<Event> {
+        match self.next_async_upto(u64::MAX).await? {
+            Some(ev) => Ok(ev),
+            // Unreachable: no position reaches u64::MAX.
+            None => std::future::pending().await,
+        }
+    }
+
+    /// [`next_async`](Subscription::next_async) over the positions below
+    /// `upto` only: `Ok(None)` once everything below `upto` was delivered
+    /// (the caller raises the cap and calls again; the head is never
+    /// awaited past it). A daemon serving only what a majority of its
+    /// group holds drives a subscription with the bound as the cap.
+    #[cfg(feature = "tokio")]
+    pub async fn next_async_upto(&mut self, upto: u64) -> Result<Option<Event>> {
         loop {
             if let Some(ev) = self.buffer.pop_front() {
-                return Ok(ev);
+                return Ok(Some(ev));
             }
-            self.fill()?;
+            self.fill(upto)?;
             if !self.buffer.is_empty() {
                 continue;
+            }
+            if self.cursor >= upto {
+                return Ok(None);
             }
             let min = self.cursor.saturating_add(1);
             // Err only if the sender is gone, which `self.db` prevents.
@@ -140,9 +157,9 @@ impl Subscription {
         }
     }
 
-    /// One catch-up step: reads the next batch into the buffer and moves
-    /// the cursor past what it covered.
-    fn fill(&mut self) -> Result<()> {
+    /// One catch-up step: reads the next batch below `upto` into the
+    /// buffer and moves the cursor past what it covered.
+    fn fill(&mut self, upto: u64) -> Result<()> {
         // The head is read before the index: the read snapshot then holds
         // every position below it, so a short batch proves there is nothing
         // more to deliver below `head`.
@@ -174,19 +191,28 @@ impl Subscription {
             });
         }
         self.head_seen = self.head_seen.max(head);
-        if self.cursor >= head {
+        // The cap bounds the page, never the cut-back check above: a cap
+        // below a head once seen is not a cut.
+        let bound = head.min(upto);
+        if self.cursor >= bound {
             return Ok(());
         }
         let max_bytes = self.db.inner.opts.page_max_bytes;
         let page = match &self.filter {
-            Filter::All => self.db.all_page(self.cursor, self.batch, max_bytes)?,
-            Filter::Tag(tag) => self.db.tag_page(tag, self.cursor, self.batch, max_bytes)?,
+            Filter::All => self
+                .db
+                .all_page(self.cursor, self.batch, max_bytes, bound)?,
+            Filter::Tag(tag) => self
+                .db
+                .tag_page(tag, self.cursor, self.batch, max_bytes, bound)?,
         };
         if let Some(last) = page.events.last() {
             self.cursor = last.position + 1;
         }
         if page.exhausted {
-            self.cursor = self.cursor.max(head);
+            // Up to the bound, not the head: what lies between is delivered
+            // once the cap rises.
+            self.cursor = self.cursor.max(bound);
         }
         self.buffer.extend(page.events);
         Ok(())
@@ -197,7 +223,7 @@ impl Subscription {
             if let Some(ev) = self.buffer.pop_front() {
                 return Ok(Some(ev));
             }
-            self.fill()?;
+            self.fill(u64::MAX)?;
             if !self.buffer.is_empty() {
                 continue;
             }

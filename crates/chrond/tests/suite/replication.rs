@@ -28,7 +28,14 @@ async fn replica_tails_existing_data_and_live_commits_including_a_long_transacti
     let replica_client = replica.client.clone();
     wait_until("the replica to reach 5", || {
         let mut c = replica_client.clone();
-        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == 5 }
+        async move {
+            c.head(pb::HeadRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .head
+                == 5
+        }
     })
     .await;
     commit_big(&leader.running.as_ref().unwrap().db, 2000).await;
@@ -37,7 +44,14 @@ async fn replica_tails_existing_data_and_live_commits_including_a_long_transacti
     let replica_client = replica.client.clone();
     wait_until("the replica to catch up", || {
         let mut c = replica_client.clone();
-        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == want }
+        async move {
+            c.head(pb::HeadRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .head
+                == want
+        }
     })
     .await;
     assert_eq!(
@@ -130,7 +144,14 @@ async fn promotion_bumps_the_epoch_fences_the_old_leader_and_the_old_leader_rejo
     let rc = replica.client.clone();
     wait_until("catch-up", || {
         let mut c = rc.clone();
-        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == want }
+        async move {
+            c.head(pb::HeadRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .head
+                == want
+        }
     })
     .await;
     assert_eq!(
@@ -206,7 +227,14 @@ async fn promotion_bumps_the_epoch_fences_the_old_leader_and_the_old_leader_rejo
     let rc = rejoined.client.clone();
     wait_until("the rejoined node to catch up", || {
         let mut c = rc.clone();
-        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == want }
+        async move {
+            c.head(pb::HeadRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .head
+                == want
+        }
     })
     .await;
     assert!(!rejoined.data_dir().join("fenced").exists());
@@ -331,7 +359,7 @@ async fn fencing_token_on_commit() {
     );
     assert_eq!(
         s.client
-            .head(pb::HeadRequest {})
+            .head(pb::HeadRequest::default())
             .await
             .unwrap()
             .into_inner()
@@ -356,7 +384,14 @@ async fn a_promoted_dir_refuses_to_start_as_a_replica_until_the_marker_is_remove
     let rc = replica.client.clone();
     wait_until("catch-up", || {
         let mut c = rc.clone();
-        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == 1 }
+        async move {
+            c.head(pb::HeadRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .head
+                == 1
+        }
     })
     .await;
     replica.client.promote(pb::PromoteRequest {}).await.unwrap();
@@ -382,7 +417,14 @@ async fn replica_reconnects_after_the_leader_restarts_on_the_same_port() {
     let rc = replica.client.clone();
     wait_until("catch-up", || {
         let mut c = rc.clone();
-        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == 2 }
+        async move {
+            c.head(pb::HeadRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .head
+                == 2
+        }
     })
     .await;
     let dir = leader.stop_keep_dir().await;
@@ -432,7 +474,14 @@ async fn a_follower_lands_a_chunk_as_one_batch() {
     let replica_client = replica.client.clone();
     wait_until("the replica to catch up", || {
         let mut c = replica_client.clone();
-        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == want }
+        async move {
+            c.head(pb::HeadRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .head
+                == want
+        }
     })
     .await;
     let st = replica.running.as_ref().unwrap().db.stats();
@@ -462,7 +511,14 @@ async fn a_follower_lands_the_chunks_that_arrived_meanwhile_together() {
     let replica_client = replica.client.clone();
     wait_until("the replica to attach", || {
         let mut c = replica_client.clone();
-        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == 1 }
+        async move {
+            c.head(pb::HeadRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .head
+                == 1
+        }
     })
     .await;
     let running = replica.running.as_ref().unwrap();
@@ -476,7 +532,14 @@ async fn a_follower_lands_the_chunks_that_arrived_meanwhile_together() {
     let replica_client = replica.client.clone();
     wait_until("the replica to catch up", || {
         let mut c = replica_client.clone();
-        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == 21 }
+        async move {
+            c.head(pb::HeadRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .head
+                == 21
+        }
     })
     .await;
     let after = running.db.stats();

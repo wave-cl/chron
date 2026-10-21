@@ -323,13 +323,20 @@ impl Index {
             .collect()
     }
 
-    /// `(index, position)` of the aggregate's events from `from_index`.
+    /// `(index, position)` of the aggregate's events from `from_index`,
+    /// at positions below `upto`.
+    ///
+    /// Every range here takes `upto`, an exclusive cap on the position
+    /// (`u64::MAX` for none): a reader bounded at what a majority holds
+    /// must cap inside the snapshot, since the index commits before the
+    /// head is published and a snapshot can hold positions past either.
     pub(crate) fn aggregate_positions(
         &self,
         txn: &ReadTransaction,
         id: &Uuid,
         from_index: u64,
         limit: usize,
+        upto: u64,
     ) -> Result<Vec<(u64, u64)>> {
         let table = txn.open_table(AGG_INDEX)?;
         let bytes = id.as_bytes();
@@ -339,21 +346,31 @@ impl Index {
             .take(limit)
         {
             let (k, v) = item?;
+            // Positions rise with the index, so the first one at or past
+            // the cap ends the page.
+            if v.value() >= upto {
+                break;
+            }
             out.push((k.value().1, v.value()));
         }
         Ok(out)
     }
 
-    /// `(position, location)` of every event from `from`, at most `limit`.
+    /// `(position, location)` of every event from `from`, at most `limit`,
+    /// below `upto`.
     pub(crate) fn positions_from(
         &self,
         txn: &ReadTransaction,
         from: u64,
         limit: usize,
+        upto: u64,
     ) -> Result<Vec<(u64, Location)>> {
         let table = txn.open_table(POS)?;
-        let end = from.saturating_add(limit as u64);
+        let end = from.saturating_add(limit as u64).min(upto);
         let mut out = Vec::new();
+        if end <= from {
+            return Ok(out);
+        }
         for item in table.range(from..end)? {
             let (k, v) = item?;
             out.push((k.value(), v.value().into()));
@@ -361,18 +378,25 @@ impl Index {
         Ok(out)
     }
 
-    /// `(position, location)` of the events at positions in `floor..=from`,
-    /// newest first, at most `limit`.
+    /// `(position, location)` of the events at positions in `floor..=from`
+    /// and below `upto`, newest first, at most `limit`.
     pub(crate) fn positions_to(
         &self,
         txn: &ReadTransaction,
         floor: u64,
         from: u64,
         limit: usize,
+        upto: u64,
     ) -> Result<Vec<(u64, Location)>> {
         let table = txn.open_table(POS)?;
         let mut out = Vec::new();
-        for item in table.range(floor..=from)?.rev().take(limit) {
+        let Some(hi) = upto.checked_sub(1).map(|u| u.min(from)) else {
+            return Ok(out);
+        };
+        if hi < floor {
+            return Ok(out);
+        }
+        for item in table.range(floor..=hi)?.rev().take(limit) {
             let (k, v) = item?;
             out.push((k.value(), v.value().into()));
         }
@@ -380,57 +404,69 @@ impl Index {
     }
 
     /// `(index, position)` of the aggregate's events at indices
-    /// `<= from_index`, newest first.
+    /// `<= from_index` and positions below `upto`, newest first.
     pub(crate) fn aggregate_positions_rev(
         &self,
         txn: &ReadTransaction,
         id: &Uuid,
         from_index: u64,
         limit: usize,
+        upto: u64,
     ) -> Result<Vec<(u64, u64)>> {
         let table = txn.open_table(AGG_INDEX)?;
         let bytes = id.as_bytes();
         let mut out = Vec::new();
-        for item in table
-            .range((bytes, 0)..=(bytes, from_index))?
-            .rev()
-            .take(limit)
-        {
+        for item in table.range((bytes, 0)..=(bytes, from_index))?.rev() {
             let (k, v) = item?;
+            if v.value() >= upto {
+                continue;
+            }
             out.push((k.value().1, v.value()));
+            if out.len() >= limit {
+                break;
+            }
         }
         Ok(out)
     }
 
-    /// Positions of the events carrying `tag` at positions `<= from`,
-    /// newest first.
+    /// Positions of the events carrying `tag` at positions `<= from` and
+    /// below `upto`, newest first.
     pub(crate) fn tag_positions_rev(
         &self,
         txn: &ReadTransaction,
         tag: &[u8],
         from: u64,
         limit: usize,
+        upto: u64,
     ) -> Result<Vec<u64>> {
         let table = txn.open_table(TAG)?;
         let mut out = Vec::new();
-        for item in table.range((tag, 0)..=(tag, from))?.rev().take(limit) {
+        let Some(hi) = upto.checked_sub(1).map(|u| u.min(from)) else {
+            return Ok(out);
+        };
+        for item in table.range((tag, 0)..=(tag, hi))?.rev().take(limit) {
             let (k, _) = item?;
             out.push(k.value().1);
         }
         Ok(out)
     }
 
-    /// Positions of the events carrying `tag` from `from`, ascending.
+    /// Positions of the events carrying `tag` from `from` and below
+    /// `upto`, ascending.
     pub(crate) fn tag_positions(
         &self,
         txn: &ReadTransaction,
         tag: &[u8],
         from: u64,
         limit: usize,
+        upto: u64,
     ) -> Result<Vec<u64>> {
         let table = txn.open_table(TAG)?;
         let mut out = Vec::new();
-        for item in table.range((tag, from)..=(tag, u64::MAX))?.take(limit) {
+        if upto <= from {
+            return Ok(out);
+        }
+        for item in table.range((tag, from)..(tag, upto))?.take(limit) {
             let (k, _) = item?;
             out.push(k.value().1);
         }
@@ -472,8 +508,12 @@ mod tests {
         assert_eq!(i.aggregate_len(&Uuid::from_u128(1)).unwrap(), 0);
         assert_eq!(i.locate(0).unwrap(), None);
         let txn = i.begin_read().unwrap();
-        assert!(i.positions_from(&txn, 0, 10).unwrap().is_empty());
-        assert!(i.tag_positions(&txn, b"t", 0, 10).unwrap().is_empty());
+        assert!(i.positions_from(&txn, 0, 10, u64::MAX).unwrap().is_empty());
+        assert!(
+            i.tag_positions(&txn, b"t", 0, 10, u64::MAX)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -489,27 +529,50 @@ mod tests {
         }
         txn.commit().unwrap();
         let txn = i.begin_read().unwrap();
-        assert_eq!(i.tag_positions(&txn, b"a", 0, 100).unwrap(), vec![0, 4, 8]);
         assert_eq!(
-            i.tag_positions(&txn, b"a\0", 0, 100).unwrap(),
+            i.tag_positions(&txn, b"a", 0, 100, u64::MAX).unwrap(),
+            vec![0, 4, 8]
+        );
+        assert_eq!(
+            i.tag_positions(&txn, b"a\0", 0, 100, u64::MAX).unwrap(),
             vec![1, 5, 9]
         );
         assert_eq!(
-            i.tag_positions(&txn, b"ab", 0, 100).unwrap(),
+            i.tag_positions(&txn, b"ab", 0, 100, u64::MAX).unwrap(),
             vec![2, 6, 10]
         );
-        assert_eq!(i.tag_positions(&txn, b"b", 0, 100).unwrap(), vec![3, 7, 11]);
-        assert_eq!(i.tag_positions(&txn, b"a", 5, 100).unwrap(), vec![8]);
-        assert_eq!(i.tag_positions(&txn, b"a", 0, 2).unwrap(), vec![0, 4]);
-        assert!(i.tag_positions(&txn, b"", 0, 100).unwrap().is_empty());
         assert_eq!(
-            i.tag_positions_rev(&txn, b"a", u64::MAX, 100).unwrap(),
+            i.tag_positions(&txn, b"b", 0, 100, u64::MAX).unwrap(),
+            vec![3, 7, 11]
+        );
+        assert_eq!(
+            i.tag_positions(&txn, b"a", 5, 100, u64::MAX).unwrap(),
+            vec![8]
+        );
+        assert_eq!(
+            i.tag_positions(&txn, b"a", 0, 2, u64::MAX).unwrap(),
+            vec![0, 4]
+        );
+        assert!(
+            i.tag_positions(&txn, b"", 0, 100, u64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            i.tag_positions_rev(&txn, b"a", u64::MAX, 100, u64::MAX)
+                .unwrap(),
             vec![8, 4, 0]
         );
-        assert_eq!(i.tag_positions_rev(&txn, b"a", 7, 100).unwrap(), vec![4, 0]);
-        assert_eq!(i.tag_positions_rev(&txn, b"a\0", 9, 1).unwrap(), vec![9]);
+        assert_eq!(
+            i.tag_positions_rev(&txn, b"a", 7, 100, u64::MAX).unwrap(),
+            vec![4, 0]
+        );
+        assert_eq!(
+            i.tag_positions_rev(&txn, b"a\0", 9, 1, u64::MAX).unwrap(),
+            vec![9]
+        );
         assert!(
-            i.tag_positions_rev(&txn, b"c", u64::MAX, 100)
+            i.tag_positions_rev(&txn, b"c", u64::MAX, 100, u64::MAX)
                 .unwrap()
                 .is_empty()
         );
@@ -531,29 +594,35 @@ mod tests {
         txn.commit().unwrap();
         let txn = i.begin_read().unwrap();
         assert_eq!(
-            i.aggregate_positions(&txn, &a, 3, 10).unwrap(),
+            i.aggregate_positions(&txn, &a, 3, 10, u64::MAX).unwrap(),
             vec![(3, 6), (4, 8)]
         );
         assert_eq!(
-            i.aggregate_positions(&txn, &b, 0, 2).unwrap(),
+            i.aggregate_positions(&txn, &b, 0, 2, u64::MAX).unwrap(),
             vec![(0, 1), (1, 3)]
         );
-        assert!(i.aggregate_positions(&txn, &a, 5, 10).unwrap().is_empty());
         assert!(
-            i.aggregate_positions(&txn, &Uuid::from_u128(3), 0, 10)
+            i.aggregate_positions(&txn, &a, 5, 10, u64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            i.aggregate_positions(&txn, &Uuid::from_u128(3), 0, 10, u64::MAX)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            i.aggregate_positions_rev(&txn, &a, u64::MAX, 2).unwrap(),
+            i.aggregate_positions_rev(&txn, &a, u64::MAX, 2, u64::MAX)
+                .unwrap(),
             vec![(4, 8), (3, 6)]
         );
         assert_eq!(
-            i.aggregate_positions_rev(&txn, &b, 1, 10).unwrap(),
+            i.aggregate_positions_rev(&txn, &b, 1, 10, u64::MAX)
+                .unwrap(),
             vec![(1, 3), (0, 1)]
         );
         assert!(
-            i.aggregate_positions_rev(&txn, &Uuid::from_u128(3), u64::MAX, 10)
+            i.aggregate_positions_rev(&txn, &Uuid::from_u128(3), u64::MAX, 10, u64::MAX)
                 .unwrap()
                 .is_empty()
         );
@@ -604,7 +673,7 @@ mod tests {
         }
         txn.commit().unwrap();
         let txn = i.begin_read().unwrap();
-        let got = i.positions_from(&txn, 2, 3).unwrap();
+        let got = i.positions_from(&txn, 2, 3, u64::MAX).unwrap();
         assert_eq!(
             got.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
             vec![2, 3, 4]
@@ -617,9 +686,13 @@ mod tests {
                 frame_len: 10
             }
         );
-        assert!(i.positions_from(&txn, u64::MAX, 5).unwrap().is_empty());
+        assert!(
+            i.positions_from(&txn, u64::MAX, 5, u64::MAX)
+                .unwrap()
+                .is_empty()
+        );
         let back = |from, limit| -> Vec<u64> {
-            i.positions_to(&txn, 0, from, limit)
+            i.positions_to(&txn, 0, from, limit, u64::MAX)
                 .unwrap()
                 .iter()
                 .map(|(p, _)| *p)
@@ -629,7 +702,7 @@ mod tests {
         assert_eq!(back(3, 10), vec![3, 2, 1, 0]);
         assert_eq!(back(0, 1), vec![0]);
         let floored: Vec<u64> = i
-            .positions_to(&txn, 3, u64::MAX, 10)
+            .positions_to(&txn, 3, u64::MAX, 10, u64::MAX)
             .unwrap()
             .iter()
             .map(|(p, _)| *p)

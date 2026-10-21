@@ -277,7 +277,12 @@ async fn a_confirmed_write_survives_two_leader_deaths() {
     c.restart(l1).await;
     let leader = c.wait_for_leader(3 * SOON).await;
     assert_eq!(leader, l1, "{}", c.describe());
-    let log = c.client(l1).await.read_all(0, 0).await.unwrap();
+    let log = c
+        .client(l1)
+        .await
+        .read_all_with(0, 0, chrond::testing::local_read())
+        .await
+        .unwrap();
     assert_eq!(log[0].payload, "confirmed by a");
     c.hold_apply(b, false);
     c.wait_following(b, l1, SOON).await;

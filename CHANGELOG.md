@@ -6,7 +6,57 @@ crates share one version.
 
 ## Unreleased
 
-Nothing yet.
+### chron-db
+
+- Capped reads: `read_all_bounded_upto`, `read_aggregate_bounded_upto`,
+  `read_tag_bounded_upto` and the `_backward_upto` forms serve only
+  positions below a caller's cap, applied inside the index snapshot;
+  `Subscription::next_async_upto(cap)` delivers below the cap and
+  answers `None` once nothing more lies under it, resuming where it
+  stopped when the cap rises. The daemon's confirmed reads are built on
+  them. Existing reads are unchanged.
+
+### chron-proto
+
+- `Consistency` (`LOCAL`, `CONFIRMED`, unspecified for the daemon's
+  default); `consistency`, `at_least` and `wait_timeout_ms` on the read
+  requests and `HeadRequest`; `HeadResponse { head, confirmed, local }`;
+  `SubscribeRequest.consistency`; `ReplicationChunk.confirmed` and
+  `HeartbeatRequest.confirmed` (per database); `InfoResponse.confirmed`
+  and `read_consistency`.
+
+### chrond
+
+- Confirmed reads: on a node with peers a read, head or subscription
+  serves, by default under sync commits, only positions a majority of
+  the group durably holds (the bound rises with the followers' reports
+  on a leader and arrives with chunks and heartbeats on a follower; a
+  promotion keeps it); `local` serves everything the node holds;
+  `--read-consistency` sets the default. `at_least` waits for the bound
+  to reach a position (a commit's `next`), at most `wait_timeout_ms`,
+  then answers DEADLINE_EXCEEDED with `chron-position` and `chron-head`
+  (504 on the gateway). The gateway takes `consistency`, `at_least` and
+  `wait_ms` on the read, head and tail routes; `/head` answers `head`,
+  `confirmed` and `local`; `/info` adds `confirmed` and
+  `read_consistency`.
+
+### chron-client
+
+- `Consistency`, `ClientConfig::consistency`, `ReadOptions`, the `_with`
+  reads, `head_with` (`Head { head, confirmed, local }`),
+  `subscribe_with`, `ClientError::BoundTimeout`; `Info.confirmed` and
+  `read_consistency`. `head()` now answers the bound under the client's
+  consistency.
+
+### chron-cli
+
+- `--local` / `--confirmed` on every command, `--at-least P [--wait
+  SECS]` on `all`, `read`, `tag` and `head`; `head --json` carries both
+  bounds.
+
+### tools
+
+- `chron-load --local` reads and subscribes under the local consistency.
 
 ## 0.5.0 - 2026-10-19
 

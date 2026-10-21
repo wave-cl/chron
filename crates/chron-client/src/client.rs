@@ -82,6 +82,69 @@ pub struct ClientConfig {
     /// See [`Client::commit`] for the retry rule it unlocks. Turn it off
     /// against 0.4.0 daemons, which drop the id and would write twice.
     pub commit_ids: bool,
+    /// What reads, head and subscriptions see when a call does not say
+    /// ([`ReadOptions::consistency`]): [`Consistency::Default`] (the
+    /// daemon's own default) unless set.
+    pub consistency: Consistency,
+}
+
+/// What a read, head or subscription may see.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Consistency {
+    /// The daemon's default: confirmed when it waits for a majority on
+    /// commits, local otherwise.
+    #[default]
+    Default,
+    /// Everything the node holds, including what a leader's death could
+    /// still erase.
+    Local,
+    /// Only positions a majority of the failover group durably holds;
+    /// the same as `Local` on a node without peers.
+    Confirmed,
+}
+
+impl Consistency {
+    fn wire(self) -> pb::Consistency {
+        match self {
+            Consistency::Default => pb::Consistency::Unspecified,
+            Consistency::Local => pb::Consistency::Local,
+            Consistency::Confirmed => pb::Consistency::Confirmed,
+        }
+    }
+
+    fn from_wire(c: i32) -> Consistency {
+        match pb::Consistency::try_from(c).unwrap_or(pb::Consistency::Unspecified) {
+            pb::Consistency::Unspecified => Consistency::Default,
+            pb::Consistency::Local => Consistency::Local,
+            pb::Consistency::Confirmed => Consistency::Confirmed,
+        }
+    }
+}
+
+/// Per-read choices (the `_with` reads and [`Client::head_with`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadOptions {
+    /// What the read may see; `None` is the client's
+    /// [`ClientConfig::consistency`].
+    pub consistency: Option<Consistency>,
+    /// Wait until the bound under that consistency reaches this position
+    /// before reading (read your writes: a commit's [`Committed::next`]).
+    pub at_least: Option<u64>,
+    /// How long `at_least` may wait; `None` is the daemon's sync timeout,
+    /// zero does not wait. Past it the read fails with
+    /// [`ClientError::BoundTimeout`].
+    pub wait_timeout: Option<Duration>,
+}
+
+/// What [`Client::head_with`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Head {
+    /// The bound under the consistency asked for.
+    pub head: u64,
+    /// Positions a majority durably holds (the local head without peers).
+    pub confirmed: u64,
+    /// Everything the node holds.
+    pub local: u64,
 }
 
 /// Per-commit choices.
@@ -112,6 +175,7 @@ impl Default for ClientConfig {
             failover_timeout: Duration::from_secs(30),
             sync_commit: None,
             commit_ids: true,
+            consistency: Consistency::Default,
         }
     }
 }
@@ -280,6 +344,11 @@ pub struct Info {
     pub followers: Vec<FollowerStatus>,
     /// Whether the daemon waits for a majority by default.
     pub sync_commit: bool,
+    /// On a node with peers: the confirmed bound (positions a majority
+    /// durably holds, as this node knows it, clamped to its head).
+    pub confirmed: Option<u64>,
+    /// What reads get when they do not ask (never `Default`).
+    pub read_consistency: Consistency,
     /// The membership generation the daemon holds (`(epoch, version)`).
     pub members_version: u64,
     /// The epoch half of that generation.
@@ -390,6 +459,9 @@ pub struct ReplicationChunk {
     /// The leader's head when it took `epoch`; a follower adopts the
     /// epoch once its head reaches it.
     pub epoch_base: u64,
+    /// The highest position a majority durably held when the chunk was
+    /// cut: a follower's confirmed bound.
+    pub confirmed: u64,
 }
 
 /// The bytes of a backup archive fetched from a daemon, in order.
@@ -980,14 +1052,23 @@ impl Client {
         self.commit(txn).await
     }
 
+    /// The wire form of a read's options: the client's consistency when
+    /// the call names none.
+    fn read_wire(&self, o: ReadOptions) -> (i32, Option<u64>, Option<u64>) {
+        let c = o.consistency.unwrap_or(self.config.consistency).wire() as i32;
+        (c, o.at_least, o.wait_timeout.map(|d| d.as_millis() as u64))
+    }
+
     async fn read(
         &self,
         read: Read,
         from: u64,
         limit: usize,
         backward: bool,
+        opts: ReadOptions,
     ) -> Result<EventStream, ClientError> {
         let limit = limit as u64;
+        let (consistency, at_least, wait_timeout_ms) = self.read_wire(opts);
         let stream = match read {
             Read::Aggregate(id) => self
                 .rpc()
@@ -996,6 +1077,9 @@ impl Client {
                     from_index: from,
                     limit,
                     backward,
+                    consistency,
+                    at_least,
+                    wait_timeout_ms,
                 })
                 .await?
                 .into_inner(),
@@ -1005,6 +1089,9 @@ impl Client {
                     from,
                     limit,
                     backward,
+                    consistency,
+                    at_least,
+                    wait_timeout_ms,
                 })
                 .await?
                 .into_inner(),
@@ -1015,6 +1102,9 @@ impl Client {
                     from,
                     limit,
                     backward,
+                    consistency,
+                    at_least,
+                    wait_timeout_ms,
                 })
                 .await?
                 .into_inner(),
@@ -1059,9 +1149,61 @@ impl Client {
 
     /// Every event from position `from` on, at most `limit` (0 for all).
     /// [`ClientError::PositionOutOfRange`] past the head,
-    /// [`ClientError::BelowFloor`] below the floor.
+    /// [`ClientError::BelowFloor`] below the floor. The head here is the
+    /// bound under the read's consistency.
     pub async fn read_all(&self, from: u64, limit: usize) -> Result<Vec<Event>, ClientError> {
         Self::collect(self.read_all_stream(from, limit).await?).await
+    }
+
+    /// [`read_all`](Client::read_all) with [`ReadOptions`]: a
+    /// consistency, or a position to wait for first.
+    pub async fn read_all_with(
+        &self,
+        from: u64,
+        limit: usize,
+        opts: ReadOptions,
+    ) -> Result<Vec<Event>, ClientError> {
+        Self::collect(self.read(Read::All, from, limit, false, opts).await?).await
+    }
+
+    /// [`read_all_backward`](Client::read_all_backward) with options.
+    pub async fn read_all_backward_with(
+        &self,
+        to: u64,
+        limit: usize,
+        opts: ReadOptions,
+    ) -> Result<Vec<Event>, ClientError> {
+        Self::collect(self.read(Read::All, to, limit, true, opts).await?).await
+    }
+
+    /// [`read_aggregate`](Client::read_aggregate) with options.
+    pub async fn read_aggregate_with(
+        &self,
+        id: Uuid,
+        from_index: u64,
+        limit: usize,
+        opts: ReadOptions,
+    ) -> Result<Vec<Event>, ClientError> {
+        Self::collect(
+            self.read(Read::Aggregate(id), from_index, limit, false, opts)
+                .await?,
+        )
+        .await
+    }
+
+    /// [`read_tag`](Client::read_tag) with options.
+    pub async fn read_tag_with(
+        &self,
+        tag: impl Into<Bytes>,
+        from: u64,
+        limit: usize,
+        opts: ReadOptions,
+    ) -> Result<Vec<Event>, ClientError> {
+        Self::collect(
+            self.read(Read::Tag(tag.into()), from, limit, false, opts)
+                .await?,
+        )
+        .await
     }
 
     /// Like [`read_all`](Client::read_all), newest first from position
@@ -1104,8 +1246,14 @@ impl Client {
         from_index: u64,
         limit: usize,
     ) -> Result<EventStream, ClientError> {
-        self.read(Read::Aggregate(id), from_index, limit, false)
-            .await
+        self.read(
+            Read::Aggregate(id),
+            from_index,
+            limit,
+            false,
+            ReadOptions::default(),
+        )
+        .await
     }
 
     /// [`read_aggregate_backward`](Client::read_aggregate_backward) as a
@@ -1116,7 +1264,14 @@ impl Client {
         to_index: u64,
         limit: usize,
     ) -> Result<EventStream, ClientError> {
-        self.read(Read::Aggregate(id), to_index, limit, true).await
+        self.read(
+            Read::Aggregate(id),
+            to_index,
+            limit,
+            true,
+            ReadOptions::default(),
+        )
+        .await
     }
 
     /// [`read_all`](Client::read_all) as a stream. A bad `from` fails the
@@ -1126,7 +1281,18 @@ impl Client {
         from: u64,
         limit: usize,
     ) -> Result<EventStream, ClientError> {
-        self.read(Read::All, from, limit, false).await
+        self.read(Read::All, from, limit, false, ReadOptions::default())
+            .await
+    }
+
+    /// [`read_all_stream`](Client::read_all_stream) with options.
+    pub async fn read_all_stream_with(
+        &self,
+        from: u64,
+        limit: usize,
+        opts: ReadOptions,
+    ) -> Result<EventStream, ClientError> {
+        self.read(Read::All, from, limit, false, opts).await
     }
 
     /// [`read_all_backward`](Client::read_all_backward) as a stream.
@@ -1135,7 +1301,8 @@ impl Client {
         to: u64,
         limit: usize,
     ) -> Result<EventStream, ClientError> {
-        self.read(Read::All, to, limit, true).await
+        self.read(Read::All, to, limit, true, ReadOptions::default())
+            .await
     }
 
     /// [`read_tag`](Client::read_tag) as a stream.
@@ -1145,7 +1312,14 @@ impl Client {
         from: u64,
         limit: usize,
     ) -> Result<EventStream, ClientError> {
-        self.read(Read::Tag(tag.into()), from, limit, false).await
+        self.read(
+            Read::Tag(tag.into()),
+            from,
+            limit,
+            false,
+            ReadOptions::default(),
+        )
+        .await
     }
 
     /// [`read_tag_backward`](Client::read_tag_backward) as a stream.
@@ -1155,7 +1329,14 @@ impl Client {
         to: u64,
         limit: usize,
     ) -> Result<EventStream, ClientError> {
-        self.read(Read::Tag(tag.into()), to, limit, true).await
+        self.read(
+            Read::Tag(tag.into()),
+            to,
+            limit,
+            true,
+            ReadOptions::default(),
+        )
+        .await
     }
 
     /// How many events the aggregate has (0 for an unknown one).
@@ -1170,17 +1351,39 @@ impl Client {
             .len)
     }
 
-    /// One past the last committed position.
+    /// One past the last position a read would see: the bound under the
+    /// client's consistency.
     pub async fn head(&self) -> Result<u64, ClientError> {
-        Ok(self.rpc().head(pb::HeadRequest {}).await?.into_inner().head)
+        Ok(self.head_with(ReadOptions::default()).await?.head)
+    }
+
+    /// The bounds, under the options' consistency and both others; with
+    /// `at_least`, after waiting for that position.
+    pub async fn head_with(&self, opts: ReadOptions) -> Result<Head, ClientError> {
+        let (consistency, at_least, wait_timeout_ms) = self.read_wire(opts);
+        let h = self
+            .rpc()
+            .head(pb::HeadRequest {
+                consistency,
+                at_least,
+                wait_timeout_ms,
+            })
+            .await?
+            .into_inner();
+        Ok(Head {
+            head: h.head,
+            confirmed: h.confirmed,
+            local: h.local,
+        })
     }
 
     /// Committed events from position `from` on, then live ones as they
-    /// commit. The stream ends only with an error: [`ClientError::
+    /// commit (under the confirmed consistency, as a majority comes to
+    /// hold them). The stream ends only with an error: [`ClientError::
     /// BelowFloor`] when `from` is below the floor, [`ClientError::
     /// Unavailable`] when the daemon is fenced or stops.
     pub async fn subscribe(&self, from: u64) -> Result<EventStream, ClientError> {
-        self.subscribe_inner(from, None).await
+        self.subscribe_inner(from, None, None).await
     }
 
     /// Like [`subscribe`](Client::subscribe), only the events carrying
@@ -1190,19 +1393,32 @@ impl Client {
         tag: impl Into<Bytes>,
         from: u64,
     ) -> Result<EventStream, ClientError> {
-        self.subscribe_inner(from, Some(tag.into())).await
+        self.subscribe_inner(from, Some(tag.into()), None).await
+    }
+
+    /// [`subscribe`](Client::subscribe) (or, with `tag`,
+    /// [`subscribe_tag`](Client::subscribe_tag)) under a consistency.
+    pub async fn subscribe_with(
+        &self,
+        from: u64,
+        tag: Option<Bytes>,
+        consistency: Consistency,
+    ) -> Result<EventStream, ClientError> {
+        self.subscribe_inner(from, tag, Some(consistency)).await
     }
 
     async fn subscribe_inner(
         &self,
         from: u64,
         tag: Option<Bytes>,
+        consistency: Option<Consistency>,
     ) -> Result<EventStream, ClientError> {
         let stream = self
             .rpc()
             .subscribe(pb::SubscribeRequest {
                 from,
                 tag: tag.map(|t| t.to_vec()),
+                consistency: consistency.unwrap_or(self.config.consistency).wire() as i32,
             })
             .await?
             .into_inner();
@@ -1254,6 +1470,8 @@ impl Client {
                 })
                 .collect(),
             sync_commit: i.sync_commit,
+            confirmed: i.confirmed,
+            read_consistency: Consistency::from_wire(i.read_consistency),
             members_version: i.members_version,
             members_epoch: i.members_epoch,
             members_committed: i.members_committed,
@@ -1600,6 +1818,7 @@ fn chunks(stream: tonic::Streaming<pb::ReplicationChunk>) -> ChunkStream {
             head: c.head,
             epoch: c.epoch,
             epoch_base: c.epoch_base,
+            confirmed: c.confirmed,
         })
     }))
 }

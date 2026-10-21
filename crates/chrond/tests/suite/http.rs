@@ -849,3 +849,69 @@ async fn the_members_routes_answer() {
     assert_eq!((code, v["member"].as_bool()), (200, Some(true)));
     s.stop().await;
 }
+
+/// The gateway's consistency parameters: `/head` reports both bounds,
+/// a bad `consistency` is 400, and `at_least` past the bound with no
+/// wait is 504 carrying the bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn consistency_parameters_on_the_gateway() {
+    let s = Server::start_with(|o| {
+        o.http_listen = Some("127.0.0.1:0".parse().unwrap());
+    })
+    .await;
+    let addr = s.running.as_ref().unwrap().http_addr.unwrap();
+    for i in 0..3 {
+        let mut t = s.running.as_ref().unwrap().db.transaction();
+        t.append_free(vec![chron::NewEvent::new(format!("e{i}"))]);
+        t.commit().unwrap();
+    }
+    let (code, v, _) = call(addr, "GET", "/v1/db/default/head".into(), vec![], None).await;
+    assert_eq!(
+        (
+            code,
+            v["head"].as_u64(),
+            v["confirmed"].as_u64(),
+            v["local"].as_u64()
+        ),
+        (200, Some(3), Some(3), Some(3))
+    );
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/events?consistency=confirmed".into(),
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!((code, v["events"].as_array().unwrap().len()), (200, 3));
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/events?consistency=bogus".into(),
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!((code, v["code"].as_str()), (400, Some("InvalidArgument")));
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/head?at_least=5&wait_ms=0".into(),
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!((code, v["position"].as_u64()), (504, Some(3)), "{v}");
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/events?at_least=3&wait_ms=0".into(),
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!((code, v["events"].as_array().unwrap().len()), (200, 3));
+    let (_, v, _) = call(addr, "GET", "/v1/db/default/info".into(), vec![], None).await;
+    assert_eq!(v["read_consistency"], "local");
+    s.stop().await;
+}

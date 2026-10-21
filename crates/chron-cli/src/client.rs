@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use chron_client::{Client, ClientConfig, ClientError, Identity, TlsConfig};
+use chron_client::{Client, ClientConfig, ClientError, Consistency, Identity, TlsConfig};
 use clap::Args;
 
 use crate::output::Usage;
@@ -48,6 +48,14 @@ pub struct Conn {
         default_value_t = 64 * 1024 * 1024
     )]
     pub max_message_bytes: usize,
+    /// Read everything the node holds, including what a leader's death
+    /// could still erase (the daemon's default is confirmed-only when it
+    /// waits for a majority on commits).
+    #[arg(long, global = true, conflicts_with = "confirmed")]
+    pub local: bool,
+    /// Read only positions a majority of the group durably holds.
+    #[arg(long, global = true)]
+    pub confirmed: bool,
 }
 
 /// The daemon could not be reached at all (exit code 2).
@@ -126,6 +134,11 @@ impl Conn {
             admin_token: self.admin_token.clone(),
             max_message_bytes: self.max_message_bytes,
             database: self.db.clone(),
+            consistency: match (self.local, self.confirmed) {
+                (true, _) => Consistency::Local,
+                (_, true) => Consistency::Confirmed,
+                _ => Consistency::Default,
+            },
             ..ClientConfig::default()
         })
     }

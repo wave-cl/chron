@@ -32,7 +32,14 @@ async fn head_reaches(client: &tonic::transport::Channel, n: u64) {
     let c = pb::chron_client::ChronClient::new(client.clone());
     wait_until(&format!("the head to reach {n}"), || {
         let mut c = c.clone();
-        async move { c.head(pb::HeadRequest {}).await.unwrap().into_inner().head == n }
+        async move {
+            c.head(pb::HeadRequest::default())
+                .await
+                .unwrap()
+                .into_inner()
+                .head
+                == n
+        }
     })
     .await;
 }
@@ -142,6 +149,7 @@ fn stalled_streams_do_not_starve_commits() {
                         from: 0,
                         limit: 0,
                         backward: false,
+                        ..Default::default()
                     })
                     .await
                     .unwrap()
@@ -308,7 +316,11 @@ async fn subscribe_and_replication_streams_end_with_unavailable_when_the_node_is
     .await;
     let mut sub = leader
         .client
-        .subscribe(pb::SubscribeRequest { from: 0, tag: None })
+        .subscribe(pb::SubscribeRequest {
+            from: 0,
+            tag: None,
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner();

@@ -38,6 +38,7 @@ async fn commit_two_aggregates_and_free_events_returns_positions_and_results() {
                 from: 0,
                 limit: 0,
                 backward: false,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -85,7 +86,7 @@ async fn conflict_is_failed_precondition_with_headers_and_nothing_written() {
     );
     assert_eq!(
         s.client
-            .head(pb::HeadRequest {})
+            .head(pb::HeadRequest::default())
             .await
             .unwrap()
             .into_inner()
@@ -158,7 +159,7 @@ async fn malformed_requests_are_invalid_argument() {
     }
     assert_eq!(
         s.client
-            .head(pb::HeadRequest {})
+            .head(pb::HeadRequest::default())
             .await
             .unwrap()
             .into_inner()
@@ -200,6 +201,7 @@ async fn a_resent_commit_id_is_a_duplicate_over_grpc() {
                 from: 0,
                 limit: 0,
                 backward: false,
+                ..Default::default()
             })
             .await
             .unwrap()

@@ -3,6 +3,7 @@
 //! info report. Both transports map errors from the same `Status`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use chron::{Committed, Db, Event, Uuid};
@@ -68,6 +69,103 @@ pub async fn role_lost(rx: &mut watch::Receiver<Role>, replication: bool) -> Rol
     }
 }
 
+/// What a read may see (see `Node::read_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Everything the node holds.
+    Local,
+    /// Positions a majority durably holds.
+    Confirmed,
+}
+
+impl Mode {
+    pub fn wire(self) -> pb::Consistency {
+        match self {
+            Mode::Local => pb::Consistency::Local,
+            Mode::Confirmed => pb::Consistency::Confirmed,
+        }
+    }
+}
+
+/// The exclusive cap a read under `mode` is served below: none for
+/// local, the confirmed bound clamped to the head otherwise (a
+/// follower learns the bound before it holds the positions).
+pub fn cap(dbn: &DbNode, mode: Mode) -> u64 {
+    match mode {
+        Mode::Local => u64::MAX,
+        Mode::Confirmed => dbn.confirmed().min(dbn.db.head()),
+    }
+}
+
+/// What `Head` answers under `mode`: the head, or the confirmed cap.
+pub fn bound(dbn: &DbNode, mode: Mode) -> u64 {
+    match mode {
+        Mode::Local => dbn.db.head(),
+        Mode::Confirmed => cap(dbn, mode),
+    }
+}
+
+/// Waits until the bound under `mode` reaches `at_least` (read your
+/// writes: a commit's `next`), at most `timeout`; DEADLINE_EXCEEDED
+/// past it with the bound in `chron-position` and the head in
+/// `chron-head`.
+pub async fn wait_bound(
+    dbn: &DbNode,
+    mode: Mode,
+    at_least: u64,
+    timeout: Duration,
+) -> Result<u64, Status> {
+    let mut conf = dbn.confirmed.subscribe();
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        let b = bound(dbn, mode);
+        if b >= at_least {
+            return Ok(b);
+        }
+        tokio::select! {
+            _ = dbn.cancel.cancelled() => return Err(Status::unavailable("the database or daemon went away")),
+            _ = &mut deadline => {
+                let mut s = Status::deadline_exceeded(format!(
+                    "the {} position is {b}, below {at_least}",
+                    match mode { Mode::Local => "local", Mode::Confirmed => "confirmed" }
+                ));
+                for (key, v) in [
+                    (chron_proto::POSITION_HEADER, b),
+                    (chron_proto::HEAD_HEADER, dbn.db.head()),
+                ] {
+                    if let Ok(v) = v.to_string().parse() {
+                        s.metadata_mut().insert(key, v);
+                    }
+                }
+                return Err(s);
+            }
+            _ = dbn.db.wait_for_async(at_least.max(b + 1)) => {}
+            r = conf.changed() => {
+                if r.is_err() {
+                    return Err(Status::unavailable("the database or daemon went away"));
+                }
+            }
+        }
+    }
+}
+
+/// The wait a request asked for: `at_least` with `wait_timeout_ms`
+/// (absent: the daemon's sync timeout; 0: do not wait).
+pub async fn wait_requested(
+    node: &Node,
+    dbn: &DbNode,
+    mode: Mode,
+    at_least: Option<u64>,
+    wait_timeout_ms: Option<u64>,
+) -> Result<(), Status> {
+    let Some(p) = at_least else {
+        return Ok(());
+    };
+    let timeout = wait_timeout_ms.map_or_else(|| node.sync_timeout(), Duration::from_millis);
+    wait_bound(dbn, mode, p, timeout).await.map(|_| ())
+}
+
 /// One finite read, paged through the library.
 pub enum Read {
     Aggregate { id: Uuid, backward: bool },
@@ -77,25 +175,28 @@ pub enum Read {
 
 impl Read {
     /// Forward pages are bounded in bytes as well as records; backward
-    /// pages, read newest first, keep the record bound only.
-    pub fn page(&self, db: &Db, cursor: u64, n: usize) -> chron::Result<Vec<Event>> {
+    /// pages, read newest first, keep the record bound only. Every page
+    /// is served below `upto` (the read's cap, `u64::MAX` for none).
+    pub fn page(&self, db: &Db, cursor: u64, n: usize, upto: u64) -> chron::Result<Vec<Event>> {
         let max_bytes = db.options().page_max_bytes;
         match self {
             Read::Aggregate {
                 id,
                 backward: false,
-            } => db.read_aggregate_bounded(*id, cursor, n, max_bytes),
-            Read::Aggregate { id, backward: true } => db.read_aggregate_backward(*id, cursor, n),
-            Read::All { backward: false } => db.read_all_bounded(cursor, n, max_bytes),
-            Read::All { backward: true } => db.read_all_backward(cursor, n),
+            } => db.read_aggregate_bounded_upto(*id, cursor, n, max_bytes, upto),
+            Read::Aggregate { id, backward: true } => {
+                db.read_aggregate_backward_upto(*id, cursor, n, upto)
+            }
+            Read::All { backward: false } => db.read_all_bounded_upto(cursor, n, max_bytes, upto),
+            Read::All { backward: true } => db.read_all_backward_upto(cursor, n, upto),
             Read::Tag {
                 tag,
                 backward: false,
-            } => db.read_tag_bounded(tag, cursor, n, max_bytes),
+            } => db.read_tag_bounded_upto(tag, cursor, n, max_bytes, upto),
             Read::Tag {
                 tag,
                 backward: true,
-            } => db.read_tag_backward(tag, cursor, n),
+            } => db.read_tag_backward_upto(tag, cursor, n, upto),
         }
     }
 
@@ -120,8 +221,9 @@ pub async fn read_page(
     read: Arc<Read>,
     cursor: u64,
     n: usize,
+    upto: u64,
 ) -> Result<Vec<Event>, Status> {
-    blocking(&dbn.db, "read", move |db| read.page(&db, cursor, n)).await
+    blocking(&dbn.db, "read", move |db| read.page(&db, cursor, n, upto)).await
 }
 
 /// Committed events from `from` (or those carrying `tag`), then live ones,
@@ -132,10 +234,12 @@ pub fn subscribe(
     dbn: Arc<DbNode>,
     from: u64,
     tag: Option<Vec<u8>>,
+    mode: Mode,
 ) -> ReceiverStream<Result<Event, Status>> {
     // The reset watch is taken before the subscription so a cut between
     // the two is not missed.
     let mut reset = dbn.reset.subscribe();
+    let mut conf = dbn.confirmed.subscribe();
     let mut sub = match tag {
         Some(tag) => dbn.db.subscribe_tag(tag, from),
         None => dbn.db.subscribe(from),
@@ -146,6 +250,10 @@ pub fn subscribe(
     let mut role = node.watch_role();
     tokio::spawn(async move {
         loop {
+            // Under the confirmed consistency the subscription is driven
+            // below the cap and, once it has delivered everything below
+            // it, waits for the bound to rise before asking again.
+            let upto = cap(&dbn, mode);
             let next = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
@@ -175,10 +283,34 @@ pub fn subscribe(
                     return;
                 }
                 _ = tx.closed() => return,
-                r = sub.next_async() => r,
+                r = sub.next_async_upto(upto) => r,
             };
             let item = match next {
-                Ok(ev) => Ok(ev),
+                Ok(Some(ev)) => Ok(ev),
+                Ok(None) => {
+                    // Everything below the cap went out: wait for the
+                    // bound to rise (the head rising alone changes nothing
+                    // under the confirmed consistency).
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            let _ = tx.send(Err(gone(&node, &dbn))).await;
+                            return;
+                        }
+                        r = role_lost(&mut role, false) => {
+                            let _ = tx.send(Err(ended(Some(r)))).await;
+                            return;
+                        }
+                        _ = tx.closed() => return,
+                        alive = confirmed_above(&mut conf, upto) => {
+                            if !alive {
+                                let _ = tx.send(Err(gone(&node, &dbn))).await;
+                                return;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 Err(e) => {
                     let _ = tx.send(Err(codec::status(e))).await;
                     return;
@@ -190,6 +322,12 @@ pub fn subscribe(
         }
     });
     ReceiverStream::new(rx)
+}
+
+/// Waits until the confirmed watch rises above `upto`; false once the
+/// sender is gone (the database was dropped).
+async fn confirmed_above(rx: &mut watch::Receiver<u64>, upto: u64) -> bool {
+    rx.wait_for(|c| *c > upto).await.is_ok()
 }
 
 /// The whole commit: the guarded write on the blocking pool, then, when
@@ -312,6 +450,8 @@ pub async fn info(node: &Node, dbn: &DbNode) -> Result<pb::InfoResponse, Status>
             Vec::new()
         },
         sync_commit: node.wants_sync(None),
+        confirmed: node.cluster.is_some().then(|| cap(dbn, Mode::Confirmed)),
+        read_consistency: node.read_mode(pb::Consistency::Unspecified).wire() as i32,
         members_version: members.current.version,
         members_epoch: members.current.epoch,
         members_committed: members.committed,

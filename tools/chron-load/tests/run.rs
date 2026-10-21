@@ -54,6 +54,7 @@ async fn a_short_run_finds_no_violation() {
         killer: None,
         sync: None,
         in_flight: in_flight(),
+        local: false,
     })
     .await
     .unwrap();
@@ -133,6 +134,7 @@ async fn a_run_with_the_leader_killed_finds_no_violation() {
             killer: Some(killer),
             sync,
             in_flight: in_flight(),
+            local: false,
         })
         .await
         .unwrap();
@@ -181,6 +183,7 @@ async fn a_short_pipelined_run_finds_no_violation() {
         killer: None,
         sync: None,
         in_flight: 8,
+        local: false,
     })
     .await
     .unwrap();

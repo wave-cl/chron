@@ -77,6 +77,18 @@ pub enum ClientError {
     /// named a reachable leader.
     #[error("no leader: {0}")]
     NoLeader(String),
+    /// A read with `at_least` waited its timeout out: the bound under the
+    /// read's consistency stayed at `position`, below what was asked
+    /// (`head` is the node's head). Nothing was read.
+    #[error("the bound is {position} (head {head}): {message}")]
+    BoundTimeout {
+        /// The bound (local or confirmed) when the wait ended.
+        position: u64,
+        /// The node's head then.
+        head: u64,
+        /// The daemon's message.
+        message: String,
+    },
     /// A sync commit landed on the leader's disk but a majority did not
     /// confirm it in time (or the node stopped leading first). It is at
     /// `first..next` there and replicates unless the node dies. With a
@@ -167,6 +179,18 @@ impl From<Status> for ClientError {
                 ClientError::Unconfirmed {
                     first,
                     next,
+                    message: s.message().to_string(),
+                }
+            }
+            Code::DeadlineExceeded
+                if let (Some(position), Some(head)) = (
+                    header::<u64>(&s, chron_proto::POSITION_HEADER),
+                    header::<u64>(&s, chron_proto::HEAD_HEADER),
+                ) =>
+            {
+                ClientError::BoundTimeout {
+                    position,
+                    head,
                     message: s.message().to_string(),
                 }
             }

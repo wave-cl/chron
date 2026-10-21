@@ -305,6 +305,7 @@ async fn a_vote_survives_a_restart_and_a_deleted_marker_does_not() {
             head: 0,
             lease_ttl_ms: 1000,
             members: None,
+            confirmed: Vec::new(),
         };
         assert!(
             !client.heartbeat(hb_other).await.unwrap().ok,
@@ -330,6 +331,7 @@ async fn a_vote_survives_a_restart_and_a_deleted_marker_does_not() {
                 head: 0,
                 lease_ttl_ms: 1000,
                 members: None,
+                confirmed: Vec::new(),
             };
             assert!(!client.heartbeat(hb(4)).await.unwrap().ok);
             assert!(client.heartbeat(hb(5)).await.unwrap().ok);
@@ -360,6 +362,7 @@ async fn a_node_without_peers_leads_alone_and_refuses_cluster_calls() {
             head: 0,
             lease_ttl_ms: 1000,
             members: None,
+            confirmed: Vec::new(),
         })
         .await;
     assert!(
@@ -834,8 +837,16 @@ async fn a_replica_below_the_leaders_floor_restores_itself() {
             assert_eq!((info.head, info.floor), (200, floor), "node {i}");
             assert!(info.replica_connected);
             let (a, b) = (
-                c.client(i).await.read_all(floor, 0).await.unwrap(),
-                c.client(l).await.read_all(floor, 0).await.unwrap(),
+                c.client(i)
+                    .await
+                    .read_all_with(floor, 0, chrond::testing::local_read())
+                    .await
+                    .unwrap(),
+                c.client(l)
+                    .await
+                    .read_all_with(floor, 0, chrond::testing::local_read())
+                    .await
+                    .unwrap(),
             );
             assert_eq!(
                 a.iter().map(|e| e.payload.clone()).collect::<Vec<_>>(),
@@ -1087,7 +1098,12 @@ async fn a_commit_id_lands_once_across_a_leader_death() {
     assert_eq!((fresh.first, fresh.duplicate), (1, false));
     c.hold_apply(f, false);
     c.hold_apply(l1, false);
-    let log = c.client(l3).await.read_all(0, 0).await.unwrap();
+    let log = c
+        .client(l3)
+        .await
+        .read_all_with(0, 0, chrond::testing::local_read())
+        .await
+        .unwrap();
     let lost: Vec<_> = log.iter().filter(|e| e.payload == "lost").collect();
     assert_eq!(lost.len(), 1, "exactly one copy");
     assert_eq!(log.iter().filter(|e| e.payload == "replicated").count(), 1);

@@ -191,7 +191,12 @@ async fn removing_the_leader_elects_another_and_the_old_one_is_removed() {
     })
     .await;
     assert_eq!(
-        c.client(l).await.read_all(0, 0).await.unwrap().len() as u64,
+        c.client(l)
+            .await
+            .read_all_with(0, 0, chrond::testing::local_read())
+            .await
+            .unwrap()
+            .len() as u64,
         after + 1
     );
     let st = c.client(l).await.members().await.unwrap();
@@ -294,6 +299,7 @@ async fn a_lagging_node_learns_the_membership_from_a_heartbeat_and_refuses_an_ol
         head: 0,
         lease_ttl_ms: 1000,
         members,
+        confirmed: Vec::new(),
     };
     // A higher generation is persisted before the acknowledgment.
     let r = client
@@ -368,6 +374,7 @@ async fn a_non_member_cannot_heartbeat_or_be_voted_for() {
         head: 0,
         lease_ttl_ms: 1000,
         members: None,
+        confirmed: Vec::new(),
     };
     let r = client.heartbeat(hb("http://z:1")).await.unwrap();
     assert!(!r.ok, "{r:?}");
@@ -526,7 +533,12 @@ async fn a_change_waits_until_the_new_majority_holds_every_confirmed_write() {
             );
             c.restart(b).await;
             let l = c.wait_for_leader(3 * SOON).await;
-            let log = c.client(l).await.read_all(0, 0).await.unwrap();
+            let log = c
+                .client(l)
+                .await
+                .read_all_with(0, 0, chrond::testing::local_read())
+                .await
+                .unwrap();
             assert_eq!(log[0].payload, "w", "{}", c.describe());
         }
         for i in [cc, d, e] {

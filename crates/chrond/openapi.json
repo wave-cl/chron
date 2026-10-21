@@ -667,6 +667,33 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "consistency",
+            "in": "query",
+            "required": false,
+            "description": "local (everything the node holds) or confirmed (only positions a majority of the group durably holds); absent: the daemon's default (--read-consistency; confirmed when sync commits are in effect)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "at_least",
+            "in": "query",
+            "required": false,
+            "description": "wait until the bound under the consistency reaches this position before answering (read your writes: a commit's next)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "wait_ms",
+            "in": "query",
+            "required": false,
+            "description": "how long at_least may wait; absent: the daemon's sync timeout, 0: fail at once (504 with the bound in position)",
+            "schema": {
+              "type": "integer"
+            }
           }
         ]
       }
@@ -743,6 +770,33 @@
             "description": "newest first",
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "name": "consistency",
+            "in": "query",
+            "required": false,
+            "description": "local (everything the node holds) or confirmed (only positions a majority of the group durably holds); absent: the daemon's default (--read-consistency; confirmed when sync commits are in effect)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "at_least",
+            "in": "query",
+            "required": false,
+            "description": "wait until the bound under the consistency reaches this position before answering (read your writes: a commit's next)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "wait_ms",
+            "in": "query",
+            "required": false,
+            "description": "how long at_least may wait; absent: the daemon's sync timeout, 0: fail at once (504 with the bound in position)",
+            "schema": {
+              "type": "integer"
             }
           }
         ]
@@ -882,13 +936,40 @@
               "type": "string"
             },
             "description": "a binary tag, base64; pass - as the path's tag"
+          },
+          {
+            "name": "consistency",
+            "in": "query",
+            "required": false,
+            "description": "local (everything the node holds) or confirmed (only positions a majority of the group durably holds); absent: the daemon's default (--read-consistency; confirmed when sync commits are in effect)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "at_least",
+            "in": "query",
+            "required": false,
+            "description": "wait until the bound under the consistency reaches this position before answering (read your writes: a commit's next)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "wait_ms",
+            "in": "query",
+            "required": false,
+            "description": "how long at_least may wait; absent: the daemon's sync timeout, 0: fail at once (504 with the bound in position)",
+            "schema": {
+              "type": "integer"
+            }
           }
         ]
       }
     },
     "/v1/db/{db}/head": {
       "get": {
-        "summary": "The next global position",
+        "summary": "The next global position: the bound under the consistency, and both bounds",
         "responses": {
           "200": {
             "description": "ok",
@@ -899,6 +980,14 @@
                   "properties": {
                     "head": {
                       "type": "integer"
+                    },
+                    "confirmed": {
+                      "type": "integer",
+                      "description": "positions a majority durably holds (the head without peers)"
+                    },
+                    "local": {
+                      "type": "integer",
+                      "description": "everything the node holds"
                     }
                   }
                 }
@@ -924,6 +1013,33 @@
             "description": "the database name",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "consistency",
+            "in": "query",
+            "required": false,
+            "description": "local (everything the node holds) or confirmed (only positions a majority of the group durably holds); absent: the daemon's default (--read-consistency; confirmed when sync commits are in effect)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "at_least",
+            "in": "query",
+            "required": false,
+            "description": "wait until the bound under the consistency reaches this position before answering (read your writes: a commit's next)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "wait_ms",
+            "in": "query",
+            "required": false,
+            "description": "how long at_least may wait; absent: the daemon's sync timeout, 0: fail at once (504 with the bound in position)",
+            "schema": {
+              "type": "integer"
             }
           }
         ]
@@ -1029,6 +1145,15 @@
               "type": "string"
             },
             "description": "a binary tag, base64, instead of tag"
+          },
+          {
+            "name": "consistency",
+            "in": "query",
+            "required": false,
+            "description": "local (everything the node holds) or confirmed (only positions a majority of the group durably holds); absent: the daemon's default (--read-consistency; confirmed when sync commits are in effect)",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "description": " The stream is text/event-stream: one data: line of JSON per event, a `: heartbeat` comment every 15 s, and a final event: error when the database is dropped, cut back to an earlier position (a diverged node resetting; its JSON carries position), the node fenced or the daemon stops."

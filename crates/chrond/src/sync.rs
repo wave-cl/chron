@@ -3,8 +3,8 @@
 //! and the wait a sync commit makes for it.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chron::Committed;
@@ -35,6 +35,9 @@ struct Follower {
 pub struct SyncState {
     peers: Mutex<HashMap<String, Follower>>,
     majority: watch::Sender<u64>,
+    /// The database's confirmed bound (`DbNode::confirmed`), raised with
+    /// the majority; unlike `majority` it survives `reset`.
+    confirmed: Arc<watch::Sender<u64>>,
     next_id: AtomicU64,
 }
 
@@ -46,9 +49,15 @@ impl Default for SyncState {
 
 impl SyncState {
     pub fn new() -> SyncState {
+        Self::with_confirmed(Arc::new(watch::Sender::new(0)))
+    }
+
+    /// A state that raises `confirmed` whenever the majority rises.
+    pub fn with_confirmed(confirmed: Arc<watch::Sender<u64>>) -> SyncState {
         SyncState {
             peers: Mutex::new(HashMap::new()),
             majority: watch::Sender::new(0),
+            confirmed,
             next_id: AtomicU64::new(1),
         }
     }
@@ -95,14 +104,16 @@ impl SyncState {
     /// change) and publishes it if it rose.
     pub fn publish(&self, own_head: u64, members: &Members, self_counted: bool) {
         let m = self.majority_for_head(own_head, members, self_counted);
-        self.majority.send_if_modified(|cur| {
+        let rise = |cur: &mut u64| {
             if m > *cur {
                 *cur = m;
                 true
             } else {
                 false
             }
-        });
+        };
+        self.majority.send_if_modified(rise);
+        self.confirmed.send_if_modified(rise);
     }
 
     /// The highest position a majority of `members` durably holds, from

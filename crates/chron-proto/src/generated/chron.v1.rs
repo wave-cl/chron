@@ -131,6 +131,11 @@ pub struct CommitResponse {
 /// For every finite read, `limit` 0 means "to the end". Forward, `from` is
 /// the first index or position returned; backward, the inclusive upper
 /// bound, newest first, and the maximum uint64 means "from the end".
+/// `at_least` makes the call wait until the bound under `consistency`
+/// reaches that position (read your writes: a commit's `next`), at most
+/// `wait_timeout_ms` (absent: the daemon's --sync-timeout; 0: do not
+/// wait); past it the answer is DEADLINE_EXCEEDED with the bound in the
+/// `chron-position` header and the head in `chron-head`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadAggregateRequest {
     #[prost(bytes = "vec", tag = "1")]
@@ -141,6 +146,12 @@ pub struct ReadAggregateRequest {
     pub limit: u64,
     #[prost(bool, tag = "4")]
     pub backward: bool,
+    #[prost(enumeration = "Consistency", tag = "5")]
+    pub consistency: i32,
+    #[prost(uint64, optional, tag = "6")]
+    pub at_least: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "7")]
+    pub wait_timeout_ms: ::core::option::Option<u64>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadAllRequest {
@@ -150,6 +161,12 @@ pub struct ReadAllRequest {
     pub limit: u64,
     #[prost(bool, tag = "3")]
     pub backward: bool,
+    #[prost(enumeration = "Consistency", tag = "4")]
+    pub consistency: i32,
+    #[prost(uint64, optional, tag = "5")]
+    pub at_least: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "6")]
+    pub wait_timeout_ms: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadTagRequest {
@@ -161,6 +178,12 @@ pub struct ReadTagRequest {
     pub limit: u64,
     #[prost(bool, tag = "4")]
     pub backward: bool,
+    #[prost(enumeration = "Consistency", tag = "5")]
+    pub consistency: i32,
+    #[prost(uint64, optional, tag = "6")]
+    pub at_least: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "7")]
+    pub wait_timeout_ms: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AggregateLenRequest {
@@ -172,22 +195,38 @@ pub struct AggregateLenResponse {
     #[prost(uint64, tag = "1")]
     pub len: u64,
 }
+/// `head` answers the bound under the effective consistency; `confirmed`
+/// and `local` are both bounds whatever was asked.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct HeadRequest {}
+pub struct HeadRequest {
+    #[prost(enumeration = "Consistency", tag = "1")]
+    pub consistency: i32,
+    #[prost(uint64, optional, tag = "2")]
+    pub at_least: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "3")]
+    pub wait_timeout_ms: ::core::option::Option<u64>,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HeadResponse {
     #[prost(uint64, tag = "1")]
     pub head: u64,
+    #[prost(uint64, tag = "2")]
+    pub confirmed: u64,
+    #[prost(uint64, tag = "3")]
+    pub local: u64,
 }
 /// Events from `from` (which may be past the head: the stream then waits
 /// for it), then live ones as they are committed. With `tag`, only events
-/// carrying it. Never ends on its own.
+/// carrying it. Never ends on its own. Under CONFIRMED an event is
+/// delivered once a majority holds it.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SubscribeRequest {
     #[prost(uint64, tag = "1")]
     pub from: u64,
     #[prost(bytes = "vec", optional, tag = "2")]
     pub tag: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(enumeration = "Consistency", tag = "3")]
+    pub consistency: i32,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FlushRequest {}
@@ -272,6 +311,12 @@ pub struct InfoResponse {
     pub members_version: u64,
     #[prost(uint64, tag = "25")]
     pub members_epoch: u64,
+    /// The confirmed bound (see Consistency) on a node with peers, and the
+    /// consistency reads get when they do not say.
+    #[prost(uint64, optional, tag = "28")]
+    pub confirmed: ::core::option::Option<u64>,
+    #[prost(enumeration = "Consistency", tag = "29")]
+    pub read_consistency: i32,
     /// On a leader: whether that generation is committed (a majority of it
     /// holds it and everything confirmed before it was made).
     #[prost(bool, tag = "26")]
@@ -395,7 +440,7 @@ pub mod follow_request {
 }
 /// A leader with peers tells each of them, every third of the lease, that
 /// it leads under `epoch`. An admin call.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HeartbeatRequest {
     #[prost(uint64, tag = "1")]
     pub epoch: u64,
@@ -409,6 +454,10 @@ pub struct HeartbeatRequest {
     /// (persisting it before acknowledging), one ahead refuses.
     #[prost(message, optional, tag = "5")]
     pub members: ::core::option::Option<Members>,
+    /// Per database, the highest position a majority durably holds, so a
+    /// follower's confirmed reads keep up when no chunk is flowing.
+    #[prost(message, repeated, tag = "6")]
+    pub confirmed: ::prost::alloc::vec::Vec<DatabaseHead>,
 }
 /// `ok` acknowledges the lease; `epoch` is the answering node's own, so a
 /// leader learns of a newer one; `members` is the answering node's
@@ -636,6 +685,10 @@ pub struct ReplicationChunk {
     pub head: u64,
     #[prost(uint64, tag = "6")]
     pub epoch: u64,
+    /// The highest position a majority durably held when the chunk was
+    /// cut: the follower's confirmed bound.
+    #[prost(uint64, tag = "8")]
+    pub confirmed: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PromoteRequest {}
@@ -710,6 +763,41 @@ impl Role {
             "ROLE_FENCED" => Some(Self::Fenced),
             "ROLE_CANDIDATE" => Some(Self::Candidate),
             "ROLE_REMOVED" => Some(Self::Removed),
+            _ => None,
+        }
+    }
+}
+/// What a read, head or subscription may see. LOCAL: everything this
+/// node holds. CONFIRMED: only positions a majority of the failover
+/// group durably holds, so nothing a leader's death can erase; the same
+/// as LOCAL on a node without peers or with sync commits off.
+/// UNSPECIFIED: the daemon's default (--read-consistency; confirmed when
+/// sync commits are in effect).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Consistency {
+    Unspecified = 0,
+    Local = 1,
+    Confirmed = 2,
+}
+impl Consistency {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CONSISTENCY_UNSPECIFIED",
+            Self::Local => "CONSISTENCY_LOCAL",
+            Self::Confirmed => "CONSISTENCY_CONFIRMED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CONSISTENCY_UNSPECIFIED" => Some(Self::Unspecified),
+            "CONSISTENCY_LOCAL" => Some(Self::Local),
+            "CONSISTENCY_CONFIRMED" => Some(Self::Confirmed),
             _ => None,
         }
     }

@@ -105,7 +105,11 @@ async fn the_endpoint_reports_calls_commits_and_gauges() {
     assert_eq!(all.len(), 3);
     let mut sub = s
         .client
-        .subscribe(pb::SubscribeRequest { from: 0, tag: None })
+        .subscribe(pb::SubscribeRequest {
+            from: 0,
+            tag: None,
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner();

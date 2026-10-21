@@ -13,7 +13,11 @@ async fn subscribe_catches_up_then_streams_live() {
     fill(&mut s.client, agg(1), 3).await;
     let mut stream = s
         .client
-        .subscribe(pb::SubscribeRequest { from: 0, tag: None })
+        .subscribe(pb::SubscribeRequest {
+            from: 0,
+            tag: None,
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner();
@@ -89,6 +93,7 @@ async fn subscribe_tag_filters_and_from_past_head_waits() {
         .subscribe(pb::SubscribeRequest {
             from: 0,
             tag: Some(b"t".to_vec()),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -112,7 +117,11 @@ async fn subscribe_tag_filters_and_from_past_head_waits() {
 
     let mut ahead = s
         .client
-        .subscribe(pb::SubscribeRequest { from: 5, tag: None })
+        .subscribe(pb::SubscribeRequest {
+            from: 5,
+            tag: None,
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner();
@@ -136,7 +145,11 @@ async fn subscribe_stream_ends_on_shutdown() {
     let mut s = Server::start().await;
     let mut stream = s
         .client
-        .subscribe(pb::SubscribeRequest { from: 0, tag: None })
+        .subscribe(pb::SubscribeRequest {
+            from: 0,
+            tag: None,
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner();

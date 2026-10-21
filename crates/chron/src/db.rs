@@ -398,7 +398,7 @@ impl Db {
         let found = self
             .inner
             .index
-            .aggregate_positions(&txn, &id, from_index, limit)?;
+            .aggregate_positions(&txn, &id, from_index, limit, u64::MAX)?;
         self.assemble_aggregate(&txn, id, found)
     }
 
@@ -411,12 +411,30 @@ impl Db {
         from_index: u64,
         limit: usize,
     ) -> Result<Vec<Event>> {
+        self.read_aggregate_backward_upto(id, from_index, limit, u64::MAX)
+    }
+
+    /// [`read_aggregate_backward`](Db::read_aggregate_backward) over the
+    /// events at positions below `upto` only.
+    ///
+    /// The `_upto` reads take an exclusive cap on the global position,
+    /// `u64::MAX` for none: a daemon serving only what a majority of its
+    /// group holds caps every read at that bound. The cap is applied
+    /// inside the index snapshot, so a position the cap excludes is never
+    /// returned even though the snapshot holds it.
+    pub fn read_aggregate_backward_upto(
+        &self,
+        id: Uuid,
+        from_index: u64,
+        limit: usize,
+        upto: u64,
+    ) -> Result<Vec<Event>> {
         let limit = all_if_zero(limit);
         let txn = self.inner.index.begin_read()?;
         let found = self
             .inner
             .index
-            .aggregate_positions_rev(&txn, &id, from_index, limit)?;
+            .aggregate_positions_rev(&txn, &id, from_index, limit, upto)?;
         self.assemble_aggregate(&txn, id, found)
     }
 
@@ -470,7 +488,22 @@ impl Db {
         limit: usize,
         max_bytes: usize,
     ) -> Result<Vec<Event>> {
-        Ok(self.all_page(from, limit, max_bytes)?.events)
+        self.read_all_bounded_upto(from, limit, max_bytes, u64::MAX)
+    }
+
+    /// [`read_all_bounded`](Db::read_all_bounded) over the positions
+    /// below `upto` only (see
+    /// [`read_aggregate_backward_upto`](Db::read_aggregate_backward_upto)).
+    /// `from` past `min(head, upto)` is [`Error::PositionOutOfRange`] with
+    /// that bound as its `head`.
+    pub fn read_all_bounded_upto(
+        &self,
+        from: u64,
+        limit: usize,
+        max_bytes: usize,
+        upto: u64,
+    ) -> Result<Vec<Event>> {
+        Ok(self.all_page(from, limit, max_bytes, upto)?.events)
     }
 
     /// [`read_aggregate`](Db::read_aggregate) cut at `max_bytes` like
@@ -482,8 +515,21 @@ impl Db {
         limit: usize,
         max_bytes: usize,
     ) -> Result<Vec<Event>> {
+        self.read_aggregate_bounded_upto(id, from_index, limit, max_bytes, u64::MAX)
+    }
+
+    /// [`read_aggregate_bounded`](Db::read_aggregate_bounded) over the
+    /// events at positions below `upto` only.
+    pub fn read_aggregate_bounded_upto(
+        &self,
+        id: Uuid,
+        from_index: u64,
+        limit: usize,
+        max_bytes: usize,
+        upto: u64,
+    ) -> Result<Vec<Event>> {
         Ok(self
-            .aggregate_page(id, from_index, limit, max_bytes)?
+            .aggregate_page(id, from_index, limit, max_bytes, upto)?
             .events)
     }
 
@@ -496,15 +542,37 @@ impl Db {
         limit: usize,
         max_bytes: usize,
     ) -> Result<Vec<Event>> {
-        Ok(self.tag_page(tag.as_ref(), from, limit, max_bytes)?.events)
+        self.read_tag_bounded_upto(tag, from, limit, max_bytes, u64::MAX)
     }
 
-    /// A forward page of the global order, bounded by `limit` records and
-    /// `max_bytes`. `exhausted` says the read reached the end of what the
-    /// snapshot held (no cut by either bound).
-    pub(crate) fn all_page(&self, from: u64, limit: usize, max_bytes: usize) -> Result<Page> {
+    /// [`read_tag_bounded`](Db::read_tag_bounded) over the events at
+    /// positions below `upto` only.
+    pub fn read_tag_bounded_upto(
+        &self,
+        tag: impl AsRef<[u8]>,
+        from: u64,
+        limit: usize,
+        max_bytes: usize,
+        upto: u64,
+    ) -> Result<Vec<Event>> {
+        Ok(self
+            .tag_page(tag.as_ref(), from, limit, max_bytes, upto)?
+            .events)
+    }
+
+    /// A forward page of the global order, bounded by `limit` records,
+    /// `max_bytes` and the positions below `upto`. `exhausted` says the
+    /// read reached the end of what the snapshot held below
+    /// `min(head, upto)` (no cut by the record or byte bound).
+    pub(crate) fn all_page(
+        &self,
+        from: u64,
+        limit: usize,
+        max_bytes: usize,
+        upto: u64,
+    ) -> Result<Page> {
         let limit = all_if_zero(limit);
-        let head = self.head();
+        let head = self.head().min(upto);
         if from > head {
             return Err(Error::PositionOutOfRange {
                 position: from,
@@ -525,7 +593,7 @@ impl Db {
                 exhausted: true,
             });
         }
-        let mut found = self.inner.index.positions_from(&txn, from, limit)?;
+        let mut found = self.inner.index.positions_from(&txn, from, limit, upto)?;
         let short = found.len() < limit;
         let cut = cut_by_bytes(&mut found, |(_, l)| u64::from(l.frame_len), max_bytes);
         Ok(Page {
@@ -541,13 +609,14 @@ impl Db {
         from_index: u64,
         limit: usize,
         max_bytes: usize,
+        upto: u64,
     ) -> Result<Page> {
         let limit = all_if_zero(limit);
         let txn = self.inner.index.begin_read()?;
         let found = self
             .inner
             .index
-            .aggregate_positions(&txn, &id, from_index, limit)?;
+            .aggregate_positions(&txn, &id, from_index, limit, upto)?;
         let short = found.len() < limit;
         let positions: Vec<u64> = found.iter().map(|(_, p)| *p).collect();
         let locations = Index::locate_many(&txn, &positions)?;
@@ -573,10 +642,14 @@ impl Db {
         from: u64,
         limit: usize,
         max_bytes: usize,
+        upto: u64,
     ) -> Result<Page> {
         let limit = all_if_zero(limit);
         let txn = self.inner.index.begin_read()?;
-        let positions = self.inner.index.tag_positions(&txn, tag, from, limit)?;
+        let positions = self
+            .inner
+            .index
+            .tag_positions(&txn, tag, from, limit, upto)?;
         let short = positions.len() < limit;
         let locations = Index::locate_many(&txn, &positions)?;
         let mut items: Vec<(u64, Option<Location>)> =
@@ -628,7 +701,7 @@ impl Db {
         let found = self
             .inner
             .index
-            .positions_from(&txn, from, all_if_zero(limit))?;
+            .positions_from(&txn, from, all_if_zero(limit), u64::MAX)?;
         self.read_runs(&found)
     }
 
@@ -636,10 +709,19 @@ impl Db {
     /// is clamped to the newest event, so `u64::MAX` means "from the end";
     /// empty when there are no events.
     pub fn read_all_backward(&self, from: u64, limit: usize) -> Result<Vec<Event>> {
+        self.read_all_backward_upto(from, limit, u64::MAX)
+    }
+
+    /// [`read_all_backward`](Db::read_all_backward) over the positions
+    /// below `upto` only.
+    pub fn read_all_backward_upto(&self, from: u64, limit: usize, upto: u64) -> Result<Vec<Event>> {
         let limit = all_if_zero(limit);
         let txn = self.inner.index.begin_read()?;
         let floor = Index::floor_in(&txn)?;
-        let mut found = self.inner.index.positions_to(&txn, floor, from, limit)?;
+        let mut found = self
+            .inner
+            .index
+            .positions_to(&txn, floor, from, limit, upto)?;
         found.reverse();
         let mut out = self.read_runs(&found)?;
         out.reverse();
@@ -652,7 +734,10 @@ impl Db {
         let tag = tag.as_ref();
         let limit = all_if_zero(limit);
         let txn = self.inner.index.begin_read()?;
-        let positions = self.inner.index.tag_positions(&txn, tag, from, limit)?;
+        let positions = self
+            .inner
+            .index
+            .tag_positions(&txn, tag, from, limit, u64::MAX)?;
         self.assemble_tag(&txn, tag, positions)
     }
 
@@ -664,10 +749,25 @@ impl Db {
         from: u64,
         limit: usize,
     ) -> Result<Vec<Event>> {
+        self.read_tag_backward_upto(tag, from, limit, u64::MAX)
+    }
+
+    /// [`read_tag_backward`](Db::read_tag_backward) over the events at
+    /// positions below `upto` only.
+    pub fn read_tag_backward_upto(
+        &self,
+        tag: impl AsRef<[u8]>,
+        from: u64,
+        limit: usize,
+        upto: u64,
+    ) -> Result<Vec<Event>> {
         let tag = tag.as_ref();
         let limit = all_if_zero(limit);
         let txn = self.inner.index.begin_read()?;
-        let positions = self.inner.index.tag_positions_rev(&txn, tag, from, limit)?;
+        let positions = self
+            .inner
+            .index
+            .tag_positions_rev(&txn, tag, from, limit, upto)?;
         self.assemble_tag(&txn, tag, positions)
     }
 
@@ -1034,9 +1134,14 @@ impl EventIter {
     fn fill(&mut self) -> Result<()> {
         let max_bytes = self.db.inner.opts.page_max_bytes;
         let page = match &self.what {
-            Paged::All => self.db.all_page(self.cursor, PAGE, max_bytes)?,
-            Paged::Aggregate(id) => self.db.aggregate_page(*id, self.cursor, PAGE, max_bytes)?,
-            Paged::Tag(tag) => self.db.tag_page(tag, self.cursor, PAGE, max_bytes)?,
+            Paged::All => self.db.all_page(self.cursor, PAGE, max_bytes, u64::MAX)?,
+            Paged::Aggregate(id) => {
+                self.db
+                    .aggregate_page(*id, self.cursor, PAGE, max_bytes, u64::MAX)?
+            }
+            Paged::Tag(tag) => self
+                .db
+                .tag_page(tag, self.cursor, PAGE, max_bytes, u64::MAX)?,
         };
         if page.exhausted {
             self.done = true;

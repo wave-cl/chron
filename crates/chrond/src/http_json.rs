@@ -251,6 +251,7 @@ pub fn info_json(i: &pb::InfoResponse) -> Value {
         "leader_addr": i.leader_addr, "lease_remaining_ms": i.lease_remaining_ms,
         "peers": i.peers, "voted_epoch": i.voted_epoch,
         "majority_applied": i.majority_applied, "sync_commit": i.sync_commit,
+        "confirmed": i.confirmed, "read_consistency": consistency_name(i.read_consistency),
         "followers": i.followers.iter().map(|f| json!({
             "peer": f.peer, "applied": f.applied, "durable": f.durable, "counted": f.counted,
         })).collect::<Vec<_>>(),
@@ -348,6 +349,30 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (http_status(self.0.code()), Json(error_json(&self.0))).into_response()
     }
+}
+
+/// The JSON name of a wire consistency.
+pub fn consistency_name(c: i32) -> &'static str {
+    match pb::Consistency::try_from(c).unwrap_or(pb::Consistency::Unspecified) {
+        pb::Consistency::Local => "local",
+        pb::Consistency::Confirmed => "confirmed",
+        pb::Consistency::Unspecified => "default",
+    }
+}
+
+/// A `?consistency=` value: `local`, `confirmed`, or absent for the
+/// daemon's default.
+pub fn consistency_from_query(s: Option<&str>) -> Result<pb::Consistency, Status> {
+    Ok(match s {
+        None => pb::Consistency::Unspecified,
+        Some("local") => pb::Consistency::Local,
+        Some("confirmed") => pb::Consistency::Confirmed,
+        Some(other) => {
+            return Err(Status::invalid_argument(format!(
+                "consistency {other:?}: expected local or confirmed"
+            )));
+        }
+    })
 }
 
 #[cfg(test)]

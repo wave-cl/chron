@@ -202,6 +202,61 @@ mod tokio_api {
         assert_eq!(positions(&got), (0..10).collect::<Vec<_>>());
     }
 
+    /// A capped subscription delivers everything below the cap, says so
+    /// with `None`, and resumes from where it stopped when the cap rises,
+    /// skipping nothing between the cap and the head.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_async_upto_yields_none_at_the_cap_and_resumes() {
+        let d = tmp();
+        let db = open(d.path());
+        fill(&db, agg(1), 5);
+        let mut sub = db.subscribe(0);
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            got.push(
+                tokio::time::timeout(LIVE, sub.next_async_upto(2))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert!(
+            tokio::time::timeout(LIVE, sub.next_async_upto(2))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none(),
+            "everything below the cap went out"
+        );
+        assert_eq!(sub.position(), 2);
+        fill(&db, agg(1), 3);
+        assert!(
+            tokio::time::timeout(LIVE, sub.next_async_upto(2))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none(),
+            "the head rising changes nothing below the cap"
+        );
+        for _ in 0..3 {
+            got.push(
+                tokio::time::timeout(LIVE, sub.next_async_upto(5))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(positions(&got), (0..5).collect::<Vec<_>>());
+        let past = tokio::time::timeout(LIVE, sub.next_async_upto(u64::MAX))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(past.position, 5, "uncapped, the rest follows at once");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn next_async_is_cancel_safe() {
         let d = tmp();

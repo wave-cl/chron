@@ -233,3 +233,90 @@ fn empty_transaction_and_empty_append() {
     assert_eq!(db.head(), 0);
     assert_eq!(db.aggregate_len(agg(1)).unwrap(), 0);
 }
+
+/// The `_upto` reads serve only positions below the cap: the daemon
+/// uses them to show a reader nothing a majority does not hold yet.
+#[test]
+fn read_all_bounded_upto_stops_below_the_cap() {
+    let d = tmp();
+    let db = open(d.path());
+    fill(&db, agg(1), 10);
+    let got = db.read_all_bounded_upto(0, 0, usize::MAX, 4).unwrap();
+    assert_eq!(positions(&got), [0, 1, 2, 3]);
+    assert!(
+        db.read_all_bounded_upto(4, 0, usize::MAX, 4)
+            .unwrap()
+            .is_empty()
+    );
+    match db.read_all_bounded_upto(5, 0, usize::MAX, 4) {
+        Err(Error::PositionOutOfRange {
+            position: 5,
+            head: 4,
+        }) => {}
+        other => panic!("past the cap: {other:?}"),
+    }
+    // The record limit and the cap compose; a cap past the head is the
+    // head.
+    assert_eq!(
+        positions(&db.read_all_bounded_upto(1, 2, usize::MAX, 4).unwrap()),
+        [1, 2]
+    );
+    assert_eq!(
+        positions(&db.read_all_bounded_upto(7, 0, usize::MAX, 100).unwrap()),
+        [7, 8, 9]
+    );
+    // Backward: nothing at or past the cap.
+    assert_eq!(
+        positions(&db.read_all_backward_upto(u64::MAX, 2, 4).unwrap()),
+        [3, 2]
+    );
+    assert!(
+        db.read_all_backward_upto(u64::MAX, 2, 0)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn tag_and_aggregate_reads_stop_below_the_cap() {
+    let d = tmp();
+    let db = open(d.path());
+    for i in 0..6u64 {
+        let mut t = db.transaction();
+        t.append_one(agg(1), Expected::Exact(i), tagged(&format!("e{i}"), &["t"]));
+        t.commit().unwrap();
+    }
+    let max = usize::MAX;
+    assert_eq!(
+        positions(&db.read_tag_bounded_upto("t", 0, 0, max, 3).unwrap()),
+        [0, 1, 2]
+    );
+    assert!(
+        db.read_tag_bounded_upto("t", 3, 0, max, 3)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        positions(&db.read_tag_backward_upto("t", u64::MAX, 0, 3).unwrap()),
+        [2, 1, 0]
+    );
+    assert_eq!(
+        positions(
+            &db.read_aggregate_bounded_upto(agg(1), 0, 0, max, 3)
+                .unwrap()
+        ),
+        [0, 1, 2]
+    );
+    assert_eq!(
+        indices(
+            &db.read_aggregate_backward_upto(agg(1), u64::MAX, 0, 3)
+                .unwrap()
+        ),
+        [2, 1, 0]
+    );
+    assert!(
+        db.read_aggregate_bounded_upto(agg(1), 3, 0, max, 3)
+            .unwrap()
+            .is_empty()
+    );
+}

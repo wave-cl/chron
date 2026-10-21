@@ -1,4 +1,6 @@
-use chron_client::EventStream;
+use std::time::Duration;
+
+use chron_client::{EventStream, ReadOptions};
 use clap::Args;
 use tokio_stream::StreamExt;
 
@@ -18,12 +20,34 @@ pub struct Range {
     /// Newest first.
     #[arg(long)]
     backward: bool,
+    /// Wait until the node's bound (under --local/--confirmed) reaches
+    /// this position before reading: a commit's `next`, to read your
+    /// own write.
+    #[arg(long)]
+    at_least: Option<u64>,
+    /// Seconds --at-least may wait (default: the daemon's sync timeout;
+    /// 0 fails at once).
+    #[arg(long, requires = "at_least")]
+    wait: Option<f64>,
 }
 
 impl Range {
     fn from(&self) -> u64 {
         self.from
             .unwrap_or(if self.backward { u64::MAX } else { 0 })
+    }
+
+    fn options(&self) -> ReadOptions {
+        read_options(self.at_least, self.wait)
+    }
+}
+
+/// The options of a read waiting for `at_least`, `wait` seconds at most.
+pub fn read_options(at_least: Option<u64>, wait: Option<f64>) -> ReadOptions {
+    ReadOptions {
+        consistency: None,
+        at_least,
+        wait_timeout: wait.map(|s| Duration::from_secs_f64(s.max(0.0))),
     }
 }
 
@@ -54,6 +78,14 @@ pub async fn aggregate(conn: &Conn, format: Format, a: AggregateArgs) -> anyhow:
     let stream = if a.range.backward {
         c.read_aggregate_backward_stream(id, a.range.from(), limit)
             .await?
+    } else if a.range.at_least.is_some() {
+        let events = c
+            .read_aggregate_with(id, a.range.from(), limit, a.range.options())
+            .await?;
+        for ev in &events {
+            print_event(format, ev);
+        }
+        return Ok(());
     } else {
         c.read_aggregate_stream(id, a.range.from(), limit).await?
     };
@@ -66,7 +98,8 @@ pub async fn all(conn: &Conn, format: Format, a: AllArgs) -> anyhow::Result<()> 
     let stream = if a.range.backward {
         c.read_all_backward_stream(a.range.from(), limit).await?
     } else {
-        c.read_all_stream(a.range.from(), limit).await?
+        c.read_all_stream_with(a.range.from(), limit, a.range.options())
+            .await?
     };
     print_stream(format, stream).await
 }
@@ -77,6 +110,14 @@ pub async fn tag(conn: &Conn, format: Format, a: TagArgs) -> anyhow::Result<()> 
     let stream = if a.range.backward {
         c.read_tag_backward_stream(a.tag, a.range.from(), limit)
             .await?
+    } else if a.range.at_least.is_some() {
+        let events = c
+            .read_tag_with(a.tag, a.range.from(), limit, a.range.options())
+            .await?;
+        for ev in &events {
+            print_event(format, ev);
+        }
+        return Ok(());
     } else {
         c.read_tag_stream(a.tag, a.range.from(), limit).await?
     };

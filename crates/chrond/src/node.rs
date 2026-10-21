@@ -229,6 +229,15 @@ pub enum SyncCommit {
     Majority,
 }
 
+/// What a read, head or subscription sees when the request does not say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadConsistency {
+    /// Everything this node holds.
+    Local,
+    /// Only positions a majority of the group durably holds.
+    Confirmed,
+}
+
 /// How a node started with `--peer` reaches the group, and the group's
 /// timing; the membership itself lives in [`Node::members`].
 #[derive(Debug, Clone)]
@@ -311,11 +320,18 @@ pub struct DbNode {
     /// with every chunk so a follower adopts the epoch only once it
     /// holds that much.
     pub epoch_base: std::sync::atomic::AtomicU64,
+    /// The confirmed bound: the highest position a majority of the group
+    /// durably holds, as this node knows it. Only rises. On a leader the
+    /// followers' reports raise it (through `sync`); on a follower the
+    /// leader's chunks and heartbeats do. Reads under the confirmed
+    /// consistency are capped at `min(confirmed, head)`.
+    pub confirmed: Arc<watch::Sender<u64>>,
 }
 
 impl DbNode {
     pub fn new(name: String, db: Db, node: &Node) -> Arc<DbNode> {
         let _ = node;
+        let confirmed = Arc::new(watch::Sender::new(0));
         Arc::new(DbNode {
             name,
             db,
@@ -324,9 +340,28 @@ impl DbNode {
             cancel: node.cancel.child_token(),
             reset: watch::Sender::new(None),
             replaced: std::sync::atomic::AtomicBool::new(false),
-            sync: crate::sync::SyncState::new(),
+            sync: crate::sync::SyncState::with_confirmed(confirmed.clone()),
             epoch_base: std::sync::atomic::AtomicU64::new(0),
+            confirmed,
         })
+    }
+
+    /// Raises the confirmed bound to `p` if that is higher.
+    pub fn raise_confirmed(&self, p: u64) {
+        self.confirmed.send_if_modified(|c| {
+            if p > *c {
+                *c = p;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// The confirmed bound as this node knows it (may exceed the head on
+    /// a follower still applying; readers clamp).
+    pub fn confirmed(&self) -> u64 {
+        *self.confirmed.borrow()
     }
 
     pub fn replica_status(&self) -> ReplicaStatus {
@@ -420,6 +455,10 @@ pub struct Node {
     pub fetch_alias: Mutex<HashMap<String, String>>,
     /// How every database is opened.
     pub db_opts: chron::Options,
+    /// The consistency reads get when they do not ask (`--read-
+    /// consistency`); `None` is confirmed when sync commits are in
+    /// effect, local otherwise.
+    pub read_consistency: Option<ReadConsistency>,
     databases: RwLock<HashMap<String, Arc<DbNode>>>,
     /// Serialises CreateDatabase and DropDatabase.
     pub admin_ops: tokio::sync::Mutex<()>,
@@ -445,6 +484,7 @@ impl Node {
         cluster: Option<ClusterConfig>,
         max_message_bytes: usize,
         db_opts: chron::Options,
+        read_consistency: Option<ReadConsistency>,
         discover_interval: Duration,
         metrics: Arc<Metrics>,
         cancel: CancellationToken,
@@ -508,6 +548,7 @@ impl Node {
             #[cfg(feature = "test-util")]
             fetch_alias: Mutex::new(HashMap::new()),
             db_opts,
+            read_consistency,
             databases: RwLock::new(HashMap::new()),
             admin_ops: tokio::sync::Mutex::new(()),
             fenced_by: Mutex::new(None),
@@ -1289,6 +1330,27 @@ impl Node {
             .is_some_and(|c| request.unwrap_or(c.sync_commit == SyncCommit::Majority))
     }
 
+    /// The consistency a read gets: the request's when it says, else the
+    /// daemon's `--read-consistency`, else confirmed when sync commits
+    /// are in effect. Without peers every read is local whatever is
+    /// asked (a lone node is its own majority).
+    pub fn read_mode(&self, requested: pb::Consistency) -> crate::ops::Mode {
+        use crate::ops::Mode;
+        if self.cluster.is_none() {
+            return Mode::Local;
+        }
+        match requested {
+            pb::Consistency::Local => Mode::Local,
+            pb::Consistency::Confirmed => Mode::Confirmed,
+            pb::Consistency::Unspecified => match self.read_consistency {
+                Some(ReadConsistency::Local) => Mode::Local,
+                Some(ReadConsistency::Confirmed) => Mode::Confirmed,
+                None if self.wants_sync(None) => Mode::Confirmed,
+                None => Mode::Local,
+            },
+        }
+    }
+
     /// How long a sync commit waits before answering "unconfirmed".
     pub fn sync_timeout(&self) -> Duration {
         self.cluster
@@ -1442,6 +1504,7 @@ mod tests {
                 cluster,
                 1 << 20,
                 chron::Options::new().fsync(chron::Fsync::Never),
+                None,
                 Duration::from_secs(1),
                 Metrics::new(),
                 cancel.clone(),

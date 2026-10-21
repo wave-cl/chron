@@ -23,6 +23,7 @@ async fn limit_zero_streams_everything_across_pages() {
                 from_index: 0,
                 limit: 0,
                 backward: false,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -42,6 +43,7 @@ async fn limit_zero_streams_everything_across_pages() {
                 from_index: u64::MAX,
                 limit: 3,
                 backward: true,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -59,6 +61,7 @@ async fn limit_zero_streams_everything_across_pages() {
                 from: u64::MAX,
                 limit: 0,
                 backward: true,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -75,6 +78,7 @@ async fn limit_zero_streams_everything_across_pages() {
                 from: 590,
                 limit: 0,
                 backward: false,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -96,6 +100,7 @@ async fn read_all_from_position_and_past_head_is_out_of_range() {
                 from: 2,
                 limit: 1,
                 backward: false,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -110,6 +115,7 @@ async fn read_all_from_position_and_past_head_is_out_of_range() {
             from: 5,
             limit: 1,
             backward: false,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -120,6 +126,7 @@ async fn read_all_from_position_and_past_head_is_out_of_range() {
                 from: 4,
                 limit: 0,
                 backward: false,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -130,7 +137,7 @@ async fn read_all_from_position_and_past_head_is_out_of_range() {
     assert!(empty.is_empty());
     assert_eq!(
         s.client
-            .head(pb::HeadRequest {})
+            .head(pb::HeadRequest::default())
             .await
             .unwrap()
             .into_inner()
@@ -150,6 +157,7 @@ async fn dropping_a_stream_midway_leaves_the_server_usable() {
             from: 0,
             limit: 0,
             backward: false,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -160,7 +168,7 @@ async fn dropping_a_stream_midway_leaves_the_server_usable() {
     fill(&mut s.client, agg(1), 1).await;
     assert_eq!(
         s.client
-            .head(pb::HeadRequest {})
+            .head(pb::HeadRequest::default())
             .await
             .unwrap()
             .into_inner()
