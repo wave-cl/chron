@@ -228,12 +228,14 @@ async fn a_replicas_confirmed_bound_follows_the_leaders_majority() {
     let client = c.client(l).await;
     let w1 = client.commit(free("one")).await.unwrap();
     let w2 = client.commit(free("two")).await.unwrap();
-    // The second chunk carried the first write's confirmation: far
-    // sooner than a heartbeat (a third of the ttl).
-    c.wait("the first write confirmed on every follower", QUIET, || {
+    // The second chunk carried the first write's confirmation to the
+    // follower whose report confirmed it, before the commit returned:
+    // at least one follower knows it at once, well before a heartbeat
+    // (a third of the ttl) could have told it.
+    c.wait("the first write confirmed on a follower", QUIET, || {
         others
             .iter()
-            .all(|i| c.node(*i).default_db().confirmed() >= w1.next)
+            .any(|i| c.node(*i).default_db().confirmed() >= w1.next)
     })
     .await;
     // The second write's confirmation arrives with a heartbeat.

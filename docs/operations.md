@@ -298,7 +298,7 @@ Four writers, one commit in flight each: p50 28 ms.
 | phase | p50 | note |
 |---|---|---|
 | leader: waiting for the batch in flight, then own land | 11 ms | the writer is serial; a commit arriving mid-batch waits for it |
-| chunk cut and sent | 0.1 ms | p90 4 ms: the cut reads the segment while the next batch flushes it |
+| chunk cut and sent | 0.1 ms | since 0.6.0 the cut reads the in-memory ring of recent batches (`chron_chunk_ring_hits_total`); before, p90 4 ms, the segment read waiting for the next batch's flush |
 | chunk waiting at the follower | 4 ms | the follower is still flushing the previous chunk 4 rounds in 5; a free follower receives it in 0.07 ms |
 | follower: segment write, flush, index commit, report | 8 to 12 ms | the flush is slower under the three daemons' contention |
 | report to the waiter waking, response to the client | 1 ms | |

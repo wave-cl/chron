@@ -356,3 +356,115 @@ fn a_chunk_still_rolls_at_the_segment_limit() {
     }
     assert_eq!(snapshot(&dst), snapshot(&src));
 }
+
+/// A chunk cut right after a land is served from the ring of recent
+/// batches, byte for byte what the segments hold; a reopened database
+/// (an empty ring) reads the segments.
+#[test]
+fn chunks_from_the_ring_equal_the_segments() {
+    let d = tmp();
+    let db = open_with(d.path(), small());
+    write_some(&db, 0, 40);
+    // A batch of several transactions: writers queue behind a held
+    // writer and land together when it is released.
+    {
+        let hold = db.debug_hold_writer();
+        let writers: Vec<_> = (0..4)
+            .map(|i| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    let mut t = db.transaction();
+                    t.append_one(agg(7), Expected::Any, ev(&format!("batched{i}")));
+                    t.commit().unwrap();
+                })
+            })
+            .collect();
+        while db.debug_pending_commits() < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(hold);
+        for w in writers {
+            w.join().unwrap();
+        }
+    }
+    // A chunk starts on a transaction boundary.
+    let starts: Vec<u64> = db
+        .read_all(0, 0)
+        .unwrap()
+        .iter()
+        .filter(|e| e.is_first_in_txn())
+        .map(|e| e.position)
+        .collect();
+    let cuts: Vec<(u64, usize, usize)> = starts
+        .iter()
+        .step_by(2)
+        .flat_map(|&from| {
+            [
+                (from, 1, usize::MAX),
+                (from, 7, 200),
+                (from, 1000, usize::MAX),
+            ]
+        })
+        .collect();
+    let warm: Vec<_> = cuts
+        .iter()
+        .map(|(f, n, b)| db.replication_chunk(*f, *n, *b).unwrap().unwrap())
+        .collect();
+    let st = db.stats();
+    assert!(st.chunk_ring_hits > 0, "{st:?}");
+    drop(db);
+    let db = open_with(d.path(), small());
+    let before = db.stats();
+    for ((f, n, b), w) in cuts.iter().zip(&warm) {
+        let cold = db.replication_chunk(*f, *n, *b).unwrap().unwrap();
+        assert_eq!((cold.from, cold.to), (w.from, w.to), "cut at {f}");
+        assert_eq!(cold.frames, w.frames, "frames at {f}");
+    }
+    let after = db.stats();
+    assert_eq!(
+        after.chunk_ring_hits, before.chunk_ring_hits,
+        "an empty ring"
+    );
+    assert!(after.chunk_ring_misses > before.chunk_ring_misses);
+}
+
+/// The ring is bounded, so an old position reads the segments; a
+/// truncation empties it.
+#[test]
+fn the_ring_evicts_old_batches_and_a_truncation_empties_it() {
+    let d = tmp();
+    let db = open_with(d.path(), opts().group_commit_max_bytes(64 * 1024));
+    // 1 MiB at least is kept: 400 records of 4 KiB pass it.
+    let big = "x".repeat(4096);
+    for i in 0..400u64 {
+        let mut t = db.transaction();
+        t.append_one(agg(1), Expected::Exact(i), ev(&big));
+        t.commit().unwrap();
+    }
+    let head = db.head();
+    let s0 = db.stats();
+    db.replication_chunk(head - 2, 1, usize::MAX).unwrap();
+    let s1 = db.stats();
+    assert_eq!(s1.chunk_ring_hits, s0.chunk_ring_hits + 1, "recent: a hit");
+    db.replication_chunk(0, 1, usize::MAX).unwrap();
+    let s2 = db.stats();
+    assert_eq!(
+        s2.chunk_ring_misses,
+        s1.chunk_ring_misses + 1,
+        "evicted: a miss"
+    );
+    db.truncate_to(head - 1).unwrap();
+    db.replication_chunk(head - 3, 1, usize::MAX).unwrap();
+    let s3 = db.stats();
+    assert_eq!(
+        s3.chunk_ring_misses,
+        s2.chunk_ring_misses + 1,
+        "after a truncation: a miss"
+    );
+    // Landing again refills it.
+    let mut t = db.transaction();
+    t.append_one(agg(1), Expected::Any, ev("again"));
+    t.commit().unwrap();
+    db.replication_chunk(db.head() - 1, 1, usize::MAX).unwrap();
+    assert_eq!(db.stats().chunk_ring_hits, s3.chunk_ring_hits + 1);
+}

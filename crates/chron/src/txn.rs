@@ -66,11 +66,24 @@ pub(crate) struct PendingAppend {
 /// Ids live in the records, so they survive restarts, rebuilds, restores
 /// and replication; truncation and retention forget the ids of the
 /// records they drop, after which a resend lands again.
-#[derive(Debug)]
 pub struct Transaction {
     db: Db,
     appends: Vec<PendingAppend>,
     commit_id: Option<[u8; 16]>,
+    guard: Option<Guard>,
+}
+
+/// A check run under the writer lock right before the batch lands.
+type Guard = Box<dyn FnOnce() -> std::result::Result<(), String> + Send>;
+
+impl std::fmt::Debug for Transaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Transaction")
+            .field("appends", &self.appends)
+            .field("commit_id", &self.commit_id)
+            .field("guarded", &self.guard.is_some())
+            .finish()
+    }
 }
 
 impl Transaction {
@@ -79,7 +92,24 @@ impl Transaction {
             db,
             appends: Vec::new(),
             commit_id: None,
+            guard: None,
         }
+    }
+
+    /// A condition checked under the writer lock immediately before the
+    /// batch holding this transaction is written: when it fails, the
+    /// transaction alone is refused with [`Error::Refused`] carrying the
+    /// message, and the rest of the batch lands. It runs on the thread
+    /// landing the batch, which may be another committer's, after any
+    /// wait in the queue: a caller whose right to write can lapse while
+    /// it waits (a leader's lease) checks it here rather than only
+    /// before committing.
+    pub fn guard(
+        &mut self,
+        f: impl FnOnce() -> std::result::Result<(), String> + Send + 'static,
+    ) -> &mut Self {
+        self.guard = Some(Box::new(f));
+        self
     }
 
     /// Gives the transaction an id, under which a resend is deduplicated
@@ -135,7 +165,13 @@ impl Transaction {
     /// Checks every expectation, writes every event, and commits. On any
     /// error nothing is written.
     pub fn commit(self) -> Result<Committed> {
-        commit(&self.db.inner, self.appends, self.commit_id, Mode::Commit)
+        commit(
+            &self.db.inner,
+            self.appends,
+            self.commit_id,
+            self.guard,
+            Mode::Commit,
+        )
     }
 
     pub(crate) fn into_parts(self) -> (Db, Vec<PendingAppend>, Option<[u8; 16]>) {
@@ -345,6 +381,20 @@ fn land_index(
         .fetch_add(entries.len() as u64, Ordering::Relaxed);
 
     w.advance(buf.len() as u64);
+    // The batch's bytes stay in memory for the chunk cut, placed before
+    // the head is published so a reader that sees the head finds them.
+    if let Some(first) = entries.first() {
+        inner
+            .recent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(crate::db::RecentBatch {
+                from: first.position,
+                to: new_head,
+                offsets: entries.iter().map(|e| e.rel_offset).collect(),
+                frames: Arc::from(buf),
+            });
+    }
     inner.publish_head(new_head);
     if w.len() >= inner.opts.segment_max_bytes {
         inner.roll(w, new_head);
@@ -527,6 +577,8 @@ pub(crate) fn import_frames(
 pub(crate) struct Pending {
     appends: Vec<PendingAppend>,
     commit_id: Option<[u8; 16]>,
+    /// Checked right before the batch lands; see `Transaction::guard`.
+    guard: Option<Guard>,
     /// Upper bound on the encoded size, from `check_shape`.
     bytes: usize,
     slot: Arc<Slot>,
@@ -611,6 +663,7 @@ pub(crate) fn commit(
     inner: &Inner,
     appends: Vec<PendingAppend>,
     commit_id: Option<[u8; 16]>,
+    guard: Option<Guard>,
     mode: Mode,
 ) -> Result<Committed> {
     let bytes = check_shape(&appends, commit_id.is_some(), inner.opts.max_record_bytes)?;
@@ -654,6 +707,7 @@ pub(crate) fn commit(
         .push_back(Pending {
             appends,
             commit_id,
+            guard,
             bytes,
             slot: slot.clone(),
         });
@@ -1067,7 +1121,16 @@ fn run_batch(inner: &Inner, w: &mut SegmentWriter, batch: Vec<Pending>) {
                 return;
             }
         };
-        for (i, p) in batch.into_iter().enumerate() {
+        for (i, mut p) in batch.into_iter().enumerate() {
+            // The guard first: a transaction whose right to land lapsed
+            // in the queue is refused alone, like a failed expectation,
+            // and nothing of it reaches the batch.
+            if let Some(g) = p.guard.take()
+                && let Err(why) = g()
+            {
+                filler.set(i, Err(Error::Refused(why)));
+                continue;
+            }
             if let Some(id) = p.commit_id {
                 if let Some(&j) = batch_ids.get(&id) {
                     if shapes[j].as_deref() == Some(shape(&p.appends).as_slice()) {

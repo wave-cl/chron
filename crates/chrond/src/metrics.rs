@@ -410,6 +410,8 @@ struct NodeCollector {
     fsyncs: IntCounterVec,
     fsync_seconds: prometheus::CounterVec,
     index_checkpoints: IntCounterVec,
+    chunk_ring_hits: IntCounterVec,
+    chunk_ring_misses: IntCounterVec,
     /// `chron_fsync_seconds`: built by hand from the library's bucket
     /// counts on each scrape.
     fsync_histogram: Desc,
@@ -542,6 +544,16 @@ impl NodeCollector {
                 "durable index commits: the commit path's checkpoints and every maintenance write; each is one fsync of index.redb (the index's own syncs are not observable otherwise)",
                 &["db"],
             ),
+            chunk_ring_hits: counter(
+                "chron_chunk_ring_hits_total",
+                "replication chunks cut from the in-memory ring of recent batches",
+                &["db"],
+            ),
+            chunk_ring_misses: counter(
+                "chron_chunk_ring_misses_total",
+                "replication chunks that read the segment files",
+                &["db"],
+            ),
             fsync_histogram: Desc::new(
                 "chron_fsync_seconds".to_string(),
                 "segment sync duration on the commit path".to_string(),
@@ -621,6 +633,8 @@ impl NodeCollector {
             &self.fsyncs,
             &self.fsync_seconds,
             &self.index_checkpoints,
+            &self.chunk_ring_hits,
+            &self.chunk_ring_misses,
         ]
     }
 
@@ -752,6 +766,12 @@ impl NodeCollector {
             self.index_checkpoints
                 .with_label_values(&[db])
                 .inc_by(now.index_checkpoints.saturating_sub(prev.index_checkpoints));
+            self.chunk_ring_hits
+                .with_label_values(&[db])
+                .inc_by(now.chunk_ring_hits.saturating_sub(prev.chunk_ring_hits));
+            self.chunk_ring_misses
+                .with_label_values(&[db])
+                .inc_by(now.chunk_ring_misses.saturating_sub(prev.chunk_ring_misses));
         }
     }
 }

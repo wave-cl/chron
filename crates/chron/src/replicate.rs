@@ -21,6 +21,34 @@ pub struct Chunk {
     pub frames: Vec<u8>,
 }
 
+/// The frames of `from..to`: from the ring of recent batches when it
+/// holds them (no file read, which under `F_FULLFSYNC` would wait for
+/// the batch being flushed), else from the segments.
+fn read_frames(inner: &Inner, from: u64, to: u64) -> Result<Vec<u8>> {
+    use std::sync::atomic::Ordering;
+    let hit = inner
+        .recent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .read(from, to);
+    match hit {
+        Some(frames) => {
+            inner
+                .counters
+                .chunk_ring_hits
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(frames)
+        }
+        None => {
+            inner
+                .counters
+                .chunk_ring_misses
+                .fetch_add(1, Ordering::Relaxed);
+            backup::frames_between(inner, from, to)
+        }
+    }
+}
+
 pub(crate) fn chunk(
     inner: &Inner,
     from: u64,
@@ -48,7 +76,7 @@ pub(crate) fn chunk(
     }
     let step = (max_events.max(1)) as u64;
     let mut to = from.saturating_add(step).min(head);
-    let mut frames = backup::frames_between(inner, from, to)?;
+    let mut frames = read_frames(inner, from, to)?;
     let path = Path::new("replication chunk");
     let max_record = inner.opts.max_record_bytes;
     // Only the flags byte of each record is looked at: where the last
@@ -85,7 +113,7 @@ pub(crate) fn chunk(
         // One transaction longer than the window: extend until it ends.
         // The head is always a boundary, so this terminates.
         let next = to.saturating_add(step).min(head);
-        frames.extend(backup::frames_between(inner, to, next)?);
+        frames.extend(read_frames(inner, to, next)?);
         to = next;
     }
     let Some((bytes, to)) = cut else {

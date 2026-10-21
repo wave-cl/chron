@@ -1109,3 +1109,68 @@ async fn a_commit_id_lands_once_across_a_leader_death() {
     assert_eq!(log.iter().filter(|e| e.payload == "replicated").count(), 1);
     c.stop_all().await;
 }
+
+/// A commit that waited in the queue past the leader's lease is refused
+/// right before it would land, instead of landing under a stale lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_queued_past_the_lease_is_refused_before_landing() {
+    let mut c = Cluster::start(3, TTL).await;
+    let l = c.wait_for_leader(SOON).await;
+    let db = c.node(l).default_db().db.clone();
+    let head = db.head();
+    // The writer is held: the commit queues behind it.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let hold = db.debug_hold_writer();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            drop(hold);
+        })
+    };
+    held_rx.recv().unwrap();
+    let client = c.client_patient(l).await;
+    let mut late = chron_client::Transaction::new();
+    late.append_free(vec![NewEvent::new("late".to_string())]);
+    // Spawned, so the request is sent while this task waits.
+    let pending = tokio::spawn(async move {
+        client
+            .commit_with(
+                late,
+                chron_client::CommitOptions {
+                    sync: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    Cluster::wait_until("the commit queued", SOON, || {
+        db.debug_pending_commits() == 1
+    })
+    .await;
+    assert!(
+        !pending.is_finished(),
+        "the commit waits behind the held writer"
+    );
+    // The lease runs out while it waits: no peer answers from now on,
+    // and the lease is expired by hand so the test does not wait a ttl.
+    c.partition(l);
+    c.node(l)
+        .with_lease(|lease| lease.held_until = Some(Instant::now() - Duration::from_millis(1)));
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    match tokio::time::timeout(SOON, pending).await.unwrap().unwrap() {
+        Err(ClientError::Fenced { message, .. }) => {
+            assert!(
+                message.contains("expired before the write landed"),
+                "{message}"
+            )
+        }
+        other => panic!("landed or another error: {other:?}"),
+    }
+    assert_eq!(db.head(), head, "nothing of it was written");
+    c.heal(l);
+    c.stop_all().await;
+}

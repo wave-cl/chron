@@ -49,6 +49,12 @@ pub(crate) fn truncate_with(inner: &Inner, to: u64, marker_only: bool) -> Result
     if to > head {
         return Err(Error::PositionOutOfRange { position: to, head });
     }
+    // The ring holds bytes about to be cut.
+    inner
+        .recent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
     if to < floor {
         return Err(Error::BelowFloor {
             position: to,

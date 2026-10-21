@@ -98,6 +98,11 @@ pub enum Error {
     #[error("transaction has no appends")]
     EmptyTransaction,
 
+    /// The transaction's guard (see `Transaction::guard`) refused it
+    /// right before the batch landed; nothing of it was written.
+    #[error("refused: {0}")]
+    Refused(String),
+
     /// A commit id seen before, on a transaction of another shape (other
     /// aggregates, or other event counts per append). A resend of the
     /// same transaction is answered with its first landing instead.

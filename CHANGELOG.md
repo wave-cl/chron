@@ -15,6 +15,14 @@ crates share one version.
   answers `None` once nothing more lies under it, resuming where it
   stopped when the cap rises. The daemon's confirmed reads are built on
   them. Existing reads are unchanged.
+- `Transaction::guard(f)`: a check run under the writer lock right before
+  the batch is written; a failing guard refuses that transaction alone
+  with the new `Error::Refused`, the rest of the batch lands.
+- The last landed batches stay in memory (four batches' worth, a
+  mebibyte at least), and a replication chunk cut from them reads no
+  segment file (under `F_FULLFSYNC` a read waited for the next batch's
+  flush: p90 4 ms on the leader under load). A truncation empties the
+  ring. `Stats::chunk_ring_hits` and `chunk_ring_misses`.
 - Durable cursors: `Db::set_cursor`, `cursor`, `remove_cursor`,
   `cursors` keep a named consumer position (`next`, `session`) in the
   index (a new `cursor` table; an older index reads as empty). A
@@ -47,6 +55,12 @@ crates share one version.
   `wait_ms` on the read, head and tail routes; `/head` answers `head`,
   `confirmed` and `local`; `/info` adds `confirmed` and
   `read_consistency`.
+- A commit checks the leader's lease again under the writer lock right
+  before its batch is written: one that waited in the queue past the
+  lease is refused (FAILED_PRECONDITION, nothing written) instead of
+  landing under a stale lease; one whose lease ran out during the write
+  itself is answered "unconfirmed". `chron_chunk_ring_hits_total` and
+  `chron_chunk_ring_misses_total`.
 - Durable cursors: `Subscribe` with `cursor` keeps the position on the
   leader under a session, starts at the stored position (the floor when
   below it), delivers confirmed events only and takes the cursor over

@@ -122,9 +122,15 @@ Tags are stored sorted and deduplicated.
   landed together (one segment write, one fsync, one index commit for up
   to `Options::group_commit_max_txns` of them), each still checked and
   acknowledged on its own; a replication chunk or an applied backup
-  lands the same way, as one batch. `Db::stats()` counts batches,
-  transactions, events, fsyncs (with a histogram of their durations)
-  and index checkpoints.
+  lands the same way, as one batch. The last landed batches stay in
+  memory (four batches' worth, a mebibyte at least), so a replication
+  chunk cut right after a land reads no segment file, which under
+  `F_FULLFSYNC` would wait for the next batch's flush. `Db::stats()`
+  counts batches, transactions, events, fsyncs (with a histogram of
+  their durations), index checkpoints and the chunk ring's hits and
+  misses. `Transaction::guard` runs a check under the writer lock right
+  before the batch is written (a daemon re-checks its lease there); a
+  failing one is `Error::Refused` for that transaction alone.
 - **Live subscriptions.** `subscribe(from)` and `subscribe_tag(tag, from)`
   return a `Subscription`: an iterator that catches up through the index
   and then blocks for new commits. `next_timeout` serves threads that also
@@ -480,8 +486,10 @@ updated as things happen (`chron_rpc_calls_total{db,method,code}`,
 `chron_commit_batches_total`, `chron_fsyncs_total`,
 `chron_fsync_seconds_total`, the histogram `chron_fsync_seconds`, and
 `chron_index_checkpoints_total`, each checkpoint being one fsync of
-the index file; commit and sync-wait histograms are bucketed from
-100 µs). `chron status [--max-lag N]` is the
+the index file, `chron_chunk_ring_hits_total` and
+`chron_chunk_ring_misses_total` for replication chunks cut from the
+in-memory ring of the last landed batches rather than the segment
+files; commit and sync-wait histograms are bucketed from 100 µs). `chron status [--max-lag N]` is the
 one-screen check with an exit code. [docs/operations.md](docs/operations.md)
 holds the runbooks: promotion and failover, a failover group, restoring
 a replica, retention, rotating tokens, upgrading, and reading the
@@ -809,8 +817,11 @@ or an expired lease. The metrics are `chron_role{role="candidate"}`,
   keeps the lease it held, since the clock did not advance meanwhile,
   and can accept writes until that lease runs out by its own clock while
   the others have elected a new leader: do not suspend a leader's host.
-  A stalled process (a long pause) past the lease can land the commits
-  that had passed the lease check before it.
+  A commit checks the lease again under the writer lock, right before
+  its batch is written, so a stall in the commit queue past the lease
+  refuses it (`FAILED_PRECONDITION`, nothing written); a stall inside
+  the write itself lands it, and the answer is then "unconfirmed",
+  since a newer leader may cut it back.
 
 ## Development
 

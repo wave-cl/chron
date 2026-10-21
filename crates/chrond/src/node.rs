@@ -1231,7 +1231,7 @@ impl Node {
     /// it; a larger jump is refused without taking effect, since no leader
     /// can be that far ahead of a node it was promoted from.
     pub fn commit_guarded(
-        &self,
+        self: &Arc<Self>,
         dbn: &DbNode,
         appends: Vec<pb::Append>,
         epoch: Option<u64>,
@@ -1276,7 +1276,32 @@ impl Node {
         if let Some(id) = commit_id {
             txn.commit_id(id);
         }
-        txn.commit().map_err(codec::status)
+        // The lease is checked again under the writer lock, right before
+        // the batch is written: a stall in the commit queue past the
+        // lease refuses the write instead of landing it under a newer
+        // leader's epoch.
+        let n = self.clone();
+        txn.guard(move || {
+            if n.role() == Role::Leader && n.lease_held() {
+                Ok(())
+            } else {
+                Err("the leader's majority lease expired before the write landed".into())
+            }
+        });
+        let c = txn.commit().map_err(|e| match e {
+            chron::Error::Refused(m) => self.refuse(m),
+            e => codec::status(e),
+        })?;
+        // Landed, but the lease may have run out while it did (a stall in
+        // the write itself): the write is on this disk and may be cut
+        // back by a newer leader, which "unconfirmed" says.
+        if self.role() != Role::Leader || !self.lease_held() {
+            return Err(crate::sync::unconfirmed(
+                &c,
+                "the lease expired while it landed; a newer leader may cut it back",
+            ));
+        }
+        Ok(c)
     }
 
     /// Records that a leader at `by` exists; this node refuses writes from

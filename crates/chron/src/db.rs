@@ -109,11 +109,96 @@ pub(crate) struct Inner {
     /// holder to land them. Lock order: the writer lock, then this.
     pub(crate) commits: Mutex<VecDeque<txn::Pending>>,
     pub(crate) counters: Counters,
+    /// The last landed batches' bytes, so a replication chunk cut right
+    /// after a land reads memory rather than the segment the next batch
+    /// is flushing (a read of a file under `F_FULLFSYNC` waits for the
+    /// flush). Filled under the writer lock, cleared by a truncation.
+    pub(crate) recent: Mutex<Recent>,
     head_watch: (Mutex<u64>, Condvar),
     #[cfg(feature = "tokio")]
     pub(crate) head_tx: tokio::sync::watch::Sender<u64>,
     files: Mutex<FileCache>,
     _lock: Lock,
+}
+
+/// One landed batch kept in memory for the replication chunk cut.
+pub(crate) struct RecentBatch {
+    pub(crate) from: u64,
+    pub(crate) to: u64,
+    /// Each position's offset into `frames`, in order.
+    pub(crate) offsets: Vec<u64>,
+    pub(crate) frames: Arc<[u8]>,
+}
+
+/// A ring of the last landed batches, contiguous in position, bounded in
+/// bytes.
+pub(crate) struct Recent {
+    batches: VecDeque<RecentBatch>,
+    bytes: usize,
+    cap: usize,
+}
+
+impl Recent {
+    pub(crate) fn new(cap: usize) -> Recent {
+        Recent {
+            batches: VecDeque::new(),
+            bytes: 0,
+            cap,
+        }
+    }
+
+    /// Keeps `b`; a gap before it (a truncation landed between) empties
+    /// the ring first, and the oldest batches go once the cap is passed.
+    pub(crate) fn push(&mut self, b: RecentBatch) {
+        if self.batches.back().is_some_and(|l| l.to != b.from) {
+            self.clear();
+        }
+        if b.frames.len() > self.cap {
+            self.clear();
+            return;
+        }
+        self.bytes += b.frames.len();
+        self.batches.push_back(b);
+        while self.bytes > self.cap {
+            if let Some(f) = self.batches.pop_front() {
+                self.bytes -= f.frames.len();
+            }
+        }
+    }
+
+    /// The frames of `from..to`, when the ring holds all of them.
+    pub(crate) fn read(&self, from: u64, to: u64) -> Option<Vec<u8>> {
+        if from >= to {
+            return Some(Vec::new());
+        }
+        let start = self
+            .batches
+            .iter()
+            .position(|b| b.from <= from && from < b.to)?;
+        let mut out = Vec::new();
+        let mut pos = from;
+        for b in self.batches.range(start..) {
+            let lo = pos.max(b.from);
+            let hi = to.min(b.to);
+            let at = b.offsets[(lo - b.from) as usize] as usize;
+            let end = if hi == b.to {
+                b.frames.len()
+            } else {
+                b.offsets[(hi - b.from) as usize] as usize
+            };
+            out.extend_from_slice(&b.frames[at..end]);
+            pos = hi;
+            if pos == to {
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.batches.clear();
+        self.bytes = 0;
+    }
 }
 
 /// Where the index stands against the disk.
@@ -182,6 +267,8 @@ impl Db {
         let epoch = index.epoch()?;
 
         let opts_max_open = opts.max_open_segments.max(1);
+        // The chunk ring: four batches' worth, a mebibyte at least.
+        let recent_cap = opts.group_commit_max_bytes.saturating_mul(4).max(1 << 20);
         Ok(Db {
             inner: Arc::new(Inner {
                 layout,
@@ -200,6 +287,7 @@ impl Db {
                 }),
                 commits: Mutex::new(VecDeque::new()),
                 counters: Counters::default(),
+                recent: Mutex::new(Recent::new(recent_cap)),
                 head_watch: (Mutex::new(head), Condvar::new()),
                 #[cfg(feature = "tokio")]
                 head_tx: tokio::sync::watch::channel(head).0,
@@ -919,7 +1007,13 @@ impl Db {
     #[doc(hidden)]
     pub fn debug_write_without_commit(&self, txn: Transaction) -> Result<Committed> {
         let (_db, appends, commit_id) = txn.into_parts();
-        txn::commit(&self.inner, appends, commit_id, Mode::WriteWithoutCommit)
+        txn::commit(
+            &self.inner,
+            appends,
+            commit_id,
+            None,
+            Mode::WriteWithoutCommit,
+        )
     }
 
     /// Where the transaction committed under `id` landed, `(first, next)`,
@@ -1342,6 +1436,8 @@ impl Inner {
             duplicates: c.duplicates.load(Ordering::Relaxed),
             index_checkpoints: c.index_checkpoints.load(Ordering::Relaxed),
             fsync_buckets: std::array::from_fn(|i| c.fsync_buckets[i].load(Ordering::Relaxed)),
+            chunk_ring_hits: c.chunk_ring_hits.load(Ordering::Relaxed),
+            chunk_ring_misses: c.chunk_ring_misses.load(Ordering::Relaxed),
         }
     }
 
@@ -1521,6 +1617,8 @@ pub(crate) struct Counters {
     pub(crate) duplicates: AtomicU64,
     pub(crate) index_checkpoints: AtomicU64,
     pub(crate) fsync_buckets: [AtomicU64; FSYNC_BUCKET_BOUNDS.len()],
+    pub(crate) chunk_ring_hits: AtomicU64,
+    pub(crate) chunk_ring_misses: AtomicU64,
 }
 
 /// Upper bounds, in seconds, of the buckets [`Stats::fsync_buckets`]
@@ -1557,6 +1655,11 @@ pub struct Stats {
     /// [`FSYNC_BUCKET_BOUNDS`] (not cumulative; the last bucket counts
     /// the rest).
     pub fsync_buckets: [u64; FSYNC_BUCKET_BOUNDS.len()],
+    /// Replication chunks cut from the in-memory ring of the last landed
+    /// batches (no segment read).
+    pub chunk_ring_hits: u64,
+    /// Replication chunks that read the segment files.
+    pub chunk_ring_misses: u64,
 }
 
 /// Holds the writer lock from a test, so that commits from other threads
