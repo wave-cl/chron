@@ -31,6 +31,8 @@ crates share one version.
 
 ### chron-proto
 
+- `DatabaseOptions`, `CreateDatabaseRequest.options`,
+  `DatabaseInfo.options`, `Tombstone`, `ListDatabasesResponse.dropped`.
 - `CursorState`, `SubscribeRequest.cursor`, `ReplicationChunk.cursors`,
   `Ack`, `ListCursors`, `DeleteCursor`; headers `chron-session` and
   `chron-cursor-from`.
@@ -55,6 +57,16 @@ crates share one version.
   `wait_ms` on the read, head and tail routes; `/head` answers `head`,
   `confirmed` and `local`; `/info` adds `confirmed` and
   `read_consistency`.
+- Per-database options: `CreateDatabase` takes `fsync` and
+  `max_record_bytes` (`chron db create --fsync|--no-fsync
+  --max-record-bytes`, the gateway body), kept in
+  `<data_dir>/<name>.options` and reported in `DatabaseInfo.options`;
+  replicas create their mirrors with the leader's. A follower counts as
+  durable by the database's own fsync setting.
+- Tombstones: a dropped database is remembered by identity for 30 days
+  (`<data_dir>/dropped`, `ListDatabasesResponse.dropped`), replicas
+  remove their copy of it (and keep the tombstone through a promotion);
+  a drop a crash interrupted is finished at the next start.
 - A commit checks the leader's lease again under the writer lock right
   before its batch is written: one that waited in the queue past the
   lease is refused (FAILED_PRECONDITION, nothing written) instead of
@@ -74,6 +86,9 @@ crates share one version.
 
 ### chron-client
 
+- `DatabaseOptions`, `Client::create_database_with`,
+  `list_databases_full` → `Listing { databases, dropped }`, `Tombstone`;
+  `DatabaseInfo.fsync` and `max_record_bytes`.
 - `Client::subscribe_cursor` → `(EventStream, Cursor)`, `Cursor::ack`,
   `cursors`, `delete_cursor`, `ClientError::TakenOver`;
   `ReplicationChunk.cursors`.
@@ -85,6 +100,8 @@ crates share one version.
 
 ### chron-cli
 
+- `db create NAME [--fsync | --no-fsync] [--max-record-bytes N]`; `db
+  list` shows each database's options and the recent drops.
 - `tail --cursor NAME [--ack-every N]`, `chron cursors [list | delete
   NAME]`.
 - `--local` / `--confirmed` on every command, `--at-least P [--wait

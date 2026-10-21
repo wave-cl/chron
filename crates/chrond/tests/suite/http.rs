@@ -459,6 +459,7 @@ async fn tail_streams_live_events_and_ends_when_the_database_is_dropped() {
     s.client
         .create_database(chron_proto::v1::CreateDatabaseRequest {
             name: "orders".into(),
+            options: None,
         })
         .await
         .unwrap();
@@ -1037,5 +1038,51 @@ async fn cursor_routes_answer() {
     )
     .await;
     assert_eq!((code, v["existed"].as_bool()), (200, Some(false)));
+    s.stop().await;
+}
+
+/// The gateway creates a database with its own options and lists the
+/// recent drops.
+#[tokio::test(flavor = "multi_thread")]
+async fn database_options_and_drops_on_the_gateway() {
+    let s = Server::start_with(|o| {
+        o.http_listen = Some("127.0.0.1:0".parse().unwrap());
+        o.fsync = true;
+    })
+    .await;
+    let addr = s.running.as_ref().unwrap().http_addr.unwrap();
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/databases".into(),
+        vec![],
+        Some(json!({"name": "fast", "fsync": false, "max_record_bytes": 4096}).to_string()),
+    )
+    .await;
+    assert_eq!(
+        (code, v["fsync"].as_bool(), v["max_record_bytes"].as_u64()),
+        (201, Some(false), Some(4096)),
+        "{v}"
+    );
+    let (code, v, _) = call(addr, "GET", "/v1/databases".into(), vec![], None).await;
+    let fast = v["databases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "fast")
+        .unwrap()
+        .clone();
+    assert_eq!((code, fast["fsync"].as_bool()), (200, Some(false)));
+    assert_eq!(v["dropped"].as_array().unwrap().len(), 0);
+    let db_id = fast["db_id"].as_str().unwrap().to_string();
+    let (code, _, _) = call(addr, "DELETE", "/v1/databases/fast".into(), vec![], None).await;
+    assert_eq!(code, 204);
+    let (_, v, _) = call(addr, "GET", "/v1/databases".into(), vec![], None).await;
+    let dropped = v["dropped"].as_array().unwrap();
+    assert_eq!(dropped.len(), 1, "{v}");
+    assert_eq!(
+        (dropped[0]["name"].as_str(), dropped[0]["db_id"].as_str()),
+        (Some("fast"), Some(db_id.as_str()))
+    );
     s.stop().await;
 }

@@ -407,33 +407,75 @@ pub async fn fence(conn: &Conn, format: Format, epoch: u64) -> anyhow::Result<()
     Ok(())
 }
 
-pub async fn db_create(conn: &Conn, format: Format, name: &str) -> anyhow::Result<()> {
-    let d = client::connect(conn).await?.create_database(name).await?;
-    print_value(
-        format,
-        format!("created {}", d.name),
-        json!({ "name": d.name, "head": d.head, "floor": d.floor, "epoch": d.epoch, "db_id": d.db_id.to_string() }),
-    );
+pub async fn db_create(
+    conn: &Conn,
+    format: Format,
+    name: &str,
+    options: chron_client::DatabaseOptions,
+) -> anyhow::Result<()> {
+    let d = client::connect(conn)
+        .await?
+        .create_database_with(name, options)
+        .await?;
+    // One line for scripts; `db list` and the JSON carry the options.
+    print_value(format, format!("created {}", d.name), database_value(&d));
     Ok(())
 }
 
+fn options_human(d: &chron_client::DatabaseInfo) -> String {
+    match (d.fsync, d.max_record_bytes) {
+        (Some(f), Some(n)) => format!(
+            "  fsync {}  max_record_bytes {n}",
+            if f { "on" } else { "off" }
+        ),
+        _ => String::new(),
+    }
+}
+
+fn database_value(d: &chron_client::DatabaseInfo) -> serde_json::Value {
+    json!({
+        "name": d.name, "head": d.head, "floor": d.floor, "epoch": d.epoch,
+        "db_id": d.db_id.to_string(), "fsync": d.fsync, "max_record_bytes": d.max_record_bytes,
+    })
+}
+
 pub async fn db_list(conn: &Conn, format: Format) -> anyhow::Result<()> {
-    let all = client::connect(conn).await?.list_databases().await?;
-    let human = all
+    let l = client::connect(conn).await?.list_databases_full().await?;
+    let all = &l.databases;
+    let mut human = all
         .iter()
         .map(|d| {
             format!(
-                "{}  head {}  floor {}  epoch {}  db_id {}",
-                d.name, d.head, d.floor, d.epoch, d.db_id
+                "{}  head {}  floor {}  epoch {}  db_id {}{}",
+                d.name,
+                d.head,
+                d.floor,
+                d.epoch,
+                d.db_id,
+                options_human(d)
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let value: Vec<serde_json::Value> = all
+    for t in &l.dropped {
+        human.push_str(&format!(
+            "\ndropped {}  db_id {}  at {}",
+            t.name, t.db_id, t.dropped_at
+        ));
+    }
+    let value: Vec<serde_json::Value> = all.iter().map(database_value).collect();
+    let dropped: Vec<serde_json::Value> = l
+        .dropped
         .iter()
-        .map(|d| json!({ "name": d.name, "head": d.head, "floor": d.floor, "epoch": d.epoch, "db_id": d.db_id.to_string() }))
+        .map(
+            |t| json!({ "name": t.name, "db_id": t.db_id.to_string(), "dropped_at": t.dropped_at }),
+        )
         .collect();
-    print_value(format, human, json!({ "databases": value }));
+    print_value(
+        format,
+        human,
+        json!({ "databases": value, "dropped": dropped }),
+    );
     Ok(())
 }
 

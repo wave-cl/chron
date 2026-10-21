@@ -479,6 +479,42 @@ pub struct DatabaseInfo {
     pub epoch: u64,
     /// Its identity.
     pub db_id: Uuid,
+    /// Whether it fsyncs (`None` from a daemon before 0.6.0).
+    pub fsync: Option<bool>,
+    /// Its record limit (`None` from a daemon before 0.6.0).
+    pub max_record_bytes: Option<u64>,
+}
+
+/// A database's own choices at creation (see
+/// [`Client::create_database_with`]); what is left `None` follows the
+/// daemon's flags.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DatabaseOptions {
+    /// Sync every batch to disk before acknowledging it.
+    pub fsync: Option<bool>,
+    /// The largest record it accepts.
+    pub max_record_bytes: Option<u64>,
+}
+
+/// A database dropped on the leader (see [`Client::list_databases_full`]):
+/// replicas remove their copy by identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tombstone {
+    /// The dropped database's identity.
+    pub db_id: Uuid,
+    /// Its name at the drop.
+    pub name: String,
+    /// When it was dropped, unix seconds.
+    pub dropped_at: u64,
+}
+
+/// [`Client::list_databases_full`]: the databases and the recent drops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    /// Every database.
+    pub databases: Vec<DatabaseInfo>,
+    /// Databases dropped within the last 30 days.
+    pub dropped: Vec<Tombstone>,
 }
 
 /// Adds the bearer token and the database name, when set.
@@ -1927,24 +1963,64 @@ impl Client {
     /// Creates the empty database `name` on the daemon (the leader). An
     /// admin call; [`ClientError::AlreadyExists`] when it exists.
     pub async fn create_database(&self, name: &str) -> Result<DatabaseInfo, ClientError> {
+        self.create_database_with(name, DatabaseOptions::default())
+            .await
+    }
+
+    /// [`create_database`](Client::create_database) with the database's
+    /// own fsync setting and record limit.
+    pub async fn create_database_with(
+        &self,
+        name: &str,
+        options: DatabaseOptions,
+    ) -> Result<DatabaseInfo, ClientError> {
         let r = self
             .admin()
             .create_database(pb::CreateDatabaseRequest {
                 name: name.to_string(),
+                options: Some(pb::DatabaseOptions {
+                    fsync: options.fsync,
+                    max_record_bytes: options.max_record_bytes,
+                }),
             })
             .await?
             .into_inner();
-        database_info(r.database.unwrap_or_default())
+        database_info(
+            r.database
+                .ok_or_else(|| ClientError::Decode("CreateDatabase without a database".into()))?,
+        )
     }
 
     /// Every database of the daemon. An admin call.
     pub async fn list_databases(&self) -> Result<Vec<DatabaseInfo>, ClientError> {
+        Ok(self.list_databases_full().await?.databases)
+    }
+
+    /// Every database and the daemon's recent drops (admin).
+    pub async fn list_databases_full(&self) -> Result<Listing, ClientError> {
         let r = self
             .admin()
             .list_databases(pb::ListDatabasesRequest {})
             .await?
             .into_inner();
-        r.databases.into_iter().map(database_info).collect()
+        Ok(Listing {
+            databases: r
+                .databases
+                .into_iter()
+                .map(database_info)
+                .collect::<Result<_, _>>()?,
+            dropped: r
+                .dropped
+                .iter()
+                .filter_map(|t| {
+                    Some(Tombstone {
+                        db_id: Uuid::from_slice(&t.db_id).ok()?,
+                        name: t.name.clone(),
+                        dropped_at: t.dropped_at_unix_secs,
+                    })
+                })
+                .collect(),
+        })
     }
 
     /// Drops the database `name` on the daemon (the leader); `default`
@@ -2010,5 +2086,7 @@ fn database_info(d: pb::DatabaseInfo) -> Result<DatabaseInfo, ClientError> {
         epoch: d.epoch,
         db_id: Uuid::from_slice(&d.db_id)
             .map_err(|_| ClientError::Decode("a database without an identity".into()))?,
+        fsync: d.options.as_ref().map(|o| o.fsync),
+        max_record_bytes: d.options.as_ref().map(|o| o.max_record_bytes),
     })
 }

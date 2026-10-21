@@ -1174,3 +1174,50 @@ async fn a_commit_queued_past_the_lease_is_refused_before_landing() {
     c.heal(l);
     c.stop_all().await;
 }
+
+/// A tombstone recorded on the leader reaches the followers, so the
+/// next leader still answers it after the first one died.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tombstone_survives_the_leaders_death() {
+    let mut c = Cluster::start_with(3, TTL, |o| {
+        o.discover_interval = Duration::from_secs(1);
+    })
+    .await;
+    let l = c.wait_for_leader(SOON).await;
+    for i in 0..3 {
+        if i != l {
+            c.wait_following(i, l, SOON).await;
+        }
+    }
+    let client = c.client(l).await;
+    let tmp = client.create_database("tmp").await.unwrap();
+    // A write, so every mirror attached and took the leader's identity
+    // (a tombstone names the identity, not the name).
+    let mut t = chron_client::Transaction::new();
+    t.append_free(vec![NewEvent::new("x".to_string())]);
+    client.database("tmp").commit(t).await.unwrap();
+    c.wait("the mirrors of tmp", SOON, || {
+        (0..3).all(|i| {
+            c.node(i)
+                .get("tmp")
+                .is_some_and(|d| d.db.head() == 1 && d.db.id() == tmp.db_id)
+        })
+    })
+    .await;
+    client.drop_database("tmp").await.unwrap();
+    c.wait("the followers to drop tmp", SOON, || {
+        (0..3).all(|i| c.node(i).get("tmp").is_none())
+    })
+    .await;
+    c.stop(l).await;
+    let l2 = c.wait_for_leader(SOON).await;
+    let listing = c.client(l2).await.list_databases_full().await.unwrap();
+    assert!(
+        listing
+            .dropped
+            .iter()
+            .any(|t| t.db_id == tmp.db_id && t.name == "tmp"),
+        "{listing:?}"
+    );
+    c.stop_all().await;
+}

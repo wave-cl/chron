@@ -264,6 +264,8 @@ pub fn database_json(d: &pb::DatabaseInfo) -> Value {
     json!({
         "name": d.name, "head": d.head, "floor": d.floor, "epoch": d.epoch,
         "db_id": Uuid::from_slice(&d.db_id).map(|u| u.to_string()).ok(),
+        "fsync": d.options.as_ref().map(|o| o.fsync),
+        "max_record_bytes": d.options.as_ref().map(|o| o.max_record_bytes),
     })
 }
 

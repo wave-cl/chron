@@ -37,7 +37,10 @@ async fn head_in(c: &mut DbClient) -> u64 {
 
 async fn create(s: &mut Server, name: &str) -> pb::DatabaseInfo {
     s.client
-        .create_database(pb::CreateDatabaseRequest { name: name.into() })
+        .create_database(pb::CreateDatabaseRequest {
+            name: name.into(),
+            options: None,
+        })
         .await
         .unwrap()
         .into_inner()
@@ -100,7 +103,10 @@ async fn unknown_and_bad_names_are_refused() {
         );
         let err = s
             .client
-            .create_database(pb::CreateDatabaseRequest { name: bad.into() })
+            .create_database(pb::CreateDatabaseRequest {
+                name: bad.into(),
+                options: None,
+            })
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument, "create {bad:?}");
@@ -125,6 +131,7 @@ async fn create_list_drop_over_rpc() {
         .client
         .create_database(pb::CreateDatabaseRequest {
             name: "orders".into(),
+            options: None,
         })
         .await
         .unwrap_err();
@@ -268,6 +275,7 @@ async fn create_and_drop_are_admin_and_leader_only() {
     let mut user = with_token(channel.clone(), "user");
     let req = pb::CreateDatabaseRequest {
         name: "orders".into(),
+        options: None,
     };
     assert_eq!(
         user.create_database(req.clone()).await.unwrap_err().code(),
@@ -291,6 +299,7 @@ async fn create_and_drop_are_admin_and_leader_only() {
         .client
         .create_database(pb::CreateDatabaseRequest {
             name: "orders".into(),
+            options: None,
         })
         .await
         .unwrap_err();
@@ -537,7 +546,8 @@ async fn a_replica_mirrors_every_database_and_discovers_new_ones() {
     .unwrap();
     assert_eq!(payloads(&got), ["b0", "b1"]);
 
-    // Dropped on the leader: the replica keeps its copy, read-only.
+    // Dropped on the leader: the replica removes its copy too (by the
+    // tombstone's identity), and the name answers NOT_FOUND there.
     leader
         .client
         .drop_database(pb::DropDatabaseRequest {
@@ -546,22 +556,18 @@ async fn a_replica_mirrors_every_database_and_discovers_new_ones() {
         .await
         .unwrap();
     let mut rorders2 = rorders.clone();
-    wait_until("the replica to notice the drop", || {
+    let orders_dir = replica.dir.path().join("data").join("orders");
+    wait_until("the replica to remove the dropped database", || {
         let mut o = rorders.clone();
+        let dir = orders_dir.clone();
         async move {
-            let i = o.info(pb::InfoRequest {}).await.unwrap().into_inner();
-            !i.replica_connected
-                && i.last_replication_error
-                    .as_deref()
-                    .is_some_and(|e| e.contains("dropped on the leader"))
+            o.info(pb::InfoRequest {})
+                .await
+                .is_err_and(|s| s.code() == Code::NotFound)
+                && !dir.exists()
         }
     })
     .await;
-    assert_eq!(
-        head_in(&mut rorders2).await,
-        1,
-        "the copy is still readable"
-    );
     assert_eq!(
         rorders2
             .commit(pb::CommitRequest {
@@ -573,7 +579,205 @@ async fn a_replica_mirrors_every_database_and_discovers_new_ones() {
             .await
             .unwrap_err()
             .code(),
-        Code::FailedPrecondition
+        Code::NotFound
+    );
+    replica.stop().await;
+    leader.stop().await;
+}
+
+async fn typed(s: &Server) -> chron_client::Client {
+    chron_client::Client::connect(s.addr(), Default::default())
+        .await
+        .unwrap()
+}
+
+/// A database created with its own fsync setting keeps it: Info says so,
+/// its commits sync nothing while the default's do, a restart reads the
+/// options file, and a replica creates its mirror with the same setting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_created_without_fsync_keeps_it_across_a_restart_and_a_mirror() {
+    let s = Server::start_with(|o| o.fsync = true).await;
+    let client = typed(&s).await;
+    let fast = client
+        .create_database_with(
+            "fast",
+            chron_client::DatabaseOptions {
+                fsync: Some(false),
+                max_record_bytes: Some(1 << 20),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (fast.fsync, fast.max_record_bytes),
+        (Some(false), Some(1 << 20))
+    );
+    let fast_client = client.database("fast");
+    for i in 0..10 {
+        fast_client
+            .append(
+                agg(1),
+                chron_client::Expected::Exact(i),
+                vec![chron_client::NewEvent::new("e".to_string())],
+            )
+            .await
+            .unwrap();
+    }
+    client
+        .append(
+            agg(1),
+            chron_client::Expected::New,
+            vec![chron_client::NewEvent::new("d".to_string())],
+        )
+        .await
+        .unwrap();
+    let node = s.running.as_ref().unwrap().node.clone();
+    assert_eq!(
+        node.get("fast").unwrap().db.stats().fsyncs,
+        0,
+        "no sync on fast"
+    );
+    assert!(
+        node.get("default").unwrap().db.stats().fsyncs > 0,
+        "default syncs"
+    );
+    assert!(!fast_client.info().await.unwrap().fsync);
+    let listed = client.list_databases_full().await.unwrap();
+    let f = listed.databases.iter().find(|d| d.name == "fast").unwrap();
+    assert_eq!(f.fsync, Some(false));
+    // The node handle keeps the databases open: let it go before the
+    // restart, which takes their locks again.
+    drop(node);
+    let addr = s.running.as_ref().unwrap().local_addr;
+    let dir = s.stop_keep_dir().await;
+    assert!(dir.path().join("data").join("fast.options").exists());
+    let s = Server::start_in(dir, addr, |o| o.fsync = true).await;
+    let client = typed(&s).await;
+    let info = client.database("fast").info().await.unwrap();
+    assert!(!info.fsync, "the options file was read at the restart");
+    assert_eq!(info.options.max_record_bytes, 1 << 20);
+    // A replica mirrors it with the same setting.
+    let laddr = s.addr();
+    let replica = Server::start_with(move |o| {
+        o.fsync = true;
+        o.replicate_from = Some(laddr);
+        o.discover_interval = Duration::from_secs(1);
+    })
+    .await;
+    let rnode = replica.running.as_ref().unwrap().node.clone();
+    wait_until("the mirror of fast", || {
+        let rnode = rnode.clone();
+        async move { rnode.get("fast").is_some() }
+    })
+    .await;
+    assert_eq!(
+        rnode.get("fast").unwrap().db.options().fsync,
+        chron::Fsync::Never,
+        "the mirror took the leader's setting"
+    );
+    assert!(
+        replica
+            .dir
+            .path()
+            .join("data")
+            .join("fast.options")
+            .exists()
+    );
+    replica.stop().await;
+    s.stop().await;
+}
+
+/// A drop on the leader removes the replica's copy within a discovery
+/// interval, and a database recreated under the dropped name is
+/// mirrored afresh, since the tombstone names the old identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_removes_a_dropped_database_by_identity() {
+    let mut leader = Server::start().await;
+    create(&mut leader, "orders").await;
+    let laddr = leader.running.as_ref().unwrap().local_addr;
+    let mut lorders = with_db(plain_channel(laddr).await, "orders");
+    commit_in(&mut lorders, "o0").await;
+    let addr = leader.addr();
+    let mut replica = Server::start_with(move |o| {
+        o.replicate_from = Some(addr);
+        o.discover_interval = Duration::from_secs(1);
+    })
+    .await;
+    let raddr = replica.running.as_ref().unwrap().local_addr;
+    let rorders = with_db(plain_channel(raddr).await, "orders");
+    wait_until("orders to catch up on the replica", || {
+        let mut o = rorders.clone();
+        async move {
+            o.head(pb::HeadRequest::default())
+                .await
+                .map(|h| h.into_inner().head)
+                .ok()
+                == Some(1)
+        }
+    })
+    .await;
+    assert_eq!(names(&mut replica).await, ["default", "orders"]);
+    let old_id = replica
+        .running
+        .as_ref()
+        .unwrap()
+        .node
+        .get("orders")
+        .unwrap()
+        .db
+        .id();
+    leader
+        .client
+        .drop_database(pb::DropDatabaseRequest {
+            name: "orders".into(),
+        })
+        .await
+        .unwrap();
+    let rnode = replica.running.as_ref().unwrap().node.clone();
+    let orders_dir = replica.dir.path().join("data").join("orders");
+    wait_until("the replica to remove orders", || {
+        let rnode = rnode.clone();
+        let dir = orders_dir.clone();
+        async move { rnode.get("orders").is_none() && !dir.exists() }
+    })
+    .await;
+    assert!(
+        rnode.tombstones().iter().any(|t| t.db_id == old_id),
+        "the tombstone was kept"
+    );
+    let code = rorders
+        .clone()
+        .head(pb::HeadRequest::default())
+        .await
+        .unwrap_err()
+        .code();
+    assert_eq!(code, Code::NotFound);
+    // Recreated under the name: a new identity, mirrored afresh and kept.
+    create(&mut leader, "orders").await;
+    let mut lorders = with_db(plain_channel(laddr).await, "orders");
+    commit_in(&mut lorders, "o1").await;
+    commit_in(&mut lorders, "o2").await;
+    wait_until("the recreated orders to catch up", || {
+        let mut o = rorders.clone();
+        async move {
+            o.head(pb::HeadRequest::default())
+                .await
+                .map(|h| h.into_inner().head)
+                .ok()
+                == Some(2)
+        }
+    })
+    .await;
+    let fresh = rnode.get("orders").unwrap();
+    assert_ne!(fresh.db.id(), old_id);
+    // Three more discovery passes: the tombstone names the old identity,
+    // so the fresh mirror stays the same one (a match by name would
+    // delete and recreate it on every pass).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(names(&mut replica).await, ["default", "orders"]);
+    assert!(
+        std::sync::Arc::ptr_eq(&fresh, &rnode.get("orders").unwrap()),
+        "the recreated mirror was replaced"
     );
     replica.stop().await;
     leader.stop().await;

@@ -779,7 +779,11 @@ pub async fn info(node: &Node, dbn: &DbNode) -> Result<pb::InfoResponse, Status>
 
 /// Creates the empty database `name` on a leader. The caller checked the
 /// admin token.
-pub async fn create_database(node: Arc<Node>, name: String) -> Result<Arc<DbNode>, Status> {
+pub async fn create_database(
+    node: Arc<Node>,
+    name: String,
+    options: crate::node::DbOptions,
+) -> Result<Arc<DbNode>, Status> {
     if !chron_proto::valid_database_name(&name) {
         return Err(Status::invalid_argument(format!(
             "{name:?} is not a database name; names are 1 to 64 of a-z, 0-9, _ and -"
@@ -794,10 +798,27 @@ pub async fn create_database(node: Arc<Node>, name: String) -> Result<Arc<DbNode
     if node.get(&name).is_some() {
         return Err(Status::already_exists(format!("database {name:?} exists")));
     }
+    if let Some(n) = options.max_record_bytes
+        && n > node.max_message_bytes
+    {
+        return Err(Status::invalid_argument(format!(
+            "max_record_bytes {n} is above the daemon's --max-message-bytes {}",
+            node.max_message_bytes
+        )));
+    }
     let n = node.clone();
     let epoch = node.epoch();
     let name2 = name.clone();
     let db = tokio::task::spawn_blocking(move || {
+        // The options file first: an orphan is harmless (the next create
+        // overwrites it), a database without its file would open with
+        // the daemon's defaults.
+        n.write_db_options(&name2, &options)
+            .map_err(|e| chron::Error::Io {
+                path: n.options_file(&name2),
+                op: "write",
+                source: e,
+            })?;
         let db = n.open_database(&name2)?;
         if db.epoch() < epoch {
             db.set_epoch(epoch)?;
@@ -840,12 +861,21 @@ pub async fn drop_database(node: Arc<Node>, name: String) -> Result<(), Status> 
     if let Some(p) = dbn.puller.lock().await.take() {
         p.stop().await;
     }
+    let tomb = crate::node::Tombstone::now(dbn.db.id(), &name);
     drop(dbn);
+    let n = node.clone();
     let dir = node.database_dir(&name);
-    tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir))
-        .await
-        .map_err(|e| codec::join("drop_database", e))?
-        .map_err(|e| Status::internal(format!("cannot remove the database directory: {e}")))?;
+    let name2 = name.clone();
+    tokio::task::spawn_blocking(move || {
+        // The tombstone before the files go: a crash in between leaves
+        // a directory the next start removes (see open_all).
+        n.record_tombstones(&[tomb])?;
+        std::fs::remove_dir_all(&dir)?;
+        n.remove_marker(&format!("{name2}.options"))
+    })
+    .await
+    .map_err(|e| codec::join("drop_database", e))?
+    .map_err(|e| Status::internal(format!("cannot remove the database: {e}")))?;
     tracing::info!(database = %name, "database dropped");
     Ok(())
 }

@@ -606,6 +606,7 @@ async fn open_all(node: &Arc<Node>) -> anyhow::Result<()> {
         names.push(chron_proto::DEFAULT_DATABASE.to_string());
     }
     names.sort();
+    let tombstones = node.tombstones();
     for name in names {
         let n = node.clone();
         let name2 = name.clone();
@@ -618,6 +619,23 @@ async fn open_all(node: &Arc<Node>) -> anyhow::Result<()> {
                     node.database_dir(&name).display()
                 )
             })?;
+        if name != chron_proto::DEFAULT_DATABASE && tombstones.iter().any(|t| t.db_id == db.id()) {
+            // A drop a crash interrupted after the tombstone: finished
+            // now.
+            tracing::warn!(database = %name, "dropped before the last stop; removing its directory");
+            drop(db);
+            let dir = node.database_dir(&name);
+            let n = node.clone();
+            let name2 = name.clone();
+            tokio::task::spawn_blocking(move || {
+                std::fs::remove_dir_all(&dir)?;
+                n.remove_marker(&format!("{name2}.options"))
+            })
+            .await
+            .context("remove task")?
+            .with_context(|| format!("cannot remove the dropped database {name}"))?;
+            continue;
+        }
         node.insert(DbNode::new(name, db, node));
     }
     let max = node

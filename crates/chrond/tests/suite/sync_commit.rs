@@ -470,3 +470,49 @@ async fn an_unconfirmed_commit_resent_with_its_id_is_a_duplicate() {
     assert_eq!(c.node(l).default_db().db.head(), 1, "landed once");
     c.stop_all().await;
 }
+
+/// Durability follows the database: a database created without fsync on
+/// a group whose daemons fsync is mirrored without it, and its sync
+/// commits are confirmed by those followers, since both sides apply it
+/// the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_without_fsync_is_confirmed_by_followers_without_it() {
+    let mut c = Cluster::start_fsync(3, TTL, true).await;
+    let (l, others) = settled(&c).await;
+    let client = c.client(l).await;
+    client
+        .create_database_with(
+            "fast",
+            chron_client::DatabaseOptions {
+                fsync: Some(false),
+                max_record_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+    c.wait("the mirrors of fast", SOON, || {
+        others.iter().all(|i| {
+            c.node(*i)
+                .get("fast")
+                .is_some_and(|d| d.db.options().fsync == chron::Fsync::Never)
+        })
+    })
+    .await;
+    let fast = client.database("fast");
+    let committed = tokio::time::timeout(SOON, fast.commit(free("fast write")))
+        .await
+        .expect("confirmed in time")
+        .unwrap();
+    assert_eq!(committed.next, 1);
+    let followers = c
+        .node(l)
+        .get("fast")
+        .unwrap()
+        .sync
+        .snapshot(&c.node(l).members());
+    assert!(
+        followers.iter().any(|f| f.counted && f.applied >= 1),
+        "a no-fsync follower counts for a no-fsync database: {followers:?}"
+    );
+    c.stop_all().await;
+}

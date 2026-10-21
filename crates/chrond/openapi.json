@@ -1272,6 +1272,25 @@
                       "items": {
                         "$ref": "#/components/schemas/DatabaseInfo"
                       }
+                    },
+                    "dropped": {
+                      "type": "array",
+                      "description": "databases dropped within the last 30 days, which replicas remove by identity",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "db_id": {
+                            "type": "string"
+                          },
+                          "dropped_at": {
+                            "type": "integer",
+                            "description": "unix seconds"
+                          }
+                        }
+                      }
                     }
                   }
                 }
@@ -1327,6 +1346,14 @@
                 "properties": {
                   "name": {
                     "type": "string"
+                  },
+                  "fsync": {
+                    "type": "boolean",
+                    "description": "sync every batch to disk before acknowledging it; absent follows the daemon's --no-fsync"
+                  },
+                  "max_record_bytes": {
+                    "type": "integer",
+                    "description": "the largest record this database accepts; absent follows the daemon's --max-record-bytes"
                   }
                 }
               }

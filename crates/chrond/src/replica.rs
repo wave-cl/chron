@@ -216,7 +216,7 @@ pub async fn connect_and_check(node: &Arc<Node>, dbn: &DbNode) -> Result<Followi
     };
     let following = match &node.cluster {
         Some(cfg) => {
-            let durable = node.db_opts.fsync == chron::Fsync::Always;
+            let durable = dbn.db.options().fsync == chron::Fsync::Always;
             match client
                 .follow(head, last_fingerprint, cfg.advertise.clone(), durable)
                 .await
@@ -1045,28 +1045,86 @@ pub fn spawn_discoverer(node: Arc<Node>) -> Puller {
 async fn discover(node: &Arc<Node>) -> Result<(), String> {
     let up = node.upstream().ok_or("no leader configured")?;
     let client = connect(&up).await.map_err(|e| e.to_string())?;
-    let listed = match tokio::time::timeout(INFO_TIMEOUT, client.list_databases()).await {
+    let listing = match tokio::time::timeout(INFO_TIMEOUT, client.list_databases_full()).await {
         Ok(r) => r.map_err(|e| format!("ListDatabases on {}: {e}", up.addr))?,
         Err(_) => return Err(format!("{} did not answer ListDatabases", up.addr)),
     };
-    let names: std::collections::HashSet<String> = listed.into_iter().map(|d| d.name).collect();
+    let names: std::collections::HashSet<String> =
+        listing.databases.iter().map(|d| d.name.clone()).collect();
     if !node.role().follows() {
         return Ok(());
     }
-    for name in &names {
+    // The leader's tombstones first, kept here too so a promotion keeps
+    // answering them; then every local copy they name goes, by identity
+    // (a database recreated under the name has another one).
+    let tombs: Vec<crate::node::Tombstone> = listing
+        .dropped
+        .iter()
+        .map(|t| crate::node::Tombstone {
+            db_id: t.db_id,
+            name: t.name.clone(),
+            dropped_at: t.dropped_at,
+        })
+        .collect();
+    if !tombs.is_empty() {
+        let n = node.clone();
+        let t2 = tombs.clone();
+        tokio::task::spawn_blocking(move || n.record_tombstones(&t2))
+            .await
+            .map_err(|e| format!("tombstone task: {e}"))?
+            .map_err(|e| format!("cannot record the leader's tombstones: {e}"))?;
+    }
+    for dbn in node.databases() {
+        if dbn.name == chron_proto::DEFAULT_DATABASE
+            || !tombs.iter().any(|t| t.db_id == dbn.db.id())
+        {
+            continue;
+        }
+        remove_dropped(node, &dbn).await?;
+    }
+    for d in &listing.databases {
+        let name = &d.name;
         if !chron_proto::valid_database_name(name) {
             tracing::warn!(database = %name, "the leader lists a database with an invalid name; skipped");
             continue;
         }
         let dbn = match node.get(name) {
-            Some(d) => d,
+            Some(dbn) => {
+                let own = crate::node::DbOptions {
+                    fsync: d.fsync,
+                    max_record_bytes: d.max_record_bytes.map(|n| n as usize),
+                };
+                let mine = dbn.db.options();
+                if let Some(f) = own.fsync
+                    && f != (mine.fsync == chron::Fsync::Always)
+                    && !dbn.replica_status().options_warned
+                {
+                    tracing::warn!(database = %name, leader_fsync = f, "this copy's fsync setting differs from the leader's; its own stands");
+                    dbn.record_replica(|r| r.options_warned = true);
+                }
+                dbn
+            }
             None => {
                 let n = node.clone();
                 let name2 = name.clone();
-                let db = tokio::task::spawn_blocking(move || n.open_database(&name2))
-                    .await
-                    .map_err(|e| format!("open task: {e}"))?
-                    .map_err(|e| format!("cannot create the database {name}: {e}"))?;
+                // The leader's options first, so the mirror runs like
+                // its original.
+                let own = crate::node::DbOptions {
+                    fsync: d.fsync,
+                    max_record_bytes: d.max_record_bytes.map(|n| n as usize),
+                };
+                let db = tokio::task::spawn_blocking(move || {
+                    n.write_db_options(&name2, &own)
+                        .map_err(|e| chron::Error::Io {
+                            path: n.options_file(&name2),
+                            op: "write",
+                            source: e,
+                        })?;
+                    n.open_database(&name2)
+                })
+                .await
+                .map_err(|e| format!("open task: {e}"))?
+                .map_err(|e| format!("cannot create the database {name}: {e}"))?;
                 let dbn = DbNode::new(name.clone(), db, node);
                 node.insert(dbn.clone());
                 tracing::info!(database = %name, "created to mirror the leader");
@@ -1085,7 +1143,7 @@ async fn discover(node: &Arc<Node>) -> Result<(), String> {
         let mut puller = dbn.puller.lock().await;
         if let Some(p) = puller.take() {
             p.stop().await;
-            let msg = "dropped on the leader; the local copy is kept".to_string();
+            let msg = "not listed by the leader; the local copy is kept".to_string();
             tracing::warn!(database = %dbn.name, "{msg}");
             dbn.record_replica(|r| {
                 r.connected = false;
@@ -1093,5 +1151,31 @@ async fn discover(node: &Arc<Node>) -> Result<(), String> {
             });
         }
     }
+    Ok(())
+}
+
+/// Removes a local copy of a database the leader dropped: its streams
+/// end, its puller stops, its directory and options file go.
+async fn remove_dropped(node: &Arc<Node>, dbn: &Arc<DbNode>) -> Result<(), String> {
+    let name = dbn.name.clone();
+    let Some(dbn) = node.remove(&name) else {
+        return Ok(());
+    };
+    dbn.cancel.cancel();
+    if let Some(p) = dbn.puller.lock().await.take() {
+        p.stop().await;
+    }
+    drop(dbn);
+    let n = node.clone();
+    let dir = node.database_dir(&name);
+    let name2 = name.clone();
+    tokio::task::spawn_blocking(move || {
+        std::fs::remove_dir_all(&dir)?;
+        n.remove_marker(&format!("{name2}.options"))
+    })
+    .await
+    .map_err(|e| format!("remove task: {e}"))?
+    .map_err(|e| format!("cannot remove the dropped database {name}: {e}"))?;
+    tracing::info!(database = %name, "dropped on the leader; the local copy was removed");
     Ok(())
 }

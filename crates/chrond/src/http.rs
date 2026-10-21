@@ -503,12 +503,26 @@ async fn list_databases(State(st): State<HttpState>, headers: HeaderMap) -> Resu
         .iter()
         .map(|d| database_json(&d.info()))
         .collect();
-    Ok(Json(json!({ "databases": all })))
+    let dropped: Vec<Value> = st
+        .node
+        .tombstones()
+        .iter()
+        .map(
+            |t| json!({ "name": t.name, "db_id": t.db_id.to_string(), "dropped_at": t.dropped_at }),
+        )
+        .collect();
+    Ok(Json(json!({ "databases": all, "dropped": dropped })))
 }
 
 #[derive(Deserialize)]
 struct NameBody {
     name: String,
+    /// The database's own fsync setting; absent follows the daemon's.
+    #[serde(default)]
+    fsync: Option<bool>,
+    /// The database's own record limit; absent follows the daemon's.
+    #[serde(default)]
+    max_record_bytes: Option<u64>,
 }
 
 async fn create_database(
@@ -518,7 +532,11 @@ async fn create_database(
 ) -> Result<(StatusCode, Json<Value>)> {
     admin(&st, &headers)?;
     let Json(b) = body.map_err(json_rejection)?;
-    let dbn = ops::create_database(st.node.clone(), b.name).await?;
+    let options = crate::node::DbOptions {
+        fsync: b.fsync,
+        max_record_bytes: b.max_record_bytes.map(|n| n as usize),
+    };
+    let dbn = ops::create_database(st.node.clone(), b.name, options).await?;
     Ok((StatusCode::CREATED, Json(database_json(&dbn.info()))))
 }
 

@@ -456,14 +456,38 @@ message DatabaseInfo {
   uint64 floor = 3;
   uint64 epoch = 4;
   bytes db_id = 5;
+  // The options the database runs with (its own, or the daemon's).
+  Options options = 6;
+}
+
+// Per-database choices at creation; what is left unset follows the
+// daemon's flags. Kept with the database and mirrored by replicas.
+message DatabaseOptions {
+  optional bool fsync = 1;
+  optional uint64 max_record_bytes = 2;
+}
+
+// A database dropped on the leader: replicas remove their copy of it
+// (matched by identity, never by name, so a database recreated under
+// the name is untouched). Kept 30 days.
+message Tombstone {
+  bytes db_id = 1;
+  string name = 2;
+  uint64 dropped_at_unix_secs = 3;
 }
 
 // A new, empty database named `name` (`[a-z0-9_-]{1,64}`). ALREADY_EXISTS
 // when one exists; FAILED_PRECONDITION on a replica or a fenced node.
-message CreateDatabaseRequest { string name = 1; }
+message CreateDatabaseRequest {
+  string name = 1;
+  DatabaseOptions options = 2;
+}
 message CreateDatabaseResponse { DatabaseInfo database = 1; }
 message ListDatabasesRequest {}
-message ListDatabasesResponse { repeated DatabaseInfo databases = 1; }
+message ListDatabasesResponse {
+  repeated DatabaseInfo databases = 1;
+  repeated Tombstone dropped = 2;
+}
 // Closes and removes the database; `default` cannot be dropped. Streams
 // on it end with UNAVAILABLE. NOT_FOUND when there is no such database.
 message DropDatabaseRequest { string name = 1; }

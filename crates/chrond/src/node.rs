@@ -179,6 +179,136 @@ pub struct ReplicaStatus {
     pub connected: bool,
     pub leader_head: Option<u64>,
     pub last_error: Option<String>,
+    /// The "options differ from the leader's" warning was logged.
+    pub options_warned: bool,
+}
+
+/// Databases dropped on this node or learned from its leader: one line
+/// `db_id name unix_secs` each, kept 30 days.
+pub const DROPPED_MARKER: &str = "dropped";
+const TOMBSTONE_TTL_SECS: u64 = 30 * 24 * 3600;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A dropped database: replicas remove their copy by identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tombstone {
+    pub db_id: chron::Uuid,
+    pub name: String,
+    pub dropped_at: u64,
+}
+
+impl Tombstone {
+    fn parse(line: &str) -> Option<Tombstone> {
+        let mut parts = line.split_whitespace();
+        let db_id = parts.next()?.parse().ok()?;
+        let name = parts.next()?.to_string();
+        let dropped_at = parts.next()?.parse().ok()?;
+        Some(Tombstone {
+            db_id,
+            name,
+            dropped_at,
+        })
+    }
+
+    fn line(&self) -> String {
+        format!("{} {} {}\n", self.db_id, self.name, self.dropped_at)
+    }
+
+    pub fn now(db_id: chron::Uuid, name: &str) -> Tombstone {
+        Tombstone {
+            db_id,
+            name: name.to_string(),
+            dropped_at: unix_now(),
+        }
+    }
+
+    pub fn to_wire(&self) -> pb::Tombstone {
+        pb::Tombstone {
+            db_id: self.db_id.as_bytes().to_vec(),
+            name: self.name.clone(),
+            dropped_at_unix_secs: self.dropped_at,
+        }
+    }
+
+    pub fn from_wire(t: &pb::Tombstone) -> Option<Tombstone> {
+        Some(Tombstone {
+            db_id: chron::Uuid::from_slice(&t.db_id).ok()?,
+            name: t.name.clone(),
+            dropped_at: t.dropped_at_unix_secs,
+        })
+    }
+}
+
+/// A database's own choices over the daemon's flags, kept in
+/// `<data_dir>/<name>.options` as `fsync on|off` and
+/// `max_record_bytes N` lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DbOptions {
+    pub fsync: Option<bool>,
+    pub max_record_bytes: Option<usize>,
+}
+
+impl DbOptions {
+    pub fn is_empty(&self) -> bool {
+        self.fsync.is_none() && self.max_record_bytes.is_none()
+    }
+
+    pub fn parse(text: &str) -> Result<DbOptions, String> {
+        let mut o = DbOptions::default();
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            match line.split_once(' ') {
+                Some(("fsync", "on")) => o.fsync = Some(true),
+                Some(("fsync", "off")) => o.fsync = Some(false),
+                Some(("max_record_bytes", n)) => {
+                    o.max_record_bytes = Some(
+                        n.parse()
+                            .map_err(|_| format!("bad max_record_bytes {n:?}"))?,
+                    )
+                }
+                _ => return Err(format!("unknown options line {line:?}")),
+            }
+        }
+        Ok(o)
+    }
+
+    pub fn text(&self) -> String {
+        let mut t = String::new();
+        if let Some(f) = self.fsync {
+            t.push_str(if f { "fsync on\n" } else { "fsync off\n" });
+        }
+        if let Some(n) = self.max_record_bytes {
+            t.push_str(&format!("max_record_bytes {n}\n"));
+        }
+        t
+    }
+
+    /// The daemon's options with these applied.
+    pub fn apply(&self, mut base: chron::Options) -> chron::Options {
+        if let Some(f) = self.fsync {
+            base = base.fsync(if f {
+                chron::Fsync::Always
+            } else {
+                chron::Fsync::Never
+            });
+        }
+        if let Some(n) = self.max_record_bytes {
+            base = base.max_record_bytes(n);
+        }
+        base
+    }
+
+    pub fn from_wire(o: Option<&pb::DatabaseOptions>) -> DbOptions {
+        DbOptions {
+            fsync: o.and_then(|o| o.fsync),
+            max_record_bytes: o.and_then(|o| o.max_record_bytes).map(|n| n as usize),
+        }
+    }
 }
 
 /// `epoch N`: this directory promoted itself to leader under epoch N.
@@ -437,6 +567,7 @@ impl DbNode {
             floor: self.db.floor(),
             epoch: self.db.epoch(),
             db_id: self.db.id().as_bytes().to_vec(),
+            options: Some(chron_proto::convert::options_to_wire(self.db.options())),
         }
     }
 }
@@ -1021,9 +1152,69 @@ impl Node {
         self.data_dir.join(name)
     }
 
-    /// Opens (creating if missing) the database directory `name`. Blocking.
+    /// Opens (creating if missing) the database directory `name` with
+    /// the daemon's options overridden by the database's own file
+    /// (`<name>.options`). Blocking.
     pub fn open_database(&self, name: &str) -> chron::Result<Db> {
-        Db::open(self.database_dir(name), self.db_opts.clone())
+        let own = self.read_db_options(name).map_err(|e| chron::Error::Io {
+            path: self.options_file(name),
+            op: "read",
+            source: std::io::Error::other(e),
+        })?;
+        Db::open(self.database_dir(name), own.apply(self.db_opts.clone()))
+    }
+
+    /// Where a database's own options live: a `.` cannot appear in a
+    /// database name, so the file never collides with one.
+    pub fn options_file(&self, name: &str) -> PathBuf {
+        self.data_dir.join(format!("{name}.options"))
+    }
+
+    /// The database's own options, none when it has no file; a
+    /// malformed file is an error (the start refuses).
+    pub fn read_db_options(&self, name: &str) -> Result<DbOptions, String> {
+        match fs::read_to_string(self.options_file(name)) {
+            Ok(text) => DbOptions::parse(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DbOptions::default()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    pub fn write_db_options(&self, name: &str, o: &DbOptions) -> std::io::Result<()> {
+        if o.is_empty() {
+            return self.remove_marker(&format!("{name}.options"));
+        }
+        self.write_marker_text(&format!("{name}.options"), &o.text())
+    }
+
+    // ---- tombstones
+
+    /// Every database dropped within the last 30 days, by identity.
+    pub fn tombstones(&self) -> Vec<Tombstone> {
+        let mut out: Vec<Tombstone> = self
+            .marker_text(DROPPED_MARKER)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(Tombstone::parse)
+            .collect();
+        let now = unix_now();
+        out.retain(|t| now.saturating_sub(t.dropped_at) <= TOMBSTONE_TTL_SECS);
+        out
+    }
+
+    /// Records drops (merged by identity, pruned at 30 days).
+    pub fn record_tombstones(&self, new: &[Tombstone]) -> std::io::Result<()> {
+        let mut all = self.tombstones();
+        for t in new {
+            if !all.iter().any(|a| a.db_id == t.db_id) {
+                all.push(t.clone());
+            }
+        }
+        if all.is_empty() {
+            return self.remove_marker(DROPPED_MARKER);
+        }
+        let text: String = all.iter().map(|t| t.line()).collect();
+        self.write_marker_text(DROPPED_MARKER, &text)
     }
 
     pub fn insert(&self, dbn: Arc<DbNode>) {

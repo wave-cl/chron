@@ -693,7 +693,9 @@ impl Chron for ChronService {
         };
         self.admit_replica(&dbn, open.from_position, open.last_fingerprint)
             .await?;
-        let leader_durable = self.node.db_opts.fsync == chron::Fsync::Always;
+        // Durability is the database's: its own fsync setting, not the
+        // daemon's.
+        let leader_durable = dbn.db.options().fsync == chron::Fsync::Always;
         let is_member =
             self.node.cluster.is_some() && self.node.members().contains(&open.peer_addr);
         let durable_ok = open.durable || !leader_durable;
@@ -802,7 +804,9 @@ impl Chron for ChronService {
         req: Request<pb::CreateDatabaseRequest>,
     ) -> Result<Response<pb::CreateDatabaseResponse>, Status> {
         self.node.require_admin(req.metadata())?;
-        let dbn = ops::create_database(self.node.clone(), req.into_inner().name).await?;
+        let r = req.into_inner();
+        let options = crate::node::DbOptions::from_wire(r.options.as_ref());
+        let dbn = ops::create_database(self.node.clone(), r.name, options).await?;
         Ok(Response::new(pb::CreateDatabaseResponse {
             database: Some(dbn.info()),
         }))
@@ -815,6 +819,7 @@ impl Chron for ChronService {
         self.node.require_admin(req.metadata())?;
         Ok(Response::new(pb::ListDatabasesResponse {
             databases: self.node.databases().iter().map(|d| d.info()).collect(),
+            dropped: self.node.tombstones().iter().map(|t| t.to_wire()).collect(),
         }))
     }
 

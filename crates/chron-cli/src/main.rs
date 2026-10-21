@@ -147,8 +147,21 @@ enum MembersCommands {
 #[derive(Subcommand, Debug)]
 enum DbCommands {
     /// Create an empty database (1 to 64 of a-z, 0-9, _ and -).
-    Create { name: String },
-    /// Every database with its head, floor, epoch and id.
+    Create {
+        name: String,
+        /// Sync every batch to disk before acknowledging it, whatever
+        /// the daemon's default.
+        #[arg(long, conflicts_with = "no_fsync")]
+        fsync: bool,
+        /// Acknowledge a batch once written, without a sync.
+        #[arg(long)]
+        no_fsync: bool,
+        /// The largest record this database accepts, in bytes.
+        #[arg(long)]
+        max_record_bytes: Option<u64>,
+    },
+    /// Every database with its head, floor, epoch, id and options, and
+    /// the recent drops.
     List,
     /// Drop a database and its data; `default` cannot be dropped.
     Drop { name: String },
@@ -212,7 +225,22 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
             CursorCommands::Delete { name } => cmd::admin::cursor_delete(conn, format, &name).await,
         },
         Commands::Db { cmd } => match cmd {
-            DbCommands::Create { name } => cmd::admin::db_create(conn, format, &name).await,
+            DbCommands::Create {
+                name,
+                fsync,
+                no_fsync,
+                max_record_bytes,
+            } => {
+                let options = chron_client::DatabaseOptions {
+                    fsync: match (fsync, no_fsync) {
+                        (true, _) => Some(true),
+                        (_, true) => Some(false),
+                        _ => None,
+                    },
+                    max_record_bytes,
+                };
+                cmd::admin::db_create(conn, format, &name, options).await
+            }
             DbCommands::List => cmd::admin::db_list(conn, format).await,
             DbCommands::Drop { name } => cmd::admin::db_drop(conn, format, &name).await,
         },

@@ -506,8 +506,13 @@ them through the normal commit path, reconnecting with backoff when the
 leader goes away. It asks the leader for its list of databases at
 start, every `--discover-interval` (10 s) and whenever a puller
 reconnects: a database created on the leader is created and followed on
-the replica; one dropped on the leader is kept on the replica, read-only,
-with `last_replication_error` saying so (remove its directory by hand).
+the replica; one dropped on the leader is removed on every replica too:
+the leader keeps a tombstone (`<data_dir>/dropped`, by identity, 30
+days) that `ListDatabases` carries, replicas keep it as well, and a
+replica deletes a copy whose identity a tombstone names, never one that
+merely shares the name (a database recreated under the name is a new
+one). A database the leader never listed, or lists no more without a
+tombstone, is kept read-only with `last_replication_error` saying so.
 The replication token must be the leader's admin token when it has one.
 Every database of a daemon carries the same epoch; promotion raises them
 all. A leader that is merely unreachable lets the replica
@@ -802,8 +807,14 @@ or an expired lease. The metrics are `chron_role{role="candidate"}`,
   finished from the segment on the next open: the complete transactions
   it synced are replayed into the index and a torn trailing one is cut;
   the caller resumes from the head the open reports.
-- Per-database options (fsync, record limit) are daemon-wide, and
-  `default` cannot be dropped.
+- `default` cannot be dropped. A database's fsync setting and record
+  limit are chosen at creation (`chron db create NAME [--fsync|
+  --no-fsync] [--max-record-bytes N]`, `CreateDatabaseRequest.options`,
+  the gateway body's `fsync` and `max_record_bytes`), kept in
+  `<data_dir>/<name>.options` and mirrored by replicas; `default` and a
+  database created without them follow the daemon's flags. Sync
+  commits count a follower as durable by the database's own setting,
+  not the daemon's.
 - With `--sync-commit off`, or `sync=false` on a request, a failover
   group loses the writes a dead leader acknowledged after the last
   transaction its successor had pulled; the old leader keeps them in a

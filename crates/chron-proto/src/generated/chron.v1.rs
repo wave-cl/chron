@@ -650,6 +650,30 @@ pub struct DatabaseInfo {
     pub epoch: u64,
     #[prost(bytes = "vec", tag = "5")]
     pub db_id: ::prost::alloc::vec::Vec<u8>,
+    /// The options the database runs with (its own, or the daemon's).
+    #[prost(message, optional, tag = "6")]
+    pub options: ::core::option::Option<Options>,
+}
+/// Per-database choices at creation; what is left unset follows the
+/// daemon's flags. Kept with the database and mirrored by replicas.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DatabaseOptions {
+    #[prost(bool, optional, tag = "1")]
+    pub fsync: ::core::option::Option<bool>,
+    #[prost(uint64, optional, tag = "2")]
+    pub max_record_bytes: ::core::option::Option<u64>,
+}
+/// A database dropped on the leader: replicas remove their copy of it
+/// (matched by identity, never by name, so a database recreated under
+/// the name is untouched). Kept 30 days.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Tombstone {
+    #[prost(bytes = "vec", tag = "1")]
+    pub db_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub dropped_at_unix_secs: u64,
 }
 /// A new, empty database named `name` (`\[a-z0-9_-\]{1,64}`). ALREADY_EXISTS
 /// when one exists; FAILED_PRECONDITION on a replica or a fenced node.
@@ -657,6 +681,8 @@ pub struct DatabaseInfo {
 pub struct CreateDatabaseRequest {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub options: ::core::option::Option<DatabaseOptions>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateDatabaseResponse {
@@ -669,6 +695,8 @@ pub struct ListDatabasesRequest {}
 pub struct ListDatabasesResponse {
     #[prost(message, repeated, tag = "1")]
     pub databases: ::prost::alloc::vec::Vec<DatabaseInfo>,
+    #[prost(message, repeated, tag = "2")]
+    pub dropped: ::prost::alloc::vec::Vec<Tombstone>,
 }
 /// Closes and removes the database; `default` cannot be dropped. Streams
 /// on it end with UNAVAILABLE. NOT_FOUND when there is no such database.

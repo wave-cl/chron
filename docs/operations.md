@@ -146,6 +146,21 @@ its directory: `--advertise` is its identity, so remove the old address,
 start the daemon under the new one with `--peer` any member, and add the
 new address.
 
+## A database dropped on the leader
+
+`chron db drop NAME` on the leader removes the database there and, on
+every replica, the copy with that identity: the leader keeps a
+tombstone for 30 days (`chron db list` shows it under `dropped`, the
+file is `<data_dir>/dropped`), replicas record it too, and a replica
+away for longer than that keeps the copy read-only, with
+`last_replication_error` saying it is not listed, until its directory
+is removed by hand. Recreating the name is safe: the new database has
+a new identity and the tombstone names the old one. A database created
+with its own options (`chron db create NAME --no-fsync
+--max-record-bytes N`) carries them to its mirrors; a copy that exists
+with other options keeps its own and the replica logs the difference
+once.
+
 ## Cursors
 
 A consumer that subscribes with a cursor (`chron tail --cursor NAME`,
