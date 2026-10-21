@@ -701,7 +701,8 @@ until the bound reaches it, at most `wait_timeout` (the daemon's
 `chron-head` (504 on the gateway, `position` in the body). A commit's
 `next` is the token for reading one's own write anywhere in the group,
 including a replica that has not applied it yet. On the wire the
-requests carry `consistency`, `at_least` and `wait_timeout_ms`;
+requests, `AggregateLen` included, carry `consistency`, `at_least` and
+`wait_timeout_ms`;
 `HeadResponse` carries `head` (the bound asked for), `confirmed` and
 `local`; the gateway takes `?consistency=`, `?at_least=` and
 `?wait_ms=` on the read, head and tail routes; the client has

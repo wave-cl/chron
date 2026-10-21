@@ -486,8 +486,11 @@ impl Chron for ChronService {
         req: Request<pb::AggregateLenRequest>,
     ) -> Result<Response<pb::AggregateLenResponse>, Status> {
         let dbn = self.db(&req)?;
-        let id = codec::aggregate(&req.into_inner().aggregate)?;
-        let len = blocking(&dbn.db, "aggregate_len", move |db| db.aggregate_len(id)).await?;
+        let r = req.into_inner();
+        let id = codec::aggregate(&r.aggregate)?;
+        let mode = self.node.read_mode(r.consistency());
+        ops::wait_requested(&self.node, &dbn, mode, r.at_least, r.wait_timeout_ms).await?;
+        let len = ops::aggregate_len(&self.node, &dbn, id, mode).await?;
         Ok(Response::new(pb::AggregateLenResponse { len }))
     }
 

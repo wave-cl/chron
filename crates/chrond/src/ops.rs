@@ -171,6 +171,23 @@ pub async fn wait_requested(
     wait_bound(node, dbn, mode, p, timeout).await.map(|_| ())
 }
 
+/// The aggregate's length under `mode`: every event under local, the
+/// events below the confirmed bound otherwise (the index's count is the
+/// local one; the last event below the cap says how many lie under it).
+pub async fn aggregate_len(node: &Node, dbn: &DbNode, id: Uuid, mode: Mode) -> Result<u64, Status> {
+    let upto = cap(node, dbn, mode);
+    blocking(&dbn.db, "aggregate_len", move |db| {
+        if upto == u64::MAX {
+            return db.aggregate_len(id);
+        }
+        Ok(db
+            .read_aggregate_backward_upto(id, u64::MAX, 1, upto)?
+            .first()
+            .map_or(0, |e| e.index + 1))
+    })
+    .await
+}
+
 /// A durable cursor's subscription, as `subscribe` drives it.
 pub struct CursorSub {
     pub name: String,

@@ -97,6 +97,7 @@ async fn conflict_is_failed_precondition_with_headers_and_nothing_written() {
         .client
         .aggregate_len(pb::AggregateLenRequest {
             aggregate: agg(2).as_bytes().to_vec(),
+            ..Default::default()
         })
         .await
         .unwrap()

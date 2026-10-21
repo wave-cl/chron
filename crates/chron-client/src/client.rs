@@ -1455,10 +1455,24 @@ impl Client {
 
     /// How many events the aggregate has (0 for an unknown one).
     pub async fn aggregate_len(&self, id: Uuid) -> Result<u64, ClientError> {
+        self.aggregate_len_with(id, ReadOptions::default()).await
+    }
+
+    /// [`aggregate_len`](Client::aggregate_len) with options: under the
+    /// confirmed consistency, the events below the confirmed bound.
+    pub async fn aggregate_len_with(
+        &self,
+        id: Uuid,
+        opts: ReadOptions,
+    ) -> Result<u64, ClientError> {
+        let (consistency, at_least, wait_timeout_ms) = self.read_wire(opts);
         Ok(self
             .rpc()
             .aggregate_len(pb::AggregateLenRequest {
                 aggregate: id.as_bytes().to_vec(),
+                consistency,
+                at_least,
+                wait_timeout_ms,
             })
             .await?
             .into_inner()

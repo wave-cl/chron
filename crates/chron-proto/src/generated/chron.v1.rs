@@ -185,10 +185,19 @@ pub struct ReadTagRequest {
     #[prost(uint64, optional, tag = "7")]
     pub wait_timeout_ms: ::core::option::Option<u64>,
 }
+/// The aggregate's length under `consistency` (see Consistency): under
+/// CONFIRMED, its events below the confirmed bound; `at_least` waits for
+/// the bound first.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AggregateLenRequest {
     #[prost(bytes = "vec", tag = "1")]
     pub aggregate: ::prost::alloc::vec::Vec<u8>,
+    #[prost(enumeration = "Consistency", tag = "2")]
+    pub consistency: i32,
+    #[prost(uint64, optional, tag = "3")]
+    pub at_least: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "4")]
+    pub wait_timeout_ms: ::core::option::Option<u64>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AggregateLenResponse {

@@ -328,10 +328,16 @@ async fn read_tag(
 async fn aggregate_len(
     State(st): State<HttpState>,
     Path((name, id)): Path<(String, String)>,
+    q: std::result::Result<Query<HeadQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<Value>> {
     let dbn = db(&st, &name)?;
     let id = uuid(&id)?;
-    let len = ops::blocking(&dbn.db, "aggregate_len", move |db| db.aggregate_len(id)).await?;
+    let Query(q) = q.map_err(bad)?;
+    let mode = st
+        .node
+        .read_mode(consistency_from_query(q.consistency.as_deref()).map_err(ApiError)?);
+    ops::wait_requested(&st.node, &dbn, mode, q.at_least, q.wait_ms).await?;
+    let len = ops::aggregate_len(&st.node, &dbn, id, mode).await?;
     Ok(Json(json!({ "len": len })))
 }
 

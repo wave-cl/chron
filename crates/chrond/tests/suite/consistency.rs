@@ -114,6 +114,53 @@ async fn a_held_follower_keeps_an_unconfirmed_write_out_of_confirmed_reads() {
     c.stop_all().await;
 }
 
+/// An aggregate's length follows the consistency too: a held write on
+/// the leader counts under local, not under confirmed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aggregate_length_follows_the_consistency() {
+    let mut c = Cluster::start(3, TTL).await;
+    let (l, others) = settled(&c).await;
+    let client = c.client(l).await;
+    let a = chron_client::Uuid::from_u128(7);
+    for i in 0..3 {
+        client
+            .append(
+                a,
+                chron_client::Expected::Exact(i),
+                vec![NewEvent::new(format!("e{i}"))],
+            )
+            .await
+            .unwrap();
+    }
+    for i in &others {
+        c.hold_apply(*i, true);
+    }
+    let mut t = Transaction::new();
+    t.append(
+        a,
+        chron_client::Expected::Exact(3),
+        vec![NewEvent::new("held".to_string())],
+    );
+    client.commit_with(t, local_commit()).await.unwrap();
+    assert_eq!(client.aggregate_len(a).await.unwrap(), 3, "confirmed");
+    assert_eq!(
+        client
+            .aggregate_len_with(a, with(Consistency::Local))
+            .await
+            .unwrap(),
+        4,
+        "local"
+    );
+    c.hold_apply(others[0], false);
+    c.wait("the held write confirmed", SOON, || {
+        c.node(l).default_db().confirmed() >= 4
+    })
+    .await;
+    assert_eq!(client.aggregate_len(a).await.unwrap(), 4);
+    c.hold_apply(others[1], false);
+    c.stop_all().await;
+}
+
 /// A confirmed subscription delivers a write only once a majority
 /// holds it; a local one at once.
 #[tokio::test(flavor = "multi_thread")]

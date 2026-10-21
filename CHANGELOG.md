@@ -45,6 +45,8 @@ crates share one version.
 
 ### chrond
 
+- `AggregateLen` takes the consistency too (and `at_least`): under
+  confirmed, the aggregate's events below the confirmed bound.
 - Confirmed reads: on a node with peers a read, head or subscription
   serves, by default under sync commits, only positions a majority of
   the group durably holds (the bound rises with the followers' reports

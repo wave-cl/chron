@@ -153,7 +153,15 @@ message ReadTagRequest {
   optional uint64 wait_timeout_ms = 7;
 }
 
-message AggregateLenRequest { bytes aggregate = 1; }
+// The aggregate's length under `consistency` (see Consistency): under
+// CONFIRMED, its events below the confirmed bound; `at_least` waits for
+// the bound first.
+message AggregateLenRequest {
+  bytes aggregate = 1;
+  Consistency consistency = 2;
+  optional uint64 at_least = 3;
+  optional uint64 wait_timeout_ms = 4;
+}
 message AggregateLenResponse { uint64 len = 1; }
 
 // `head` answers the bound under the effective consistency; `confirmed`

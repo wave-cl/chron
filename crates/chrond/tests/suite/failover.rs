@@ -520,7 +520,15 @@ async fn aggregates_keep_their_lengths_across_a_failover() {
     c.stop(l).await;
     let l2 = c.wait_for_leader(SOON).await;
     let new_leader = c.client(l2).await;
-    assert_eq!(new_leader.aggregate_len(id).await.unwrap(), 4);
+    // What the new leader holds (its confirmed bound catches up once the
+    // followers re-attach).
+    assert_eq!(
+        new_leader
+            .aggregate_len_with(id, chrond::testing::local_read())
+            .await
+            .unwrap(),
+        4
+    );
     let r = new_leader
         .append(id, Expected::Exact(3), vec![NewEvent::new("stale")])
         .await;

@@ -850,6 +850,33 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "consistency",
+            "in": "query",
+            "required": false,
+            "description": "local (every event) or confirmed (the events below the confirmed bound); absent: the daemon's default",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "at_least",
+            "in": "query",
+            "required": false,
+            "description": "wait until the bound reaches this position first",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "wait_ms",
+            "in": "query",
+            "required": false,
+            "description": "how long at_least may wait; absent: the daemon's sync timeout, 0: fail at once",
+            "schema": {
+              "type": "integer"
+            }
           }
         ]
       }
