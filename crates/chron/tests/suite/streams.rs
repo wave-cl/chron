@@ -394,6 +394,120 @@ fn a_fill_of_several_chunks_interleaved_with_commits_is_complete() {
     assert_eq!(db.read_stream("a", 0, 0).unwrap().len(), 30_000 + 200);
 }
 
+/// Records written but not committed to the index before a crash are
+/// replayed at the next open, into the stream too.
+#[test]
+fn a_crash_before_the_index_commit_is_replayed_into_the_stream() {
+    let d = tmp();
+    let db = open(d.path());
+    write_pattern(&db, 12, PATTERN);
+    db.create_stream("ab", ["a", "b"]).unwrap();
+    let mut t = db.transaction();
+    t.append_free(vec![
+        tagged("lost-a", &["a"]),
+        tagged("lost-c", &["c"]),
+        tagged("lost-b", &["b", "c"]),
+    ]);
+    let c = db.debug_write_without_commit(t).unwrap();
+    drop(db);
+    let db = open(d.path());
+    assert_eq!(db.head(), c.next, "replayed");
+    let got = positions(&db.read_stream("ab", 0, 0).unwrap());
+    assert_eq!(got, merged(&db, &["a", "b"]));
+    assert!(got.contains(&c.first) && got.contains(&(c.first + 2)));
+    assert!(!got.contains(&(c.first + 1)));
+}
+
+/// A creation interrupted before its fill finished leaves nothing: the
+/// next open removes the definition and whatever entries it had.
+#[test]
+fn an_interrupted_create_leaves_nothing_after_a_reopen() {
+    let d = tmp();
+    let db = open(d.path());
+    write_pattern(&db, 12, PATTERN);
+    db.begin_stream("s", ["a"]).unwrap();
+    // Records landing after the definition are indexed for it already.
+    write_pattern(&db, 6, PATTERN);
+    assert!(!db.debug_stream_entries("s").unwrap().is_empty());
+    assert!(matches!(
+        db.read_stream("s", 0, 0),
+        Err(Error::StreamNotReady(_))
+    ));
+    assert!(!db.stream("s").unwrap().unwrap().ready);
+    drop(db);
+    let db = open(d.path());
+    assert!(db.streams().unwrap().is_empty(), "gone with its entries");
+    assert!(matches!(db.read_stream("s", 0, 0), Err(Error::NoStream(_))));
+    db.create_stream("s", ["a"]).unwrap();
+    assert_eq!(
+        positions(&db.read_stream("s", 0, 0).unwrap()),
+        merged(&db, &["a"])
+    );
+}
+
+/// An index rebuild keeps the definitions and recomputes the entries.
+#[test]
+fn a_rebuild_keeps_the_streams() {
+    let d = tmp();
+    let db = open(d.path());
+    write_pattern(&db, 24, PATTERN);
+    db.create_stream("ab", ["a", "b"]).unwrap();
+    db.create_stream("c", ["c"]).unwrap();
+    let want_ab = positions(&db.read_stream("ab", 0, 0).unwrap());
+    let want_c = positions(&db.read_stream("c", 0, 0).unwrap());
+    drop(db);
+    chron::Db::rebuild_index(d.path(), &opts()).unwrap();
+    let db = open(d.path());
+    let names: Vec<String> = db.streams().unwrap().into_iter().map(|s| s.name).collect();
+    assert_eq!(names, ["ab", "c"]);
+    assert!(db.streams().unwrap().iter().all(|s| s.ready));
+    assert_eq!(positions(&db.read_stream("ab", 0, 0).unwrap()), want_ab);
+    assert_eq!(positions(&db.read_stream("c", 0, 0).unwrap()), want_c);
+    write_pattern(&db, 6, PATTERN);
+    assert_eq!(
+        positions(&db.read_stream("ab", 0, 0).unwrap()),
+        merged(&db, &["a", "b"])
+    );
+}
+
+/// A full backup carries the definitions (format 3); a restore rebuilds
+/// their entries. An archive from a database without streams keeps the
+/// earlier format.
+#[test]
+fn a_backup_carries_the_definitions_and_a_restore_rebuilds_the_entries() {
+    let d = tmp();
+    let db = open(d.path());
+    write_pattern(&db, 24, PATTERN);
+    let plain = d.path().join("plain.chronbak");
+    assert_eq!(db.backup(&plain).unwrap().format, 1);
+    db.create_stream("ab", ["a", "b"]).unwrap();
+    db.create_stream("c", ["c"]).unwrap();
+    let archive = d.path().join("full.chronbak");
+    let meta = db.backup(&archive).unwrap();
+    assert_eq!(meta.format, 3);
+    assert_eq!(chron::inspect_backup(&archive).unwrap().format, 3);
+    assert_eq!(
+        meta.files as usize,
+        segments(d.path()).len() + 2,
+        "lengths and streams"
+    );
+    let dst = d.path().join("restored");
+    chron::restore_backup(&archive, &dst, &opts()).unwrap();
+    let restored = open(&dst);
+    assert_eq!(restored.streams().unwrap(), db.streams().unwrap());
+    assert_eq!(
+        positions(&restored.read_stream("ab", 0, 0).unwrap()),
+        positions(&db.read_stream("ab", 0, 0).unwrap())
+    );
+    assert_eq!(
+        positions(&restored.read_stream("c", 0, 0).unwrap()),
+        positions(&db.read_stream("c", 0, 0).unwrap())
+    );
+    let plain_dst = d.path().join("plain");
+    chron::restore_backup(&plain, &plain_dst, &opts()).unwrap();
+    assert!(open(&plain_dst).streams().unwrap().is_empty());
+}
+
 #[cfg(feature = "tokio")]
 mod tokio_api {
     use super::*;

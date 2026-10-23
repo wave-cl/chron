@@ -210,7 +210,10 @@ fn real_expected(e: &Exp, cur: u64) -> Expected {
     }
 }
 
-fn check(db: &Db, model: &Model) -> Result<(), TestCaseError> {
+/// The streams the run defines: a name and the tags it covers.
+const STREAMS: [(&str, &[&str]); 2] = [("ab", &["a", "b"]), ("c", &["c"])];
+
+fn check(db: &Db, model: &Model, streams: usize) -> Result<(), TestCaseError> {
     prop_assert_eq!(db.head(), model.events.len() as u64);
     prop_assert_eq!(db.floor(), model.floor);
     let visible: Vec<Projected> = model.visible().cloned().collect();
@@ -282,6 +285,33 @@ fn check(db: &Db, model: &Model) -> Result<(), TestCaseError> {
             model.lens.get(&agg).copied().unwrap_or(0)
         );
     }
+    for (name, tags) in &STREAMS[..streams] {
+        let want: Vec<Projected> = visible
+            .iter()
+            .filter(|e| {
+                e.tags
+                    .iter()
+                    .any(|x| tags.iter().any(|t| x.as_ref() == t.as_bytes()))
+            })
+            .cloned()
+            .collect();
+        let got: Vec<Projected> = db
+            .read_stream(name, 0, usize::MAX)
+            .unwrap()
+            .iter()
+            .map(project)
+            .collect();
+        prop_assert_eq!(&got, &want, "stream {}", name);
+        let mut back: Vec<Projected> = db
+            .read_stream_backward(name, u64::MAX, usize::MAX)
+            .unwrap()
+            .iter()
+            .map(project)
+            .collect();
+        back.reverse();
+        prop_assert_eq!(&back, &want, "stream {} backward", name);
+    }
+    prop_assert_eq!(db.streams().unwrap().len(), streams);
     if model.floor > 0 {
         let below = matches!(
             db.read_all(model.floor - 1, 1),
@@ -308,9 +338,18 @@ proptest! {
         let o = opts().segment_max_bytes(300);
         let mut db = Some(Db::open(d.path(), o.clone()).unwrap());
         let mut model = Model::default();
+        // One stream from the start, one defined halfway through: the
+        // second covers what was there before it.
+        db.as_ref().unwrap().create_stream(STREAMS[0].0, STREAMS[0].1.iter().copied()).unwrap();
+        let mut streams = 1;
+        let midway = ops.len() / 2;
         // Per op: what was sent (resolved appends) and where it landed.
         let mut sent: Vec<Option<Sent>> = Vec::new();
         for (k, op) in ops.iter().enumerate() {
+            if k == midway {
+                db.as_ref().unwrap().create_stream(STREAMS[1].0, STREAMS[1].1.iter().copied()).unwrap();
+                streams = 2;
+            }
             let handle = db.as_ref().unwrap();
             let mut record = None;
             match op {
@@ -386,7 +425,7 @@ proptest! {
                 }
             }
             sent.push(record);
-            check(db.as_ref().unwrap(), &model)?;
+            check(db.as_ref().unwrap(), &model, streams)?;
         }
     }
 }

@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use bytes::Bytes;
 use redb::Durability;
 use uuid::Uuid;
 
@@ -12,6 +13,7 @@ use crate::index::{DB_ID_KEY, FLOOR_KEY, HEAD_KEY, Index, META, META_BYTES};
 use crate::options::{Fsync, Options};
 use crate::recover::{FLUSH_EVERY, Item, Records, Replayer, later_record_exists};
 use crate::segment;
+use crate::stream;
 
 /// What [`Db::rebuild_index`](crate::Db::rebuild_index) found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,19 +76,27 @@ enum IdSource {
 /// index holds (if any): lengths of aggregates whose events all lie
 /// below the floor exist nowhere else.
 pub(crate) fn rebuild(path: &Path, opts: &Options) -> Result<Rebuilt> {
-    rebuild_from(path, opts, IdSource::Existing, Vec::new(), Vec::new())
+    rebuild_from(
+        path,
+        opts,
+        IdSource::Existing,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
-/// Rebuilds from a backup: `id`, `lens` and `cursors` come from the
-/// archive; without an id the next open mints a fresh identity.
+/// Rebuilds from a backup: `id`, `lens`, `cursors` and `streams` come
+/// from the archive; without an id the next open mints a fresh identity.
 pub(crate) fn rebuild_seeded(
     path: &Path,
     opts: &Options,
     id: Option<Uuid>,
     lens: Vec<(Uuid, u64)>,
     cursors: Vec<(String, u64, u64)>,
+    streams: Vec<(String, Vec<Bytes>)>,
 ) -> Result<Rebuilt> {
-    rebuild_from(path, opts, IdSource::Given(id), lens, cursors)
+    rebuild_from(path, opts, IdSource::Given(id), lens, cursors, streams)
 }
 
 fn rebuild_from(
@@ -95,6 +105,7 @@ fn rebuild_from(
     id: IdSource,
     seed: Vec<(Uuid, u64)>,
     given_cursors: Vec<(String, u64, u64)>,
+    given_streams: Vec<(String, Vec<Bytes>)>,
 ) -> Result<Rebuilt> {
     let layout = Layout::new(path);
     let dir = layout.segments_dir();
@@ -108,11 +119,12 @@ fn rebuild_from(
     let segments = validated_segments(&dir)?;
     // Only after the segments passed: opening the old index may rewrite
     // its file, and a refused rebuild must leave it untouched.
-    // The old index is the only place cursors live: they are copied
-    // with the identity and the aggregate lengths. A seeded rebuild (a
+    // The old index is the only place cursors and stream definitions
+    // live: they are copied with the identity and the aggregate lengths
+    // (a stream half filled is rebuilt whole). A seeded rebuild (a
     // restore) takes the archive's.
-    let (id, seed, cursors) = match id {
-        IdSource::Given(id) => (id, seed, given_cursors),
+    let (id, seed, cursors, stream_defs) = match id {
+        IdSource::Given(id) => (id, seed, given_cursors, given_streams),
         IdSource::Existing => {
             let index_file = layout.index_file();
             let old = if index_file.exists() {
@@ -125,8 +137,13 @@ fn rebuild_from(
                     old.db_id().unwrap_or(None),
                     old.aggregate_lens().unwrap_or_default(),
                     old.cursors().unwrap_or_default(),
+                    old.stream_rows()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(name, row)| (name, stream::decode_tagset(&row.tagset)))
+                        .collect(),
                 ),
-                None => (None, Vec::new(), Vec::new()),
+                None => (None, Vec::new(), Vec::new(), Vec::new()),
             }
         }
     };
@@ -136,10 +153,11 @@ fn rebuild_from(
     if !cursors.is_empty() {
         index.set_cursors(&cursors)?;
     }
+    let streams = stream::seed(&index, &stream_defs)?;
     let floor = segments.first().map_or(0, |(b, _)| *b);
     // An aggregate first seen above a floor may start at any index: its
     // earlier events were dropped.
-    let mut replayer = Replayer::new(floor, floor > 0);
+    let mut replayer = Replayer::new(floor, floor > 0, streams);
     let mut unknown = |_: &Uuid| Ok(None);
     let mut next_base = floor;
     let mut tail_bytes_dropped = 0u64;

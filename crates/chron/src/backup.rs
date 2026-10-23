@@ -10,6 +10,8 @@
 //!   kind 3  "agg_len": (uuid, u64 length) pairs                  (full backups)
 //!   kind 4  "cursors": u16 name_len | name | u64 next | u64 session, per cursor
 //!           (full backups holding a cursor; the header then says format 2)
+//!   kind 5  "streams": u16 name_len | name | u8 tag_count | (u8 len | bytes)*, per
+//!           stream (full backups holding a stream; the header then says format 3)
 //! u8 0xFF | u32 crc32 over everything before it
 //! ```
 
@@ -19,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -34,6 +37,8 @@ const FORMAT: u32 = 1;
 /// The format of an archive carrying a `cursors` entry: a reader from
 /// before cursors refuses it at the header rather than at the entry.
 const FORMAT_CURSORS: u32 = 2;
+/// The format of an archive carrying a `streams` entry.
+const FORMAT_STREAMS: u32 = 3;
 const KIND_SEGMENT: u8 = 1;
 const KIND_RECORDS: u8 = 2;
 /// Every aggregate's length, (16-byte uuid, u64) pairs: lengths of
@@ -41,6 +46,8 @@ const KIND_RECORDS: u8 = 2;
 const KIND_AGG_LEN: u8 = 3;
 /// Every durable cursor: `(name, next, session)`; a restore keeps them.
 const KIND_CURSORS: u8 = 4;
+/// Every stream definition: `(name, tags)`; a restore rebuilds its entries.
+const KIND_STREAMS: u8 = 5;
 const KIND_END: u8 = 0xFF;
 const MAX_HEADER: u32 = 16 * 1024 * 1024;
 const COPY_CHUNK: usize = 1 << 20;
@@ -319,20 +326,30 @@ pub(crate) fn write_full_to(
     let _m = inner.maintenance.lock().unwrap_or_else(|p| p.into_inner());
     let plan = plan(inner)?;
     let cursors = inner.index.cursors()?;
+    let streams: Vec<(String, Vec<Bytes>)> = inner
+        .streams()
+        .iter()
+        .map(|d| (d.name.clone(), d.tags.clone()))
+        .collect();
     let mut meta = BackupMeta {
-        // A database without cursors writes the format every reader
-        // knows; one with them needs a reader that knows the entry.
-        format: if cursors.is_empty() {
-            FORMAT
-        } else {
+        // A database without cursors or streams writes the format every
+        // reader knows; one with them needs a reader that knows the entry.
+        format: if !streams.is_empty() {
+            FORMAT_STREAMS
+        } else if !cursors.is_empty() {
             FORMAT_CURSORS
+        } else {
+            FORMAT
         },
         kind: BackupKind::Full,
         base_head: None,
         head: plan.head,
         floor: plan.floor,
         created_at_unix_nanos: now_nanos(),
-        files: plan.segments.len() as u64 + 1 + u64::from(!cursors.is_empty()),
+        files: plan.segments.len() as u64
+            + 1
+            + u64::from(!cursors.is_empty())
+            + u64::from(!streams.is_empty()),
         bytes: 0,
         db_id: Some(*inner.db_id.lock().unwrap_or_else(|p| p.into_inner())),
     };
@@ -361,8 +378,58 @@ pub(crate) fn write_full_to(
         w.entry_header(KIND_CURSORS, "cursors", bytes.len() as u64)?;
         w.bytes(&bytes)?;
     }
+    if !streams.is_empty() {
+        let bytes = encode_streams(&streams);
+        w.entry_header(KIND_STREAMS, "streams", bytes.len() as u64)?;
+        w.bytes(&bytes)?;
+    }
     meta.bytes = w.finish()?;
     Ok(meta)
+}
+
+/// Encodes a `streams` entry: per stream `u16 name_len | name | u8
+/// tag_count | (u8 len | bytes)*`.
+fn encode_streams(streams: &[(String, Vec<Bytes>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, tags) in streams {
+        out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.push(tags.len() as u8);
+        for t in tags {
+            out.push(t.len() as u8);
+            out.extend_from_slice(t);
+        }
+    }
+    out
+}
+
+/// Decodes a `streams` entry.
+fn parse_streams(bytes: &[u8], path: &Path, at: u64) -> Result<Vec<(String, Vec<Bytes>)>> {
+    let take = |p: &mut usize, n: usize| -> Result<&[u8]> {
+        let s = bytes
+            .get(*p..*p + n)
+            .ok_or_else(|| Error::corrupt(path, at + *p as u64, "truncated streams entry"))?;
+        *p += n;
+        Ok(s)
+    };
+    let mut out = Vec::new();
+    let mut p = 0usize;
+    while p < bytes.len() {
+        let n = usize::from(u16::from_be_bytes(
+            take(&mut p, 2)?.try_into().expect("two bytes"),
+        ));
+        let name = std::str::from_utf8(take(&mut p, n)?)
+            .map_err(|_| Error::corrupt(path, at + p as u64, "a stream name is not utf-8"))?
+            .to_string();
+        let count = usize::from(take(&mut p, 1)?[0]);
+        let mut tags = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = usize::from(take(&mut p, 1)?[0]);
+            tags.push(Bytes::copy_from_slice(take(&mut p, len)?));
+        }
+        out.push((name, tags));
+    }
+    Ok(out)
 }
 
 /// Encodes a `cursors` entry.
@@ -565,7 +632,7 @@ impl<R: Read> Reader<R> {
         r.read_hashed(&mut header)?;
         let meta: BackupMeta = serde_json::from_slice(&header)
             .map_err(|e| Error::corrupt(what, 12, format!("bad header: {e}")))?;
-        if meta.format != FORMAT && meta.format != FORMAT_CURSORS {
+        if !(FORMAT..=FORMAT_STREAMS).contains(&meta.format) {
             return Err(Error::corrupt(
                 what,
                 12,
@@ -748,6 +815,7 @@ fn restore_into<R: Read>(
     fs::create_dir_all(&segments_dir).map_err(|e| Error::io(&segments_dir, "mkdir", e))?;
     let mut lens: Vec<(Uuid, u64)> = Vec::new();
     let mut cursors: Vec<(String, u64, u64)> = Vec::new();
+    let mut streams: Vec<(String, Vec<Bytes>)> = Vec::new();
     while let Some((kind, name, len)) = reader.next_entry()? {
         if kind == KIND_AGG_LEN {
             let at = reader.at;
@@ -759,6 +827,12 @@ fn restore_into<R: Read>(
             let at = reader.at;
             let bytes = reader.read_entry(len)?;
             cursors = parse_cursors(&bytes, &reader.path, at)?;
+            continue;
+        }
+        if kind == KIND_STREAMS {
+            let at = reader.at;
+            let bytes = reader.read_entry(len)?;
+            streams = parse_streams(&bytes, &reader.path, at)?;
             continue;
         }
         if kind != KIND_SEGMENT {
@@ -791,7 +865,7 @@ fn restore_into<R: Read>(
     for c in &mut cursors {
         c.1 = c.1.min(meta.head);
     }
-    let rebuilt = rebuild::rebuild_seeded(staging, opts, meta.db_id, lens, cursors)?;
+    let rebuilt = rebuild::rebuild_seeded(staging, opts, meta.db_id, lens, cursors, streams)?;
     if rebuilt.head != meta.head || rebuilt.floor != meta.floor || rebuilt.dropped != 0 {
         return Err(Error::corrupt(
             staging,

@@ -19,6 +19,11 @@ crates share one version.
   creation, from the tag entries a chunk at a time without holding up
   commits. A truncation drops a stream's entries from the cut, retention
   those below the floor; both by range, no record scan.
+  Definitions survive a crash (the replay at open indexes for them; a
+  creation interrupted before its fill finished is removed with its
+  entries), an index rebuild (entries recomputed) and a full backup: an
+  archive holding a stream says `format` 3 in its header and a restore
+  rebuilds the entries from the definitions.
 
 ## 0.6.0 - 2026-10-23
 

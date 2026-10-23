@@ -28,6 +28,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use redb::Durability;
@@ -36,9 +37,10 @@ use uuid::Uuid;
 use crate::db::Layout;
 use crate::error::{Error, Result};
 use crate::event::{self, Event};
-use crate::index::{AGG_INDEX, AGG_LEN, HEAD_KEY, Index, META, POS, TAG, TXN_ID};
+use crate::index::{AGG_INDEX, AGG_LEN, HEAD_KEY, Index, META, POS, STREAM_POS, TAG, TXN_ID};
 use crate::options::Options;
 use crate::segment::{self, HEADER_LEN, ScanItem, Scanner, SegmentWriter};
+use crate::stream::{self, StreamDef};
 
 pub(crate) struct Recovered {
     pub index: Index,
@@ -168,10 +170,16 @@ pub(crate) struct Replayer {
     /// rebuild of a database above a floor, whose earlier events are gone.
     unknown_starts_anywhere: bool,
     pub decoded: u64,
+    /// The streams the replayed records are indexed for.
+    streams: Vec<Arc<StreamDef>>,
 }
 
 impl Replayer {
-    pub(crate) fn new(head: u64, unknown_starts_anywhere: bool) -> Self {
+    pub(crate) fn new(
+        head: u64,
+        unknown_starts_anywhere: bool,
+        streams: Vec<Arc<StreamDef>>,
+    ) -> Self {
         Replayer {
             lens: HashMap::new(),
             pending: HashMap::new(),
@@ -184,6 +192,7 @@ impl Replayer {
             last_complete_end: HEADER_LEN,
             unknown_starts_anywhere,
             decoded: 0,
+            streams,
         }
     }
 
@@ -270,6 +279,11 @@ impl Replayer {
         let mut tag = txn.open_table(TAG)?;
         let mut agg_len = txn.open_table(AGG_LEN)?;
         let mut ids = txn.open_table(TXN_ID)?;
+        let mut stream_pos = if self.streams.is_empty() {
+            None
+        } else {
+            Some(txn.open_table(STREAM_POS)?)
+        };
         for (id, first, next) in self.txn_ids.drain(..) {
             ids.insert(&id, (first, next))?;
         }
@@ -280,6 +294,11 @@ impl Replayer {
             }
             for t in &e.tags {
                 tag.insert((t.as_ref(), e.position), ())?;
+            }
+            if let Some(sp) = stream_pos.as_mut() {
+                for s in self.streams.iter().filter(|s| s.member(&e.tags)) {
+                    sp.insert((s.id, e.position), ())?;
+                }
             }
         }
         for id in self.touched.drain() {
@@ -342,6 +361,11 @@ pub(crate) fn recover(layout: &Layout, opts: &Options) -> Result<Recovered> {
     if let Some(to) = index.truncate_intent()? {
         crate::truncate::finish(&index, layout, to)?;
     }
+    // A stream whose fill was interrupted: its definition is durable, its
+    // entries may or may not be; nothing else names its id. Gone before
+    // the replay, which indexes only for the streams that stay.
+    stream::remove_unready(&index)?;
+    let streams = stream::load(&index)?;
     let head_d = index.head()?;
     let floor = index.floor()?;
 
@@ -401,7 +425,7 @@ pub(crate) fn recover(layout: &Layout, opts: &Options) -> Result<Recovered> {
     };
 
     let max_record = opts.max_record_bytes;
-    let mut replayer = Replayer::new(head_d, false);
+    let mut replayer = Replayer::new(head_d, false, streams);
     let mut known = |id: &Uuid| index.aggregate_len(id).map(Some);
     let mut tail: Option<(usize, u64)> = None;
     let mut j = k;

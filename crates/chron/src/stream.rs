@@ -122,6 +122,64 @@ pub(crate) fn normalise(name: &str, tags: Vec<Bytes>) -> Result<Vec<Bytes>> {
     Ok(tags)
 }
 
+/// Writes definitions into a fresh index (a rebuild or a restore) with
+/// fresh ids, all ready: the replay that follows computes every entry.
+/// Returns them for that replay.
+pub(crate) fn seed(index: &Index, defs: &[(String, Vec<Bytes>)]) -> Result<Vec<Arc<StreamDef>>> {
+    let mut out = Vec::with_capacity(defs.len());
+    if defs.is_empty() {
+        return Ok(out);
+    }
+    let txn = index.begin_write_durable()?;
+    {
+        let mut table = txn.open_table(STREAM)?;
+        let mut meta = txn.open_table(META)?;
+        for (k, (name, tags)) in defs.iter().enumerate() {
+            let tags = normalise(name, tags.clone())?;
+            let id =
+                u32::try_from(k).map_err(|_| Error::InvalidStream("too many streams".into()))?;
+            table.insert(
+                name.as_str(),
+                (id, true, 0u64, encode_tagset(&tags).as_slice()),
+            )?;
+            out.push(Arc::new(StreamDef {
+                id,
+                name: name.clone(),
+                tags,
+                ready: AtomicBool::new(true),
+            }));
+        }
+        meta.insert(STREAM_NEXT_ID_KEY, defs.len() as u64)?;
+    }
+    txn.commit()?;
+    Ok(out)
+}
+
+/// Removes every stream whose fill never finished, with its entries: a
+/// creation interrupted by a crash leaves nothing. How many went.
+pub(crate) fn remove_unready(index: &Index) -> Result<usize> {
+    let unready: Vec<(String, u32)> = index
+        .stream_rows()?
+        .into_iter()
+        .filter(|(_, r)| !r.ready)
+        .map(|(name, r)| (name, r.id))
+        .collect();
+    if unready.is_empty() {
+        return Ok(0);
+    }
+    let txn = index.begin_write_durable()?;
+    {
+        let mut table = txn.open_table(STREAM)?;
+        let mut positions = txn.open_table(STREAM_POS)?;
+        for (name, id) in &unready {
+            table.remove(name.as_str())?;
+            positions.retain_in((*id, 0)..=(*id, u64::MAX), |_, _| false)?;
+        }
+    }
+    txn.commit()?;
+    Ok(unready.len())
+}
+
 /// Every definition the index holds, ready or not.
 pub(crate) fn load(index: &Index) -> Result<Vec<Arc<StreamDef>>> {
     Ok(index
