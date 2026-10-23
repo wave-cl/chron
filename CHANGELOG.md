@@ -6,6 +6,10 @@ crates share one version.
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.7.0 - 2026-10-23
+
 ### chron-db
 
 - Streams: `Db::create_stream(name, tags)` defines a named subset of the
