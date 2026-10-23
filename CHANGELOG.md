@@ -6,6 +6,10 @@ crates share one version.
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.6.0 - 2026-10-23
+
 ### chron-db
 
 - Capped reads: `read_all_bounded_upto`, `read_aggregate_bounded_upto`,
