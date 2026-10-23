@@ -214,6 +214,186 @@ fn delete_removes_the_entries_and_a_recreate_starts_clean() {
     );
 }
 
+/// A stream begun while a batch waits behind the writer lock misses
+/// none of that batch's members and doubles none: whichever of the two
+/// takes the lock first, the batch lands through the cache or lies below
+/// the head the definition records.
+#[test]
+fn a_create_racing_a_held_batch_misses_nothing() {
+    for round in 0..10 {
+        let d = tmp();
+        let db = open(d.path());
+        write_pattern(&db, 6, PATTERN);
+        let hold = db.debug_hold_writer();
+        let db1 = db.clone();
+        let writer = std::thread::spawn(move || {
+            for i in 0..5 {
+                let mut t = db1.transaction();
+                t.append_free(vec![tagged(&format!("w{i}"), &["a", "x"])]);
+                t.commit().unwrap();
+            }
+        });
+        let db2 = db.clone();
+        let creator = std::thread::spawn(move || db2.create_stream("s", ["a"]).unwrap());
+        // Both threads queue behind the hold; the order they take the
+        // lock in once it drops is theirs.
+        std::thread::sleep(Duration::from_millis(20 + round * 5));
+        drop(hold);
+        writer.join().unwrap();
+        creator.join().unwrap();
+        assert_eq!(
+            positions(&db.read_stream("s", 0, 0).unwrap()),
+            merged(&db, &["a"]),
+            "round {round}"
+        );
+    }
+}
+
+/// A truncation drops the stream entries from the cut on; records landing
+/// at the reused positions are indexed afresh. A cut at the head changes
+/// nothing.
+#[test]
+fn truncate_drops_entries_from_the_cut_and_reused_positions_are_indexed_again() {
+    let d = tmp();
+    let db = open(d.path());
+    write_pattern(&db, 24, PATTERN);
+    db.create_stream("ab", ["a", "b"]).unwrap();
+    let before = positions(&db.read_stream("ab", 0, 0).unwrap());
+    db.truncate_to(db.head()).unwrap();
+    assert_eq!(positions(&db.read_stream("ab", 0, 0).unwrap()), before);
+    db.truncate_to(10).unwrap();
+    assert_eq!(
+        positions(&db.read_stream("ab", 0, 0).unwrap()),
+        merged(&db, &["a", "b"])
+    );
+    assert!(
+        positions(&db.read_stream("ab", 0, 0).unwrap())
+            .iter()
+            .all(|p| *p < 10)
+    );
+    // Reused positions with other tags: only the members come back.
+    for i in 0..10 {
+        let mut t = db.transaction();
+        let tags: &[&str] = if i % 2 == 0 { &["b"] } else { &["c"] };
+        t.append_free(vec![tagged(&format!("r{i}"), tags)]);
+        t.commit().unwrap();
+    }
+    assert_eq!(
+        positions(&db.read_stream("ab", 0, 0).unwrap()),
+        merged(&db, &["a", "b"])
+    );
+    assert_eq!(
+        positions(&db.read_stream("ab", 10, 0).unwrap()),
+        [10, 12, 14, 16, 18]
+    );
+}
+
+/// Retention drops the stream entries below the floor, a read from 0
+/// starts at the floor, and a retention landing between two chunks of a
+/// fill leaves no entry below the new floor.
+#[test]
+fn retention_drops_entries_below_the_floor_even_during_a_fill() {
+    let d = tmp();
+    let db = open_with(d.path(), opts().segment_max_bytes(300));
+    write_pattern(&db, 60, PATTERN);
+    assert!(segments(d.path()).len() > 3);
+    db.create_stream("ab", ["a", "b"]).unwrap();
+    let head = db.head();
+    db.retain_from(db.floor()).unwrap();
+    assert_eq!(
+        positions(&db.read_stream("ab", 0, 0).unwrap()),
+        merged(&db, &["a", "b"]),
+        "a retention at the floor changes nothing"
+    );
+    let r = db.retain_from(head / 2).unwrap();
+    assert!(r.floor > 0);
+    let got = positions(&db.read_stream("ab", 0, 0).unwrap());
+    assert_eq!(got, merged(&db, &["a", "b"]));
+    assert!(got.iter().all(|p| *p >= r.floor));
+    assert_eq!(
+        db.debug_stream_entries("ab").unwrap(),
+        got,
+        "the table holds nothing below the floor"
+    );
+    let mut sub = db.subscribe_stream("ab", 0).unwrap();
+    assert_eq!(
+        sub.next_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .position,
+        got[0],
+        "a subscription from below the floor starts at it"
+    );
+    // A second stream, filled with a retention between its chunks: the
+    // first chunk's entries below the new floor are gone with it.
+    db.begin_stream("c", ["b", "c"]).unwrap();
+    let floor_before = db.floor();
+    let db2 = db.clone();
+    let mut cut = false;
+    let done = db
+        .debug_fill_stream_with("c", || {
+            if !cut {
+                cut = true;
+                let h = db2.head();
+                db2.retain_from(h - h / 4).unwrap();
+            }
+        })
+        .unwrap();
+    assert!(done);
+    assert!(cut, "the hook ran");
+    assert!(db.floor() > floor_before);
+    let got = positions(&db.read_stream("c", 0, 0).unwrap());
+    assert_eq!(got, merged(&db, &["b", "c"]));
+    assert!(got.iter().all(|p| *p >= db.floor()));
+    assert_eq!(
+        db.debug_stream_entries("c").unwrap(),
+        got,
+        "the chunk written before the retention left nothing below the floor"
+    );
+    assert!(
+        positions(&db.read_stream_backward("c", u64::MAX, 0).unwrap())
+            .iter()
+            .all(|p| *p >= db.floor())
+    );
+}
+
+/// A fill of several chunks while another thread commits members: the
+/// result equals the merge of the tag reads.
+#[test]
+fn a_fill_of_several_chunks_interleaved_with_commits_is_complete() {
+    let d = tmp();
+    let db = open(d.path());
+    // 60 000 tagged events: more than one fill chunk.
+    for i in 0..300 {
+        let mut t = db.transaction();
+        let tags: &[&str] = if i % 2 == 0 { &["a"] } else { &["b"] };
+        t.append_free(
+            (0..200)
+                .map(|j| tagged(&format!("{i}-{j}"), tags))
+                .collect(),
+        );
+        t.commit().unwrap();
+    }
+    let db1 = db.clone();
+    let writer = std::thread::spawn(move || {
+        for i in 0..200 {
+            let mut t = db1.transaction();
+            t.append_free(vec![
+                tagged(&format!("live{i}"), &["a"]),
+                tagged("n", &["c"]),
+            ]);
+            t.commit().unwrap();
+        }
+    });
+    db.create_stream("a", ["a"]).unwrap();
+    writer.join().unwrap();
+    assert_eq!(
+        positions(&db.read_stream("a", 0, 0).unwrap()),
+        merged(&db, &["a"])
+    );
+    assert_eq!(db.read_stream("a", 0, 0).unwrap().len(), 30_000 + 200);
+}
+
 #[cfg(feature = "tokio")]
 mod tokio_api {
     use super::*;

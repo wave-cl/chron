@@ -17,7 +17,8 @@ crates share one version.
   index gains `stream` and `stream_pos` tables (an older index reads as
   having no streams); members are indexed as records land and, at
   creation, from the tag entries a chunk at a time without holding up
-  commits.
+  commits. A truncation drops a stream's entries from the cut, retention
+  those below the floor; both by range, no record scan.
 
 ## 0.6.0 - 2026-10-23
 

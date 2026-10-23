@@ -12,6 +12,7 @@ use crate::error::{Error, Result};
 use crate::event::FLAG_FIRST_IN_TXN;
 use redb::ReadableTable;
 
+use crate::index::STREAM_POS;
 use crate::index::{
     AGG_INDEX, AGG_LEN, HEAD_KEY, Index, META, POS, TAG, TRUNCATE_INTENT_KEY, TXN_ID,
 };
@@ -159,6 +160,15 @@ pub(crate) fn truncate_with(inner: &Inner, to: u64, marker_only: bool) -> Result
         }
         for (t, p) in &tag_keys {
             tag.remove((t.as_slice(), *p))?;
+        }
+        // Stream entries only ever name positions below the head, so
+        // everything from the cut on goes, per stream, by range.
+        let streams = inner.streams();
+        if !streams.is_empty() {
+            let mut stream_pos = txn.open_table(STREAM_POS)?;
+            for s in streams.iter() {
+                stream_pos.retain_in((s.id, to)..=(s.id, u64::MAX), |_, _| false)?;
+            }
         }
         // The cut transactions' ids go with them: a resend lands again.
         let mut txn_ids = txn.open_table(TXN_ID)?;

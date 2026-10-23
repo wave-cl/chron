@@ -326,6 +326,22 @@ impl Index {
         Ok(())
     }
 
+    /// Every entry of the stream, floor or not: what the table holds.
+    pub(crate) fn stream_entries(&self, id: u32) -> Result<Vec<u64>> {
+        let txn = self.begin_read()?;
+        let mut out = Vec::new();
+        let table = match txn.open_table(STREAM_POS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        for item in table.range((id, 0)..=(id, u64::MAX))? {
+            let (k, _) = item?;
+            out.push(k.value().1);
+        }
+        Ok(out)
+    }
+
     /// Positions of the stream's members from `from` (and the floor) and
     /// below `upto`, ascending.
     pub(crate) fn stream_positions(

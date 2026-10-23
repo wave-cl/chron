@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::db::Inner;
 use crate::error::{Error, Result};
-use crate::index::{AGG_INDEX, FLOOR_KEY, META, POS, TAG, TXN_ID};
+use crate::index::{AGG_INDEX, FLOOR_KEY, META, POS, STREAM_POS, TAG, TXN_ID};
 use crate::recover::{Item, Records};
 use crate::segment;
 
@@ -109,7 +109,7 @@ pub(crate) fn retain(inner: &Inner, floor: u64, remove_files: bool) -> Result<Re
     }
 
     // The index first, in one short durable transaction.
-    inner.durable_index(|_, txn| {
+    inner.durable_index(|inner, txn| {
         let mut pos = txn.open_table(POS)?;
         let mut agg_index = txn.open_table(AGG_INDEX)?;
         let mut tag = txn.open_table(TAG)?;
@@ -121,6 +121,16 @@ pub(crate) fn retain(inner: &Inner, floor: u64, remove_files: bool) -> Result<Re
         }
         for (t, p) in &tag_keys {
             tag.remove((t.as_slice(), *p))?;
+        }
+        // Stream entries below the new floor go by range, per stream
+        // (a fill in progress may have written some since its last chunk
+        // read the floor; it reads the new one at its next).
+        let streams = inner.streams();
+        if !streams.is_empty() {
+            let mut stream_pos = txn.open_table(STREAM_POS)?;
+            for s in streams.iter() {
+                stream_pos.retain_in((s.id, 0)..(s.id, new_floor), |_, _| false)?;
+            }
         }
         // Ids below the floor are forgotten with their records.
         let mut txn_ids = txn.open_table(TXN_ID)?;

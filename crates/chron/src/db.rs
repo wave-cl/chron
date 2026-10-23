@@ -1072,7 +1072,7 @@ impl Db {
             name,
             tags.into_iter().map(Into::into).collect(),
         )?;
-        if !stream::fill(&self.inner, &def)? {
+        if !stream::fill(&self.inner, &def, None)? {
             return Err(Error::NoStream(name.to_string()));
         }
         Ok(def.info())
@@ -1106,7 +1106,36 @@ impl Db {
             .find(|d| d.name == name)
             .cloned()
             .ok_or_else(|| Error::NoStream(name.to_string()))?;
-        stream::fill(&self.inner, &def)
+        stream::fill(&self.inner, &def, None)
+    }
+
+    /// [`fill_stream`](Db::fill_stream) with `between` run after each
+    /// chunk of the fill, no lock held: for tests of a retention or a
+    /// truncation landing in the middle of a fill.
+    #[doc(hidden)]
+    pub fn debug_fill_stream_with(&self, name: &str, mut between: impl FnMut()) -> Result<bool> {
+        let def = self
+            .inner
+            .streams()
+            .iter()
+            .find(|d| d.name == name)
+            .cloned()
+            .ok_or_else(|| Error::NoStream(name.to_string()))?;
+        stream::fill(&self.inner, &def, Some(&mut between))
+    }
+
+    /// Every index entry of the stream, below the floor included: what
+    /// the table holds, not what a read serves. For tests of retention.
+    #[doc(hidden)]
+    pub fn debug_stream_entries(&self, name: &str) -> Result<Vec<u64>> {
+        let def = self
+            .inner
+            .streams()
+            .iter()
+            .find(|d| d.name == name)
+            .cloned()
+            .ok_or_else(|| Error::NoStream(name.to_string()))?;
+        self.inner.index.stream_entries(def.id)
     }
 
     /// Removes the stream and its index entries; whether it existed. A

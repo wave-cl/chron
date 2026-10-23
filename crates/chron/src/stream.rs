@@ -176,14 +176,19 @@ pub(crate) fn begin(inner: &Inner, name: &str, tags: Vec<Bytes>) -> Result<Arc<S
 /// written at, a chunk per index transaction under the maintenance lock
 /// (never across the whole fill: chunk cuts, backups and retention take
 /// turns between chunks), then marks the stream ready. `Ok(false)` when
-/// the stream was deleted meanwhile.
-pub(crate) fn fill(inner: &Inner, def: &Arc<StreamDef>) -> Result<bool> {
+/// the stream was deleted meanwhile. `between` runs after each chunk
+/// with no lock held (for tests of what interleaves).
+pub(crate) fn fill(
+    inner: &Inner,
+    def: &Arc<StreamDef>,
+    mut between: Option<&mut dyn FnMut()>,
+) -> Result<bool> {
     let name = def.name.as_str();
     // Per tag, the next position to scan from; a tag leaves the list once
     // its range is exhausted.
     let mut pending: Vec<(Bytes, u64)> = def.tags.iter().map(|t| (t.clone(), 0)).collect();
     loop {
-        let _m = inner.maintenance.lock().unwrap_or_else(|p| p.into_inner());
+        let m = inner.maintenance.lock().unwrap_or_else(|p| p.into_inner());
         let txn = inner.index.begin_write_with(Durability::None)?;
         let row = {
             let table = txn.open_table(STREAM)?;
@@ -204,7 +209,7 @@ pub(crate) fn fill(inner: &Inner, def: &Arc<StreamDef>) -> Result<bool> {
         }
         if pending.is_empty() {
             drop(txn);
-            drop(_m);
+            drop(m);
             break;
         }
         // The floor as of this chunk: positions retention dropped since
@@ -247,6 +252,10 @@ pub(crate) fn fill(inner: &Inner, def: &Arc<StreamDef>) -> Result<bool> {
             }
         }
         txn.commit()?;
+        drop(m);
+        if let Some(f) = between.as_mut() {
+            f();
+        }
     }
     inner
         .durable_index(|_, txn| {
