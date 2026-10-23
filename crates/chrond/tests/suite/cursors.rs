@@ -301,3 +301,83 @@ async fn a_follower_keeps_no_cursors() {
     }
     c.stop_all().await;
 }
+
+/// A full backup carries the cursors: a daemon started on the restored
+/// copy resumes a consumer at its last acknowledgment.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_database_resumes_its_cursors() {
+    let s = Server::start_with(crate::common::with_backup_dir).await;
+    let client = typed(&s).await;
+    fill(&client, 5).await;
+    let (mut stream, cursor) = client.subscribe_cursor("p", 0, None).await.unwrap();
+    for i in 0..3 {
+        assert_eq!(next_event(&mut stream).await.position, i);
+    }
+    assert_eq!(cursor.ack(3).await.unwrap(), 3);
+    let mut raw = s.client.clone();
+    raw.backup(pb::BackupRequest {
+        archive: "full.chronbak".into(),
+        since: None,
+    })
+    .await
+    .unwrap();
+    drop(stream);
+    let archive = s.dir.path().join("backups/default/full.chronbak");
+    let dir = tempfile::tempdir().unwrap();
+    chron::restore_backup(
+        &archive,
+        dir.path().join("data/default"),
+        &chron::Options::new(),
+    )
+    .unwrap();
+    let s2 = Server::start_in(dir, "127.0.0.1:0".parse().unwrap(), |_| {}).await;
+    let client2 = typed(&s2).await;
+    assert_eq!(client2.cursors().await.unwrap().cursors.len(), 1);
+    let (mut stream, cursor) = client2.subscribe_cursor("p", 0, None).await.unwrap();
+    assert_eq!(
+        (cursor.session(), cursor.from),
+        (2, 3),
+        "resumed at the restored acknowledgment"
+    );
+    assert_eq!(next_event(&mut stream).await.position, 3);
+}
+
+/// A copy holding a cursor the leader no longer has (deleted while the
+/// copy was away) drops it on the opening chunk.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_opening_chunk_drops_a_cursor_the_leader_lacks() {
+    let mut c = Cluster::start(3, TTL).await;
+    let (l, others) = settled(&c).await;
+    let f = others[0];
+    let client = c.client(l).await;
+    fill(&client, 3).await;
+    let (mut stream, cursor) = client.subscribe_cursor("p", 0, None).await.unwrap();
+    assert_eq!(next_event(&mut stream).await.position, 0);
+    assert_eq!(cursor.ack(1).await.unwrap(), 1);
+    let held = |c: &Cluster, i: usize| -> Vec<String> {
+        c.node(i)
+            .databases()
+            .into_iter()
+            .find(|d| d.name == "default")
+            .expect("the database")
+            .db
+            .cursors()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect()
+    };
+    c.wait("the follower holds the cursor", SOON, || {
+        held(&c, f) == ["p"]
+    })
+    .await;
+    c.stop(f).await;
+    drop(stream);
+    assert!(client.delete_cursor("p").await.unwrap());
+    c.restart(f).await;
+    c.wait_following(f, l, SOON).await;
+    c.wait("the stale cursor goes on the opening chunk", SOON, || {
+        held(&c, f).is_empty()
+    })
+    .await;
+}

@@ -563,6 +563,9 @@ pub struct ReplicationChunk {
     pub confirmed: u64,
     /// Durable cursors that changed (every one on the opening chunk).
     pub cursors: Vec<CursorChange>,
+    /// `cursors` is the complete list: a follower drops every cursor it
+    /// holds that is not in it.
+    pub all_cursors: bool,
 }
 
 /// A durable cursor's state as the replication stream carries it.
@@ -2088,6 +2091,7 @@ fn chunks(stream: tonic::Streaming<pb::ReplicationChunk>) -> ChunkStream {
                     deleted: s.deleted,
                 })
                 .collect(),
+            all_cursors: c.all_cursors,
         })
     }))
 }

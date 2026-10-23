@@ -177,7 +177,9 @@ segment count and bytes, identity, epoch and the fsync mode.
 - `db.backup(archive)` writes a **full** backup while the database stays in
   use: each segment is copied up to where the index places its last
   committed record, plus every aggregate's length (so lengths of aggregates
-  wholly below the floor survive a restore).
+  wholly below the floor survive a restore) and every durable cursor (an
+  archive holding one says `format` 2 in its header, which a reader from
+  before cursors refuses; one without keeps format 1).
 - `db.backup_since(archive, since)` writes an **incremental** backup: the
   frames of positions `since..head`, to be applied onto a database whose
   head is `since`.
@@ -734,9 +736,10 @@ INVALID_ARGUMENT. Delivery is at least once: whatever was processed but
 not acknowledged comes again. Cursors are kept on the leader and
 replicate with the chunks (every cursor on the opening chunk, the
 changes after), so the next leader resumes them; they live in the index
-and survive a rebuild, are clamped by a truncation, and a restore from a
-backup starts without them (a group member refreshed from the leader
-receives them again). `ListCursors` (`GET /v1/db/{db}/cursors`, `chron
+and survive a rebuild, are clamped by a truncation, and a full backup
+carries them: a restore keeps them, clamped to the archived head. A
+group member takes the leader's complete list on the opening chunk and
+drops any cursor the leader no longer has. `ListCursors` (`GET /v1/db/{db}/cursors`, `chron
 cursors`) shows each cursor's position, session and lag;
 `DeleteCursor` (admin) ends its stream. Metrics: `chron_cursors{db}`,
 `chron_cursor_lag_events{db,cursor}`, `chron_cursor_acks_total{db,

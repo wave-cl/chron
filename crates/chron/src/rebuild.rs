@@ -74,18 +74,19 @@ enum IdSource {
 /// index holds (if any): lengths of aggregates whose events all lie
 /// below the floor exist nowhere else.
 pub(crate) fn rebuild(path: &Path, opts: &Options) -> Result<Rebuilt> {
-    rebuild_from(path, opts, IdSource::Existing, Vec::new())
+    rebuild_from(path, opts, IdSource::Existing, Vec::new(), Vec::new())
 }
 
-/// Rebuilds from a backup: `id` and `lens` come from the archive; without
-/// an id the next open mints a fresh identity.
+/// Rebuilds from a backup: `id`, `lens` and `cursors` come from the
+/// archive; without an id the next open mints a fresh identity.
 pub(crate) fn rebuild_seeded(
     path: &Path,
     opts: &Options,
     id: Option<Uuid>,
     lens: Vec<(Uuid, u64)>,
+    cursors: Vec<(String, u64, u64)>,
 ) -> Result<Rebuilt> {
-    rebuild_from(path, opts, IdSource::Given(id), lens)
+    rebuild_from(path, opts, IdSource::Given(id), lens, cursors)
 }
 
 fn rebuild_from(
@@ -93,6 +94,7 @@ fn rebuild_from(
     _opts: &Options,
     id: IdSource,
     seed: Vec<(Uuid, u64)>,
+    given_cursors: Vec<(String, u64, u64)>,
 ) -> Result<Rebuilt> {
     let layout = Layout::new(path);
     let dir = layout.segments_dir();
@@ -108,9 +110,9 @@ fn rebuild_from(
     // its file, and a refused rebuild must leave it untouched.
     // The old index is the only place cursors live: they are copied
     // with the identity and the aggregate lengths. A seeded rebuild (a
-    // restore) starts without any.
+    // restore) takes the archive's.
     let (id, seed, cursors) = match id {
-        IdSource::Given(id) => (id, seed, Vec::new()),
+        IdSource::Given(id) => (id, seed, given_cursors),
         IdSource::Existing => {
             let index_file = layout.index_file();
             let old = if index_file.exists() {

@@ -198,6 +198,7 @@ fn spawn_chunk_stream(
                         deleted: false,
                     })
                     .collect(),
+                all_cursors: true,
             };
             if tx.send(Ok(item)).await.is_err() {
                 return;
@@ -256,6 +257,7 @@ fn spawn_chunk_stream(
                         epoch_base: dbn.epoch_base.load(std::sync::atomic::Ordering::Acquire),
                         confirmed: dbn.sync.majority(),
                         cursors,
+                        all_cursors: false,
                     };
                     cursor = c.to;
                     if tx.send(Ok(item)).await.is_err() {
@@ -308,6 +310,7 @@ fn spawn_chunk_stream(
                                 epoch_base: dbn.epoch_base.load(std::sync::atomic::Ordering::Acquire),
                                 confirmed: dbn.sync.majority(),
                                 cursors,
+                            all_cursors: false,
                             };
                             if tx.send(Ok(item)).await.is_err() {
                                 return;

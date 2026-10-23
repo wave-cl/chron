@@ -1,5 +1,5 @@
 //! Durable cursors: stored in the index, kept across a reopen and a
-//! rebuild, clamped by a truncation, absent from a restored backup.
+//! rebuild, clamped by a truncation, carried by a full backup.
 
 use chron::CursorState;
 
@@ -42,7 +42,7 @@ fn cursors_persist_reopen_and_clamp_on_truncate() {
     assert!(!db.remove_cursor("q").unwrap());
     assert_eq!(db.cursors().unwrap().len(), 1);
     drop(db);
-    // A rebuilt index keeps them; a restored backup starts without.
+    // A rebuilt index keeps them; so does a restored backup.
     let archive = d.path().join("full.chronbak");
     {
         let db = open(d.path());
@@ -59,7 +59,57 @@ fn cursors_persist_reopen_and_clamp_on_truncate() {
     let dst = d.path().join("restored");
     chron::restore_backup(&archive, &dst, &opts()).unwrap();
     let restored = open(&dst);
-    assert!(restored.cursors().unwrap().is_empty());
+    assert_eq!(
+        restored.cursors().unwrap(),
+        [CursorState {
+            name: "p".into(),
+            next: 5,
+            session: 1
+        }],
+        "the restore kept it"
+    );
+}
+
+/// A full backup carries every cursor; a restore keeps them, clamping
+/// one past the archived head (a follower stores the leader's unclamped).
+#[test]
+fn a_backup_carries_cursors_and_a_restore_clamps_them() {
+    let d = tmp();
+    let db = open(d.path());
+    fill(&db, agg(1), 10);
+    db.set_cursor("a", 4, 2).unwrap();
+    db.set_cursor("z", 15, 7).unwrap();
+    let archive = d.path().join("full.chronbak");
+    let meta = db.backup(&archive).unwrap();
+    assert_eq!(meta.format, 2, "an archive holding cursors says so");
+    assert_eq!(chron::inspect_backup(&archive).unwrap().format, 2);
+    let dst = d.path().join("restored");
+    chron::restore_backup(&archive, &dst, &opts()).unwrap();
+    let got: Vec<(String, u64, u64)> = open(&dst)
+        .cursors()
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.name, c.next, c.session))
+        .collect();
+    assert_eq!(
+        got,
+        [("a".to_string(), 4, 2), ("z".to_string(), 10, 7)],
+        "kept; the one past the head clamped to it"
+    );
+}
+
+/// A database without cursors writes the first format, which every
+/// reader knows; the archive restores without cursors.
+#[test]
+fn an_archive_without_cursors_keeps_the_first_format() {
+    let d = tmp();
+    let db = open(d.path());
+    fill(&db, agg(1), 3);
+    let archive = d.path().join("full.chronbak");
+    assert_eq!(db.backup(&archive).unwrap().format, 1);
+    let dst = d.path().join("restored");
+    chron::restore_backup(&archive, &dst, &opts()).unwrap();
+    assert!(open(&dst).cursors().unwrap().is_empty());
 }
 
 /// An index from before cursors existed reads as having none.

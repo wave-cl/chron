@@ -174,9 +174,10 @@ and the stream it replaces ends with "taken over". A cursor nobody will
 resume stays listed until `chron cursors delete NAME` (admin): delete
 it, since every cursor rides on every replication chunk. Cursors survive
 a leader change (they replicate with the chunks) and an index rebuild;
-a restore from a backup on a standalone node starts without them (a
-group member gets them back from the leader), so note each consumer's
-position before restoring. Cursors are accepted on the leader only: a
+a full backup carries them, so a restore resumes every consumer where
+the backup left it (a cursor past the archived head is clamped to it);
+a group member takes the leader's list when it attaches, dropping any
+cursor the leader deleted while it was away. Cursors are accepted on the leader only: a
 client made by `connect_any` finds it.
 
 ## Restoring a replica from the leader
@@ -264,6 +265,9 @@ so only file contents change.
    0.6.0 before relying on cursors or per-database options, and expect
    confirmed reads to serve fewer positions than before on a node with
    peers (`--read-consistency local` restores the old reads).
+   A full backup of a database holding a cursor is written as archive
+   format 2, which a 0.5.0 `chron restore` refuses ("unknown format 2");
+   one without cursors keeps format 1. Restore such archives with 0.6.0.
 
 ## Reading the metrics
 

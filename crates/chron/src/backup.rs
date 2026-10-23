@@ -8,6 +8,8 @@
 //!   kind 1  a segment file, "segments/<base:020>.seg"   (full backups)
 //!   kind 2  "records": frames of positions [base_head, head)   (incremental)
 //!   kind 3  "agg_len": (uuid, u64 length) pairs                  (full backups)
+//!   kind 4  "cursors": u16 name_len | name | u64 next | u64 session, per cursor
+//!           (full backups holding a cursor; the header then says format 2)
 //! u8 0xFF | u32 crc32 over everything before it
 //! ```
 
@@ -29,11 +31,16 @@ use crate::txn;
 
 const MAGIC: &[u8; 8] = b"CHRONBAK";
 const FORMAT: u32 = 1;
+/// The format of an archive carrying a `cursors` entry: a reader from
+/// before cursors refuses it at the header rather than at the entry.
+const FORMAT_CURSORS: u32 = 2;
 const KIND_SEGMENT: u8 = 1;
 const KIND_RECORDS: u8 = 2;
 /// Every aggregate's length, (16-byte uuid, u64) pairs: lengths of
 /// aggregates whose events all lie below the floor exist nowhere else.
 const KIND_AGG_LEN: u8 = 3;
+/// Every durable cursor: `(name, next, session)`; a restore keeps them.
+const KIND_CURSORS: u8 = 4;
 const KIND_END: u8 = 0xFF;
 const MAX_HEADER: u32 = 16 * 1024 * 1024;
 const COPY_CHUNK: usize = 1 << 20;
@@ -311,14 +318,21 @@ pub(crate) fn write_full_to(
 ) -> Result<BackupMeta> {
     let _m = inner.maintenance.lock().unwrap_or_else(|p| p.into_inner());
     let plan = plan(inner)?;
+    let cursors = inner.index.cursors()?;
     let mut meta = BackupMeta {
-        format: FORMAT,
+        // A database without cursors writes the format every reader
+        // knows; one with them needs a reader that knows the entry.
+        format: if cursors.is_empty() {
+            FORMAT
+        } else {
+            FORMAT_CURSORS
+        },
         kind: BackupKind::Full,
         base_head: None,
         head: plan.head,
         floor: plan.floor,
         created_at_unix_nanos: now_nanos(),
-        files: plan.segments.len() as u64 + 1,
+        files: plan.segments.len() as u64 + 1 + u64::from(!cursors.is_empty()),
         bytes: 0,
         db_id: Some(*inner.db_id.lock().unwrap_or_else(|p| p.into_inner())),
     };
@@ -342,8 +356,50 @@ pub(crate) fn write_full_to(
         w.bytes(id.as_bytes())?;
         w.bytes(&len.to_be_bytes())?;
     }
+    if !cursors.is_empty() {
+        let bytes = encode_cursors(&cursors);
+        w.entry_header(KIND_CURSORS, "cursors", bytes.len() as u64)?;
+        w.bytes(&bytes)?;
+    }
     meta.bytes = w.finish()?;
     Ok(meta)
+}
+
+/// Encodes a `cursors` entry.
+fn encode_cursors(cursors: &[(String, u64, u64)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, next, session) in cursors {
+        out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&next.to_be_bytes());
+        out.extend_from_slice(&session.to_be_bytes());
+    }
+    out
+}
+
+/// Decodes a `cursors` entry.
+fn parse_cursors(bytes: &[u8], path: &Path, at: u64) -> Result<Vec<(String, u64, u64)>> {
+    let take = |p: &mut usize, n: usize| -> Result<&[u8]> {
+        let s = bytes
+            .get(*p..*p + n)
+            .ok_or_else(|| Error::corrupt(path, at + *p as u64, "truncated cursors entry"))?;
+        *p += n;
+        Ok(s)
+    };
+    let mut out = Vec::new();
+    let mut p = 0usize;
+    while p < bytes.len() {
+        let n = usize::from(u16::from_be_bytes(
+            take(&mut p, 2)?.try_into().expect("two bytes"),
+        ));
+        let name = std::str::from_utf8(take(&mut p, n)?)
+            .map_err(|_| Error::corrupt(path, at + p as u64, "a cursor name is not utf-8"))?
+            .to_string();
+        let next = u64::from_be_bytes(take(&mut p, 8)?.try_into().expect("eight bytes"));
+        let session = u64::from_be_bytes(take(&mut p, 8)?.try_into().expect("eight bytes"));
+        out.push((name, next, session));
+    }
+    Ok(out)
 }
 
 /// Decodes an `agg_len` entry.
@@ -509,7 +565,7 @@ impl<R: Read> Reader<R> {
         r.read_hashed(&mut header)?;
         let meta: BackupMeta = serde_json::from_slice(&header)
             .map_err(|e| Error::corrupt(what, 12, format!("bad header: {e}")))?;
-        if meta.format != FORMAT {
+        if meta.format != FORMAT && meta.format != FORMAT_CURSORS {
             return Err(Error::corrupt(
                 what,
                 12,
@@ -691,11 +747,18 @@ fn restore_into<R: Read>(
     let segments_dir = layout.segments_dir();
     fs::create_dir_all(&segments_dir).map_err(|e| Error::io(&segments_dir, "mkdir", e))?;
     let mut lens: Vec<(Uuid, u64)> = Vec::new();
+    let mut cursors: Vec<(String, u64, u64)> = Vec::new();
     while let Some((kind, name, len)) = reader.next_entry()? {
         if kind == KIND_AGG_LEN {
             let at = reader.at;
             let bytes = reader.read_entry(len)?;
             lens = parse_lens(&bytes, &reader.path, at)?;
+            continue;
+        }
+        if kind == KIND_CURSORS {
+            let at = reader.at;
+            let bytes = reader.read_entry(len)?;
+            cursors = parse_cursors(&bytes, &reader.path, at)?;
             continue;
         }
         if kind != KIND_SEGMENT {
@@ -722,7 +785,13 @@ fn restore_into<R: Read>(
     }
     reader.finish()?;
     // The index last: a damaged archive never leaves a half-built database.
-    let rebuilt = rebuild::rebuild_seeded(staging, opts, meta.db_id, lens)?;
+    // A cursor past the archived head (a follower stores the leader's
+    // unclamped, and an ack may land after the plan) is clamped to it,
+    // as a truncation would.
+    for c in &mut cursors {
+        c.1 = c.1.min(meta.head);
+    }
+    let rebuilt = rebuild::rebuild_seeded(staging, opts, meta.db_id, lens, cursors)?;
     if rebuilt.head != meta.head || rebuilt.floor != meta.floor || rebuilt.dropped != 0 {
         return Err(Error::corrupt(
             staging,

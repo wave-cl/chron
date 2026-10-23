@@ -945,10 +945,26 @@ async fn tail(
         // The leader's cursor changes, after the events they may point
         // into: a copy promoted later holds at least what its cursors
         // name (reads clamp at the confirmed bound anyway).
-        if !c.cursors.is_empty() {
+        if c.all_cursors || !c.cursors.is_empty() {
             let db = db.clone();
             let changes = std::mem::take(&mut c.cursors);
+            let complete = c.all_cursors;
             blocking(move || {
+                // The opening chunk lists every cursor the leader holds:
+                // one this copy has from before (a delete it missed while
+                // away, or a restore from an older backup) goes.
+                if complete {
+                    let listed: std::collections::HashSet<&str> = changes
+                        .iter()
+                        .filter(|s| !s.deleted)
+                        .map(|s| s.name.as_str())
+                        .collect();
+                    for mine in db.cursors()? {
+                        if !listed.contains(mine.name.as_str()) {
+                            db.remove_cursor(&mine.name)?;
+                        }
+                    }
+                }
                 for s in changes {
                     if s.deleted {
                         db.remove_cursor(&s.name)?;

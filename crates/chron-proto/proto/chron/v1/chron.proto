@@ -555,6 +555,9 @@ message ReplicationChunk {
   // Cursors that changed since the previous chunk (every cursor on the
   // opening chunk); a follower stores them after applying the events.
   repeated CursorState cursors = 9;
+  // `cursors` is the complete list (the opening chunk): a follower drops
+  // every cursor it holds that is not in it.
+  bool all_cursors = 10;
 }
 
 message PromoteRequest {}

@@ -27,13 +27,16 @@ crates share one version.
   `cursors` keep a named consumer position (`next`, `session`) in the
   index (a new `cursor` table; an older index reads as empty). A
   truncation clamps cursors to the cut, a rebuilt index keeps them, a
-  restored backup starts without them.
+  full backup carries them (the header says `format` 2 when the archive
+  holds one; without cursors it keeps format 1) and a restore keeps
+  them, clamped to the archived head.
 
 ### chron-proto
 
 - `DatabaseOptions`, `CreateDatabaseRequest.options`,
   `DatabaseInfo.options`, `Tombstone`, `ListDatabasesResponse.dropped`.
-- `CursorState`, `SubscribeRequest.cursor`, `ReplicationChunk.cursors`,
+- `CursorState`, `SubscribeRequest.cursor`, `ReplicationChunk.cursors`
+  and `all_cursors`,
   `Ack`, `ListCursors`, `DeleteCursor`; headers `chron-session` and
   `chron-cursor-from`.
 - `Consistency` (`LOCAL`, `CONFIRMED`, unspecified for the daemon's
@@ -47,6 +50,9 @@ crates share one version.
 
 - `AggregateLen` takes the consistency too (and `at_least`): under
   confirmed, the aggregate's events below the confirmed bound.
+- A follower takes the leader's complete cursor list on the opening
+  chunk and drops any cursor it holds that the leader lacks: a delete it
+  missed while away, or one restored from an older backup.
 - Confirmed reads: on a node with peers a read, head or subscription
   serves, by default under sync commits, only positions a majority of
   the group durably holds (the bound rises with the followers' reports
@@ -93,7 +99,7 @@ crates share one version.
   `DatabaseInfo.fsync` and `max_record_bytes`.
 - `Client::subscribe_cursor` → `(EventStream, Cursor)`, `Cursor::ack`,
   `cursors`, `delete_cursor`, `ClientError::TakenOver`;
-  `ReplicationChunk.cursors`.
+  `ReplicationChunk.cursors` and `all_cursors`.
 - `Consistency`, `ClientConfig::consistency`, `ReadOptions`, the `_with`
   reads, `head_with` (`Head { head, confirmed, local }`),
   `subscribe_with`, `ClientError::BoundTimeout`; `Info.confirmed` and

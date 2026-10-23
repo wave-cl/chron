@@ -1044,7 +1044,8 @@ impl Db {
     /// enough since a lost cursor update means a redelivery, never a loss.
     /// Truncation clamps a cursor to the cut; retention leaves it (a
     /// consumer below the floor restarts at the floor); a rebuilt index
-    /// keeps cursors, a restored backup starts without any.
+    /// keeps cursors; a full backup carries them and a restore keeps
+    /// them, clamped to the archived head.
     pub fn set_cursor(&self, name: &str, next: u64, session: u64) -> Result<()> {
         self.inner
             .index

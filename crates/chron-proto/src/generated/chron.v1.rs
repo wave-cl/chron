@@ -796,6 +796,10 @@ pub struct ReplicationChunk {
     /// opening chunk); a follower stores them after applying the events.
     #[prost(message, repeated, tag = "9")]
     pub cursors: ::prost::alloc::vec::Vec<CursorState>,
+    /// `cursors` is the complete list (the opening chunk): a follower drops
+    /// every cursor it holds that is not in it.
+    #[prost(bool, tag = "10")]
+    pub all_cursors: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PromoteRequest {}
