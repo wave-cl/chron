@@ -71,6 +71,34 @@ pub struct TagArgs {
     range: Range,
 }
 
+#[derive(Args, Debug)]
+pub struct StreamArgs {
+    stream: String,
+    #[command(flatten)]
+    range: Range,
+}
+
+pub async fn stream(conn: &Conn, format: Format, a: StreamArgs) -> anyhow::Result<()> {
+    let c = client::connect(conn).await?;
+    let limit = a.range.limit as usize;
+    let stream = if a.range.backward {
+        c.read_stream_backward_stream(&a.stream, a.range.from(), limit)
+            .await?
+    } else if a.range.at_least.is_some() {
+        let events = c
+            .read_stream_with(&a.stream, a.range.from(), limit, a.range.options())
+            .await?;
+        for ev in &events {
+            print_event(format, ev);
+        }
+        return Ok(());
+    } else {
+        c.read_stream_stream(&a.stream, a.range.from(), limit)
+            .await?
+    };
+    print_stream(format, stream).await
+}
+
 pub async fn aggregate(conn: &Conn, format: Format, a: AggregateArgs) -> anyhow::Result<()> {
     let id = aggregate_id(&a.aggregate)?;
     let c = client::connect(conn).await?;
@@ -143,6 +171,9 @@ pub struct TailArgs {
     /// Only events carrying this tag.
     #[arg(long)]
     tag: Option<String>,
+    /// Only the members of this stream (see `streams`).
+    #[arg(long, conflicts_with = "tag")]
+    stream: Option<String>,
     /// Follow through a durable cursor of this name: the daemon keeps
     /// the position (--from applies to a new cursor only) and every
     /// event is acknowledged once printed, so a restart resumes where
@@ -162,10 +193,13 @@ pub async fn tail(conn: &Conn, format: Format, a: TailArgs) -> anyhow::Result<()
         (false, Some(from)) => from,
         (false, None) => c.info().await?.floor,
     };
+    let source = match (a.stream, a.tag) {
+        (Some(s), _) => chron_client::Source::Stream(s),
+        (None, Some(t)) => chron_client::Source::Tag(t.into()),
+        (None, None) => chron_client::Source::All,
+    };
     if let Some(name) = a.cursor {
-        let (mut stream, cursor) = c
-            .subscribe_cursor(&name, from, a.tag.map(Into::into))
-            .await?;
+        let (mut stream, cursor) = c.subscribe_cursor_source(&name, from, source).await?;
         if matches!(format, Format::Human) {
             eprintln!(
                 "cursor {name}: session {} from {}",
@@ -186,9 +220,8 @@ pub async fn tail(conn: &Conn, format: Format, a: TailArgs) -> anyhow::Result<()
         }
         return Ok(());
     }
-    let stream = match a.tag {
-        Some(tag) => c.subscribe_tag(tag, from).await?,
-        None => c.subscribe(from).await?,
-    };
+    let stream = c
+        .subscribe_source(source, from, chron_client::Consistency::Default)
+        .await?;
     print_stream(format, stream).await
 }

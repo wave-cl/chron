@@ -180,6 +180,22 @@ a group member takes the leader's list when it attaches, dropping any
 cursor the leader deleted while it was away. Cursors are accepted on the leader only: a
 client made by `connect_any` finds it.
 
+## Streams
+
+`chron streams` lists every stream with its tags and whether it is
+ready; `chron streams create NAME --tag T...` (admin, on the leader)
+defines one and returns once the earlier events are indexed, `chron
+streams delete NAME` removes one (its live `tail --stream` consumers
+end "deleted"). A stream that stays `filling` on a follower is being
+filled from that copy's own records, off its apply path; a stream that
+stays `filling` on the leader after the create returned is a creation
+interrupted by a crash, and the next open of that database removes it
+(define it again). `chron_streams{db}` counts the definitions per node;
+a node whose count differs from the leader's once the group is quiet has
+not attached since the stream was defined (check `chron status`).
+Definitions replicate with the chunks and are carried by full backups,
+so a restore keeps them; cursors on a stream behave as cursors do.
+
 ## Restoring a replica from the leader
 
 With peers nothing to do: a node below the leader's floor fetches the
@@ -268,6 +284,12 @@ so only file contents change.
    A full backup of a database holding a cursor is written as archive
    format 2, which a 0.5.0 `chron restore` refuses ("unknown format 2");
    one without cursors keeps format 1. Restore such archives with 0.6.0.
+7. 0.7.0 only adds fields and calls. Run every member on 0.7.0 before
+   defining a stream: a 0.6.0 follower ignores the definitions a 0.7.0
+   leader sends, and if it were elected it would lead without them, so
+   a 0.7.0 node reattaching to it would drop its streams. A full backup
+   of a database holding a stream is written as archive format 3, which
+   a 0.6.0 `chron restore` refuses; one without streams keeps its format.
 
 ## Reading the metrics
 

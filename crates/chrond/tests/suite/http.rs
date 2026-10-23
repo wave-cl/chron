@@ -549,6 +549,18 @@ async fn every_route_answers_and_metrics_count_them() {
     let (code, _, text) = call(addr, "GET", "/openapi.json".into(), vec![], None).await;
     assert_eq!(code, 200);
     let doc: Value = serde_json::from_str(&text).unwrap();
+    // The stream routes answer for a stream that exists.
+    let define = || async {
+        call(
+            addr,
+            "POST",
+            "/v1/db/default/streams".into(),
+            vec![],
+            Some(json!({"name": "s", "tags": ["t"]}).to_string()),
+        )
+        .await
+    };
+    assert_eq!(define().await.0, 201);
     // Every documented (method, path) is routed: anything but 404/405.
     // Bodies are empty, so writes answer 400; the delete names a
     // database that cannot be dropped (409); the tail is HTTP/1.0 and
@@ -568,9 +580,13 @@ async fn every_route_answers_and_metrics_count_them() {
                 .replace("{db}", "default")
                 .replace("{uuid}", AGG)
                 .replace("{tag}", "t")
+                .replace("{stream}", "s")
                 .replace("{name}", "default");
             let (code, _, _) = call(addr, method, concrete.clone(), vec![], None).await;
             assert!(code != 404 && code != 405, "{method} {concrete} -> {code}");
+            if method == "DELETE" && concrete.contains("/streams/") {
+                assert_eq!(define().await.0, 201, "defined again after the delete");
+            }
         }
     }
     let (code, _, _) = call(addr, "GET", "/v1/nope".into(), vec![], None).await;
@@ -1085,4 +1101,130 @@ async fn database_options_and_drops_on_the_gateway() {
         (Some("fast"), Some(db_id.as_str()))
     );
     s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_routes_answer() {
+    let s = Server::start_with(|o| {
+        o.http_listen = Some("127.0.0.1:0".parse().unwrap());
+        o.token = Some("user".into());
+        o.admin_token = Some("admin".into());
+    })
+    .await;
+    let addr = s.running.as_ref().unwrap().http_addr.unwrap();
+    let user = vec![("Authorization", "Bearer user".to_string())];
+    let admin = vec![("Authorization", "Bearer admin".to_string())];
+    for i in 0..6 {
+        let mut t = s.running.as_ref().unwrap().db.transaction();
+        let tags: &[&str] = if i % 2 == 0 { &["a"] } else { &["b"] };
+        t.append_free(vec![
+            chron::NewEvent::new(format!("e{i}")).tags(tags.iter().map(|t| t.to_string())),
+        ]);
+        t.commit().unwrap();
+    }
+    let (code, _, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/streams".into(),
+        user.clone(),
+        Some(json!({"name": "s", "tags": ["a"]}).to_string()),
+    )
+    .await;
+    assert_eq!(code, 403, "defining is admin");
+    let (code, v, _) = call(
+        addr,
+        "POST",
+        "/v1/db/default/streams".into(),
+        admin.clone(),
+        Some(json!({"name": "s", "tags": ["a"], "tags_base64": ["/w=="]}).to_string()),
+    )
+    .await;
+    assert_eq!(code, 201, "{v}");
+    assert_eq!(v["name"], "s");
+    assert_eq!(v["tags"], json!(["a"]));
+    assert_eq!(v["tags_base64"], json!(["/w=="]));
+    assert_eq!(v["ready"], true);
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/streams".into(),
+        user.clone(),
+        None,
+    )
+    .await;
+    assert_eq!((code, v["streams"].as_array().unwrap().len()), (200, 1));
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/streams/s/events?from=0&limit=0".into(),
+        user.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    let positions: Vec<u64> = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["position"].as_u64().unwrap())
+        .collect();
+    assert_eq!(positions, [0, 2, 4]);
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/streams/none/events".into(),
+        user.clone(),
+        None,
+    )
+    .await;
+    assert_eq!((code, v["code"].as_str()), (404, Some("NotFound")), "{v}");
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/tail?stream=s&tag=a".into(),
+        user.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (code, v["code"].as_str()),
+        (400, Some("InvalidArgument")),
+        "{v}"
+    );
+    let (code, v, _) = call(
+        addr,
+        "GET",
+        "/v1/db/default/info".into(),
+        user.clone(),
+        None,
+    )
+    .await;
+    assert_eq!((code, v["streams"].as_u64()), (200, Some(1)));
+    let (code, _, _) = call(
+        addr,
+        "DELETE",
+        "/v1/db/default/streams/s".into(),
+        user.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(code, 403, "deleting is admin");
+    let (code, v, _) = call(
+        addr,
+        "DELETE",
+        "/v1/db/default/streams/s".into(),
+        admin.clone(),
+        None,
+    )
+    .await;
+    assert_eq!((code, v["existed"].as_bool()), (200, Some(true)));
+    let (code, v, _) = call(
+        addr,
+        "DELETE",
+        "/v1/db/default/streams/s".into(),
+        admin,
+        None,
+    )
+    .await;
+    assert_eq!((code, v["existed"].as_bool()), (200, Some(false)));
 }

@@ -44,6 +44,9 @@ crates share one version.
   leader lacks, replacing one defined with other tags), so every node
   holds the same streams. A restore from a fetched backup keeps them.
   Metric `chron_streams{db}`; `Info.streams`.
+- Gateway: `GET|POST /v1/db/{db}/streams`, `DELETE
+  /v1/db/{db}/streams/{stream}`, `GET /v1/db/{db}/streams/{stream}/
+  events`, `tail?stream=`; `/info` answers `streams`.
 
 ### chron-client
 
@@ -51,6 +54,12 @@ crates share one version.
   `streams`, `delete_stream`, `read_stream(_with/_backward/_stream)`,
   `subscribe_stream`, `subscribe_source`, `subscribe_cursor_source`;
   `ReplicationChunk.streams` and `all_streams`; `Info.streams`.
+
+### chron-cli
+
+- `chron streams [list | create NAME --tag T... | delete NAME]`, `chron
+  stream NAME [range flags]`, `chron tail --stream NAME` (with
+  `--cursor` too).
 
 ## 0.6.0 - 2026-10-23
 

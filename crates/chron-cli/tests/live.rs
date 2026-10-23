@@ -254,6 +254,58 @@ fn unreachable_address_exits_2() {
 }
 
 #[test]
+fn streams_are_defined_listed_read_and_deleted() {
+    let d = Daemon::start();
+    for (i, tag) in ["a", "b", "c", "a"].iter().enumerate() {
+        d.chron()
+            .args(["append", "free", "--tag", tag, "-d", &format!("e{i}")])
+            .assert()
+            .success();
+    }
+    d.chron()
+        .args(["streams"])
+        .assert()
+        .success()
+        .stdout("no streams\n");
+    d.chron()
+        .args(["streams", "create", "ac", "--tag", "c", "--tag", "a"])
+        .assert()
+        .success()
+        .stdout("created ac\n");
+    d.chron()
+        .args(["streams"])
+        .assert()
+        .success()
+        .stdout("ac  tags a,c  ready\n");
+    d.chron().args(["stream", "ac"]).assert().success().stdout(
+        predicate::str::contains("e0")
+            .and(predicate::str::contains("e2"))
+            .and(predicate::str::contains("e3"))
+            .and(predicate::str::contains("e1").not()),
+    );
+    d.chron()
+        .args(["--json", "stream", "ac", "--backward", "--limit", "1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"position\":3"));
+    d.chron()
+        .args(["stream", "none"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("NotFound: no stream \"none\""));
+    d.chron()
+        .args(["streams", "delete", "ac"])
+        .assert()
+        .success()
+        .stdout("deleted\n");
+    d.chron()
+        .args(["streams", "delete", "ac"])
+        .assert()
+        .success()
+        .stdout("no such stream\n");
+}
+
+#[test]
 fn tail_streams_live_until_killed() {
     let d = Daemon::start();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_chron"))

@@ -1,3 +1,4 @@
+use base64::Engine;
 use chron::BackupMeta;
 use clap::Args;
 use serde_json::json;
@@ -338,6 +339,76 @@ pub async fn cursor_delete(conn: &Conn, format: Format, name: &str) -> anyhow::R
     print_value(
         format,
         if existed { "deleted" } else { "no such cursor" }.to_string(),
+        json!({ "existed": existed }),
+    );
+    Ok(())
+}
+
+fn stream_value(s: &chron_client::StreamInfo) -> serde_json::Value {
+    let mut tags = Vec::new();
+    let mut tags_base64 = Vec::new();
+    for t in &s.tags {
+        match std::str::from_utf8(t) {
+            Ok(text) => tags.push(json!(text)),
+            Err(_) => tags_base64.push(json!(base64::engine::general_purpose::STANDARD.encode(t))),
+        }
+    }
+    let mut v = json!({ "name": s.name, "tags": tags, "ready": s.ready });
+    if !tags_base64.is_empty() {
+        v["tags_base64"] = serde_json::Value::Array(tags_base64);
+    }
+    v
+}
+
+pub async fn streams(conn: &Conn, format: Format) -> anyhow::Result<()> {
+    let l = client::connect(conn).await?.streams().await?;
+    let human = if l.is_empty() {
+        "no streams".to_string()
+    } else {
+        l.iter()
+            .map(|s| {
+                let tags: Vec<String> = s
+                    .tags
+                    .iter()
+                    .map(|t| String::from_utf8_lossy(t).into_owned())
+                    .collect();
+                format!(
+                    "{}  tags {}  {}",
+                    s.name,
+                    tags.join(","),
+                    if s.ready { "ready" } else { "filling" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    print_value(
+        format,
+        human,
+        json!({ "streams": l.iter().map(stream_value).collect::<Vec<_>>() }),
+    );
+    Ok(())
+}
+
+pub async fn stream_create(
+    conn: &Conn,
+    format: Format,
+    name: &str,
+    tags: Vec<String>,
+) -> anyhow::Result<()> {
+    let s = client::connect(conn)
+        .await?
+        .create_stream(name, tags)
+        .await?;
+    print_value(format, format!("created {}", s.name), stream_value(&s));
+    Ok(())
+}
+
+pub async fn stream_delete(conn: &Conn, format: Format, name: &str) -> anyhow::Result<()> {
+    let existed = client::connect(conn).await?.delete_stream(name).await?;
+    print_value(
+        format,
+        if existed { "deleted" } else { "no such stream" }.to_string(),
         json!({ "existed": existed }),
     );
     Ok(())

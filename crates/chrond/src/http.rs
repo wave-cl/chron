@@ -14,6 +14,7 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use base64::Engine;
 use bytes::Bytes;
 use chron::Uuid;
 use hyper_util::rt::TokioIo;
@@ -50,6 +51,10 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/db/{db}/head"),
     ("GET", "/v1/db/{db}/info"),
     ("GET", "/v1/db/{db}/tail"),
+    ("GET", "/v1/db/{db}/streams"),
+    ("POST", "/v1/db/{db}/streams"),
+    ("DELETE", "/v1/db/{db}/streams/{stream}"),
+    ("GET", "/v1/db/{db}/streams/{stream}/events"),
     ("GET", "/v1/db/{db}/cursors"),
     ("DELETE", "/v1/db/{db}/cursors/{name}"),
     ("POST", "/v1/db/{db}/cursors/{name}/ack"),
@@ -105,6 +110,9 @@ pub fn router(
         .route("/db/{db}/head", get(head))
         .route("/db/{db}/info", get(info))
         .route("/db/{db}/tail", get(tail))
+        .route("/db/{db}/streams", get(list_streams).post(create_stream))
+        .route("/db/{db}/streams/{stream}", delete(delete_stream))
+        .route("/db/{db}/streams/{stream}/events", get(read_stream))
         .route("/db/{db}/cursors", get(list_cursors))
         .route("/db/{db}/cursors/{name}", delete(delete_cursor))
         .route("/db/{db}/cursors/{name}/ack", post(ack_cursor))
@@ -325,6 +333,96 @@ async fn read_tag(
     page(&st, &dbn, Read::Tag { tag, backward }, q).await
 }
 
+async fn read_stream(
+    State(st): State<HttpState>,
+    Path((name, stream)): Path<(String, String)>,
+    q: std::result::Result<Query<ReadQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<Value>> {
+    let dbn = db(&st, &name)?;
+    let Query(q) = q.map_err(bad)?;
+    let backward = q.backward.unwrap_or(false);
+    ops::check_stream(&dbn, &stream)?;
+    page(
+        &st,
+        &dbn,
+        Read::Stream {
+            name: stream,
+            backward,
+        },
+        q,
+    )
+    .await
+}
+
+/// A stream as the gateway renders it: UTF-8 tags under `tags`, the
+/// others base64 under `tags_base64`.
+fn stream_json(s: &chron_proto::v1::StreamInfo) -> Value {
+    let mut tags = Vec::new();
+    let mut tags_base64 = Vec::new();
+    for t in &s.tags {
+        match std::str::from_utf8(t) {
+            Ok(text) => tags.push(Value::String(text.to_string())),
+            Err(_) => tags_base64.push(Value::String(
+                base64::engine::general_purpose::STANDARD.encode(t),
+            )),
+        }
+    }
+    let mut v = json!({ "name": s.name, "tags": tags, "ready": s.ready });
+    if !tags_base64.is_empty() {
+        v["tags_base64"] = Value::Array(tags_base64);
+    }
+    v
+}
+
+async fn list_streams(
+    State(st): State<HttpState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>> {
+    let dbn = db(&st, &name)?;
+    let l = ops::list_streams(&dbn)?;
+    Ok(Json(json!({
+        "streams": l.streams.iter().map(stream_json).collect::<Vec<_>>(),
+    })))
+}
+
+/// `{"name": .., "tags": [..], "tags_base64": [..]}`.
+#[derive(Deserialize)]
+struct StreamBody {
+    name: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    tags_base64: Vec<String>,
+}
+
+async fn create_stream(
+    State(st): State<HttpState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: std::result::Result<Json<StreamBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<Value>)> {
+    admin(&st, &headers)?;
+    let dbn = db(&st, &name)?;
+    let Json(b) = body.map_err(json_rejection)?;
+    let mut tags: Vec<Vec<u8>> = b.tags.into_iter().map(String::into_bytes).collect();
+    for t in b.tags_base64 {
+        tags.push(crate::http_json::decode_base64(&t, "tags_base64").map_err(ApiError)?);
+    }
+    let s = ops::create_stream(&st.node, &dbn, b.name, tags).await?;
+    Ok((StatusCode::CREATED, Json(stream_json(&s))))
+}
+
+async fn delete_stream(
+    State(st): State<HttpState>,
+    Path((name, stream)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    admin(&st, &headers)?;
+    let dbn = db(&st, &name)?;
+    let existed = ops::delete_stream(&st.node, &dbn, &stream).await?;
+    Ok(Json(json!({ "existed": existed })))
+}
+
 async fn aggregate_len(
     State(st): State<HttpState>,
     Path((name, id)): Path<(String, String)>,
@@ -381,6 +479,8 @@ struct TailQuery {
     /// A durable cursor's name: the first SSE item is then `event:
     /// session` with `{"session", "from"}`.
     cursor: Option<String>,
+    /// A stream's name: only its members. Not with `tag`.
+    stream: Option<String>,
 }
 
 async fn tail(
@@ -397,6 +497,21 @@ async fn tail(
     let mode = st
         .node
         .read_mode(consistency_from_query(q.consistency.as_deref()).map_err(ApiError)?);
+    // The source is checked before a cursor is registered: a cursor on
+    // a stream that does not exist would be persisted for nothing.
+    let source = match (q.stream, tag) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError(tonic::Status::invalid_argument(
+                "a tail takes a tag or a stream, not both",
+            )));
+        }
+        (Some(stream), None) => {
+            ops::check_stream(&dbn, &stream)?;
+            ops::Source::Stream(stream)
+        }
+        (None, Some(t)) => ops::Source::Tag(Bytes::from(t)),
+        (None, None) => ops::Source::All,
+    };
     let mut mode = mode;
     let mut from = q.from.unwrap_or(0);
     let mut first = None;
@@ -419,9 +534,6 @@ async fn tail(
             })
         }
     };
-    let source = tag.map_or(ops::Source::All, |t| {
-        ops::Source::Tag(bytes::Bytes::from(t))
-    });
     let rx = ops::subscribe(st.node.clone(), dbn, from, source, mode, cursor)?;
     let stream = tokio_stream::iter(first.into_iter().map(Ok)).chain(rx.map(|item| {
         Ok(match item {

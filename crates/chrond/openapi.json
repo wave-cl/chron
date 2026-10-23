@@ -527,6 +527,32 @@
             ]
           }
         }
+      },
+      "Stream": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "the UTF-8 tags the stream covers, sorted"
+          },
+          "tags_base64": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "the other tags, base64 (present only when there are any)"
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "whether the fill at creation finished; until then the stream cannot be read"
+          }
+        }
       }
     }
   },
@@ -1190,6 +1216,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "stream",
+            "in": "query",
+            "required": false,
+            "description": "a stream's name: only its members; not with tag",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "description": " The stream is text/event-stream: one data: line of JSON per event, a `: heartbeat` comment every 15 s, and a final event: error when the database is dropped, cut back to an earlier position (a diverged node resetting; its JSON carries position), the node fenced or the daemon stops."
@@ -1747,6 +1782,277 @@
             }
           }
         }
+      }
+    },
+    "/v1/db/{db}/streams": {
+      "get": {
+        "summary": "The database's streams: named subsets of the global order, each over a set of tags",
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "streams": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Stream"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Define a stream (admin, on the leader): every event, committed before or after, carrying any of the tags; answers once the earlier events are indexed",
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "1 to 64 of a-z, 0-9, _ and -"
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "UTF-8 tags"
+                  },
+                  "tags_base64": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "binary tags, base64"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "defined",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stream"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/db/{db}/streams/{stream}": {
+      "delete": {
+        "summary": "Remove a stream (admin, on the leader); its live subscriptions end",
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stream",
+            "in": "path",
+            "required": true,
+            "description": "the stream",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "existed": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/db/{db}/streams/{stream}/events": {
+      "get": {
+        "summary": "A stream's members in global order (404 for an unknown stream, 503 while its fill runs)",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "db",
+            "in": "path",
+            "required": true,
+            "description": "the database",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stream",
+            "in": "path",
+            "required": true,
+            "description": "the stream",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "description": "first position or index (backward: the inclusive upper bound; default 0, or the end backward)",
+            "schema": {
+              "type": "integer",
+              "format": "uint64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "records per page, at most 4096 (0: the maximum); default 256",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4096
+            }
+          },
+          {
+            "name": "backward",
+            "in": "query",
+            "required": false,
+            "description": "newest first",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "consistency",
+            "in": "query",
+            "required": false,
+            "description": "local (everything the node holds) or confirmed (only positions a majority of the group durably holds); absent: the daemon's default (--read-consistency; confirmed when sync commits are in effect)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "at_least",
+            "in": "query",
+            "required": false,
+            "description": "wait until the bound under the consistency reaches this position before answering (read your writes: a commit's next)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "wait_ms",
+            "in": "query",
+            "required": false,
+            "description": "how long at_least may wait; absent: the daemon's sync timeout, 0: fail at once (504 with the bound in position)",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ]
       }
     }
   }

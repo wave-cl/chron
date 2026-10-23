@@ -252,6 +252,7 @@ pub fn info_json(i: &pb::InfoResponse) -> Value {
         "peers": i.peers, "voted_epoch": i.voted_epoch,
         "majority_applied": i.majority_applied, "sync_commit": i.sync_commit,
         "confirmed": i.confirmed, "read_consistency": consistency_name(i.read_consistency),
+        "streams": i.streams,
         "followers": i.followers.iter().map(|f| json!({
             "peer": f.peer, "applied": f.applied, "durable": f.durable, "counted": f.counted,
         })).collect::<Vec<_>>(),

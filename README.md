@@ -378,9 +378,13 @@ GET    /v1/db/{db}/events?from&limit&backward
 GET    /v1/db/{db}/aggregates/{uuid}/events?from&limit&backward
 GET    /v1/db/{db}/aggregates/{uuid}/len
 GET    /v1/db/{db}/tags/{tag}/events?from&limit&backward
+GET    /v1/db/{db}/streams                   {"streams":[{"name","tags","ready"}]}
+POST   /v1/db/{db}/streams                   {"name":"..","tags":[..]}  201  (admin)
+DELETE /v1/db/{db}/streams/{stream}          {"existed":bool}       (admin)
+GET    /v1/db/{db}/streams/{stream}/events?from&limit&backward
 GET    /v1/db/{db}/head                      {"head":N}
 GET    /v1/db/{db}/info
-GET    /v1/db/{db}/tail?from&tag             text/event-stream
+GET    /v1/db/{db}/tail?from&tag|stream      text/event-stream
 POST   /v1/db/{db}/flush                     204
 POST   /v1/db/{db}/retain                    {"floor":N}            (admin)
 GET    /v1/databases
@@ -435,7 +439,9 @@ chron commit (-f FILE | --stdin)   # {"appends":[{"aggregate":"<uuid>"|null,"exp
 chron read <AGGREGATE> [--from N] [--limit N] [--backward]
 chron all [--from N] [--limit N] [--backward]
 chron tag <TAG> [--from N] [--limit N] [--backward]
-chron tail [--from N | --from-head] [--tag T]        # from the floor by default
+chron stream <NAME> [--from N] [--limit N] [--backward]   # a stream's members (see streams)
+chron streams [list | create NAME --tag T... | delete NAME]   # named subsets of the global order over a tag set
+chron tail [--from N | --from-head] [--tag T | --stream NAME]   # from the floor by default
 chron len <AGGREGATE> | head | info | flush
 chron status [--max-lag N]                           # exit 0 healthy, 1 degraded, 2 unreachable
 chron backup <NAME> [--since N] | apply <NAME>       # names under the daemon's --backup-dir
@@ -802,6 +808,48 @@ or an expired lease. The metrics are `chron_role{role="candidate"}`,
 `chron_voted_epoch`, `chron_peers`, `chron_elections_total`,
 `chron_leader_changes_total` and `chron_heartbeat_failures_total{peer}`.
 
+## Streams
+
+A **stream** is a named subset of the global order: a set of tags, and
+every event, committed before or after the definition, that carries any
+of them. Events keep their global positions; the stream has no
+numbering of its own. The index keeps one `(stream, position)` entry
+per member, written beside the tag entries as records land, so a read,
+a backward read, a paged walk, a subscription or a cursor on a stream
+is one range scan in global order, like a tag read. At creation the
+earlier positions are filled from the tag entries a chunk at a time,
+without holding up commits, backups or replication; the call returns
+once the stream is ready, and until then it answers "not ready"
+(UNAVAILABLE on the daemon, `Error::StreamNotReady` in the library).
+
+```rust
+db.create_stream("orders", ["OrderPlaced", "OrderShipped"])?;
+let page = db.read_stream("orders", 0, 100)?;            // the members, in global order
+for event in db.subscribe_stream("orders", 0)? { ... }  // then live
+```
+
+```
+chron streams create orders --tag OrderPlaced --tag OrderShipped
+chron stream orders --limit 0
+chron tail --stream orders --cursor fulfilment
+```
+
+On a daemon a stream is defined on the leader (admin), listed and read
+on every node, and replicated like a cursor: the definition rides on the
+replication chunks, applied before the events, so a follower fills a
+new stream from what it holds, off its apply path, and every node
+computes the same members. The first chunk of a Follow carries the
+complete list: a follower drops a stream the leader lacks and replaces
+one defined with other tags, so a copy that was away while a stream was
+deleted and defined again ends up as the leader has it. Definitions
+survive a crash (a creation interrupted before its fill finished leaves
+nothing), an index rebuild (entries recomputed) and a full backup (an
+archive holding a stream says format 3 in its header; a restore
+rebuilds the entries). Deleting a stream ends its subscriptions
+(UNAVAILABLE "deleted"). A cursor does not record its source: resuming
+it on another stream, tag or the whole log is the caller's call. At most
+32 tags per stream; `chron_streams{db}` counts them.
+
 ## Known limitations
 
 - Forward pages (iterators, subscriptions, the daemon's streams) are
@@ -811,6 +859,11 @@ or an expired lease. The metrics are `chron_role{role="candidate"}`,
   finished from the segment on the next open: the complete transactions
   it synced are replayed into the index and a torn trailing one is cut;
   the caller resumes from the head the open reports.
+- A stream is defined and deleted on the leader only (admin), and every
+  member of a group must run 0.7.0 before one is defined: a 0.6.0
+  follower ignores the definitions, and if elected would lead without
+  them, so the others would drop theirs on reattaching. A 0.6.0 `chron
+  restore` refuses an archive holding a stream (format 3).
 - `default` cannot be dropped. A database's fsync setting and record
   limit are chosen at creation (`chron db create NAME [--fsync|
   --no-fsync] [--max-record-bytes N]`, `CreateDatabaseRequest.options`,

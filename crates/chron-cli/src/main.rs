@@ -37,7 +37,9 @@ enum Commands {
     All(cmd::read::AllArgs),
     /// Read the events carrying a tag.
     Tag(cmd::read::TagArgs),
-    /// Follow the database (or one tag) live until stopped.
+    /// Read a stream's members (see `streams`).
+    Stream(cmd::read::StreamArgs),
+    /// Follow the database (or one tag, or one stream) live until stopped.
     Tail(cmd::read::TailArgs),
     /// How many events an aggregate has.
     Len { aggregate: String },
@@ -83,6 +85,12 @@ enum Commands {
         #[command(subcommand)]
         cmd: Option<CursorCommands>,
     },
+    /// The database's streams: named subsets of the global order, each
+    /// over a set of tags; list, define or delete one.
+    Streams {
+        #[command(subcommand)]
+        cmd: Option<StreamCommands>,
+    },
     /// Create, list or drop the daemon's databases.
     Db {
         #[command(subcommand)]
@@ -109,6 +117,26 @@ enum Commands {
     },
     /// Offline: print a backup's header.
     Inspect { archive: std::path::PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+enum StreamCommands {
+    /// Every stream with its tags and whether it is ready (the default).
+    List,
+    /// Define a stream over the given tags (admin, on the leader): every
+    /// event, committed before or after, carrying any of them.
+    Create {
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// A tag the stream covers; repeat for several.
+        #[arg(long = "tag", value_name = "TAG", required = true)]
+        tags: Vec<String>,
+    },
+    /// Remove a stream (admin, on the leader); its live subscriptions end.
+    Delete {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -198,6 +226,7 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
         Commands::Read(a) => cmd::read::aggregate(conn, format, a).await,
         Commands::All(a) => cmd::read::all(conn, format, a).await,
         Commands::Tag(a) => cmd::read::tag(conn, format, a).await,
+        Commands::Stream(a) => cmd::read::stream(conn, format, a).await,
         Commands::Tail(a) => cmd::read::tail(conn, format, a).await,
         Commands::Len { aggregate } => cmd::admin::len(conn, format, &aggregate).await,
         Commands::Head(a) => cmd::admin::head(conn, format, a).await,
@@ -219,6 +248,13 @@ async fn run(cli: Cli, format: Format) -> anyhow::Result<()> {
             MembersCommands::Remove { member } => {
                 cmd::admin::members_remove(conn, format, &member).await
             }
+        },
+        Commands::Streams { cmd } => match cmd.unwrap_or(StreamCommands::List) {
+            StreamCommands::List => cmd::admin::streams(conn, format).await,
+            StreamCommands::Create { name, tags } => {
+                cmd::admin::stream_create(conn, format, &name, tags).await
+            }
+            StreamCommands::Delete { name } => cmd::admin::stream_delete(conn, format, &name).await,
         },
         Commands::Cursors { cmd } => match cmd.unwrap_or(CursorCommands::List) {
             CursorCommands::List => cmd::admin::cursors(conn, format).await,

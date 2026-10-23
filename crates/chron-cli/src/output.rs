@@ -197,6 +197,7 @@ pub fn render_error(e: &anyhow::Error) -> String {
             ClientError::PermissionDenied(m) => {
                 format!("PermissionDenied: {m}; set --admin-token")
             }
+            ClientError::NotFound(m) if m.contains("stream") => format!("NotFound: {m}"),
             ClientError::NotFound(m) => format!("NotFound: {m}; see chron db list"),
             ClientError::AlreadyExists(m) => format!("AlreadyExists: {m}"),
             ClientError::FailedPrecondition(m) => format!("FailedPrecondition: {m}"),
