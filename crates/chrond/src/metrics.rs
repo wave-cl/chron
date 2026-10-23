@@ -38,6 +38,10 @@ pub const METHODS: &[(&str, bool)] = &[
     ("/chron.v1.Chron/Ack", false),
     ("/chron.v1.Chron/ListCursors", false),
     ("/chron.v1.Chron/DeleteCursor", false),
+    ("/chron.v1.Chron/CreateStream", false),
+    ("/chron.v1.Chron/ListStreams", false),
+    ("/chron.v1.Chron/DeleteStream", false),
+    ("/chron.v1.Chron/ReadStream", true),
     ("/chron.v1.Chron/Flush", false),
     ("/chron.v1.Chron/Info", false),
     ("/chron.v1.Chron/Backup", false),
@@ -383,6 +387,7 @@ struct NodeCollector {
     head: IntGaugeVec,
     floor: IntGaugeVec,
     segments: IntGaugeVec,
+    streams: IntGaugeVec,
     segment_bytes: IntGaugeVec,
     epoch: IntGaugeVec,
     fsync_enabled: IntGaugeVec,
@@ -429,6 +434,7 @@ impl NodeCollector {
             ),
             floor: gauge("chron_floor", "the first readable position", &["db"]),
             segments: gauge("chron_segments", "segment files", &["db"]),
+            streams: gauge("chron_streams", "streams defined, ready or not", &["db"]),
             segment_bytes: gauge("chron_segment_bytes", "bytes in segment files", &["db"]),
             epoch: gauge("chron_epoch", "the fencing epoch", &["db"]),
             fsync_enabled: gauge(
@@ -606,6 +612,7 @@ impl NodeCollector {
             &self.head,
             &self.floor,
             &self.segments,
+            &self.streams,
             &self.segment_bytes,
             &self.epoch,
             &self.fsync_enabled,
@@ -699,6 +706,9 @@ impl NodeCollector {
                 self.segments
                     .with_label_values(&[db])
                     .set(info.segments as i64);
+                self.streams
+                    .with_label_values(&[db])
+                    .set(info.streams as i64);
                 self.segment_bytes
                     .with_label_values(&[db])
                     .set(info.bytes as i64);

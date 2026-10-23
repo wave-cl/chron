@@ -193,6 +193,8 @@ message SubscribeRequest {
   // metadata carries `chron-session` (this stream's session) and
   // `chron-cursor-from` (where it starts). Leader only.
   string cursor = 4;
+  // A stream: only its members are delivered. Not with `tag`.
+  string stream = 5;
 }
 
 // What the daemon keeps per cursor: `next` is the position after the
@@ -230,6 +232,56 @@ message ListCursorsResponse {
 // Removes a cursor (admin); its live stream ends UNAVAILABLE.
 message DeleteCursorRequest { string cursor = 1; }
 message DeleteCursorResponse { bool existed = 1; }
+
+// A stream definition on the replication stream: a name and the tags it
+// covers; `deleted` marks a removal.
+message StreamDef {
+  string name = 1;
+  repeated bytes tags = 2;
+  bool deleted = 3;
+}
+
+// A stream as the daemon lists it.
+message StreamInfo {
+  string name = 1;
+  // Sorted, without duplicates.
+  repeated bytes tags = 2;
+  // Whether the fill at creation finished: until then the stream cannot
+  // be read.
+  bool ready = 3;
+}
+
+// Defines a stream (admin, leader only): a named subset of the global
+// order, every event committed before or after that carries any of
+// `tags`. The call returns once the earlier events are indexed (new ones
+// are indexed as they land). An existing name is ALREADY_EXISTS; a bad
+// name (1 to 64 of a-z, 0-9, _ and -) or tag set (1 to 32 tags) is
+// INVALID_ARGUMENT.
+message CreateStreamRequest {
+  string name = 1;
+  repeated bytes tags = 2;
+}
+message CreateStreamResponse { StreamInfo stream = 1; }
+
+message ListStreamsRequest {}
+message ListStreamsResponse { repeated StreamInfo streams = 1; }
+
+// Removes a stream (admin, leader only); its live subscriptions end
+// UNAVAILABLE.
+message DeleteStreamRequest { string name = 1; }
+message DeleteStreamResponse { bool existed = 1; }
+
+// The stream's members in global order; the fields as ReadTagRequest.
+// An unknown stream is NOT_FOUND, one still being filled UNAVAILABLE.
+message ReadStreamRequest {
+  string stream = 1;
+  uint64 from = 2;
+  uint64 limit = 3;
+  bool backward = 4;
+  Consistency consistency = 5;
+  optional uint64 at_least = 6;
+  optional uint64 wait_timeout_ms = 7;
+}
 
 message FlushRequest {}
 message FlushResponse {}
@@ -286,6 +338,8 @@ message InfoResponse {
   // consistency reads get when they do not say.
   optional uint64 confirmed = 28;
   Consistency read_consistency = 29;
+  // Streams defined on the database, ready or not.
+  uint64 streams = 30;
   // On a leader: whether that generation is committed (a majority of it
   // holds it and everything confirmed before it was made).
   bool members_committed = 26;
@@ -558,6 +612,12 @@ message ReplicationChunk {
   // `cursors` is the complete list (the opening chunk): a follower drops
   // every cursor it holds that is not in it.
   bool all_cursors = 10;
+  // Stream definitions that changed since the previous chunk; a follower
+  // applies them before the events (a new one fills from what it holds).
+  repeated StreamDef streams = 11;
+  // `streams` is the complete list (the first chunk of a stream): a
+  // follower drops every stream it holds that is not in it.
+  bool all_streams = 12;
 }
 
 message PromoteRequest {}
@@ -592,8 +652,9 @@ message RetainResponse {
 // epoch is FAILED_PRECONDITION with the metadata `chron-epoch`. A missing
 // or wrong bearer token is UNAUTHENTICATED; an administrative call
 // (Promote, Fence, Retain, Backup, ApplyBackup, Replicate, Follow,
-// FetchBackup, Fingerprints, ChangeMembers, the database calls and the
-// daemon-to-daemon Heartbeat and RequestVote) without the admin token,
+// FetchBackup, Fingerprints, ChangeMembers, the database calls,
+// CreateStream, DeleteStream and the daemon-to-daemon Heartbeat and
+// RequestVote) without the admin token,
 // when the daemon has one, is PERMISSION_DENIED. A
 // replication stream meets a transaction larger than the message limit
 // with RESOURCE_EXHAUSTED. Subscribe and Replicate end with UNAVAILABLE
@@ -609,6 +670,10 @@ service Chron {
   rpc Ack(AckRequest) returns (AckResponse);
   rpc ListCursors(ListCursorsRequest) returns (ListCursorsResponse);
   rpc DeleteCursor(DeleteCursorRequest) returns (DeleteCursorResponse);
+  rpc CreateStream(CreateStreamRequest) returns (CreateStreamResponse);
+  rpc ListStreams(ListStreamsRequest) returns (ListStreamsResponse);
+  rpc DeleteStream(DeleteStreamRequest) returns (DeleteStreamResponse);
+  rpc ReadStream(ReadStreamRequest) returns (stream Event);
   rpc Flush(FlushRequest) returns (FlushResponse);
   rpc Info(InfoRequest) returns (InfoResponse);
   rpc Backup(BackupRequest) returns (BackupMeta);

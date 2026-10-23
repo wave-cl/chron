@@ -93,6 +93,59 @@ pub async fn connect(up: &Upstream) -> Result<Client, CheckError> {
         .map_err(|e| unreachable(&up.addr, e))
 }
 
+/// Applies the leader's stream definitions to this copy: by name and
+/// tags, so a stream redefined between two chunks (deleted and created
+/// again with other tags) ends up as the leader has it. With `complete`
+/// (the first chunk of a Follow), every stream the leader does not list
+/// goes. Returns the streams begun here, for their fills.
+fn reconcile_streams(
+    db: &chron::Db,
+    changes: Vec<chron_client::StreamChange>,
+    complete: bool,
+) -> chron::Result<Vec<String>> {
+    let mine = db.streams()?;
+    if complete {
+        let listed: std::collections::HashSet<&str> = changes
+            .iter()
+            .filter(|s| !s.deleted)
+            .map(|s| s.name.as_str())
+            .collect();
+        for m in &mine {
+            if !listed.contains(m.name.as_str()) {
+                db.delete_stream(&m.name)?;
+            }
+        }
+    }
+    let mut begun = Vec::new();
+    for s in changes {
+        if s.deleted {
+            db.delete_stream(&s.name)?;
+            continue;
+        }
+        let mut want = s.tags;
+        want.sort();
+        want.dedup();
+        match mine.iter().find(|m| m.name == s.name) {
+            Some(m) if m.tags == want => continue,
+            Some(_) => {
+                db.delete_stream(&s.name)?;
+            }
+            None => {}
+        }
+        match db.begin_stream(&s.name, want) {
+            Ok(_) => {
+                // A name redefined twice in one round fills once.
+                begun.retain(|b| *b != s.name);
+                begun.push(s.name);
+            }
+            // Begun by an earlier chunk in this round, or by hand.
+            Err(chron::Error::StreamExists(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(begun)
+}
+
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> chron::Result<T> + Send + 'static,
 ) -> Result<T, String> {
@@ -907,12 +960,37 @@ async fn tail(
                     c.head = c.head.max(n.head);
                     c.confirmed = c.confirmed.max(n.confirmed);
                     c.cursors.extend(n.cursors);
+                    c.streams.extend(n.streams);
                     merged += 1;
                 }
                 other => {
                     pending = Some(other);
                     break;
                 }
+            }
+        }
+        // The leader's stream definitions, before the events: a new
+        // stream is begun here (brief: the definition, in force for the
+        // chunk about to land) and filled from what this copy holds on
+        // the blocking pool, off the apply path, so the acknowledgments
+        // never wait for a fill.
+        if c.all_streams || !c.streams.is_empty() {
+            let changes = std::mem::take(&mut c.streams);
+            let complete = c.all_streams;
+            let db2 = db.clone();
+            let begun = blocking(move || reconcile_streams(&db2, changes, complete)).await?;
+            for name in begun {
+                let db3 = db.clone();
+                let database = dbn.name.clone();
+                tokio::task::spawn_blocking(move || match db3.fill_stream(&name) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::info!(database, stream = %name, "the stream was removed before its fill finished")
+                    }
+                    Err(e) => {
+                        tracing::warn!(database, stream = %name, error = %e, "the stream's fill failed")
+                    }
+                });
             }
         }
         let from = c.chunk.from;

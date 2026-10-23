@@ -18,7 +18,7 @@ use tonic::{Request, Response, Status};
 use crate::cluster;
 use crate::codec;
 use crate::node::{DbNode, Node, Role, Upstream};
-use crate::ops::{self, PAGE, Read, blocking, ended, gone, role_lost};
+use crate::ops::{self, PAGE, Read, Source, blocking, ended, gone, role_lost};
 use crate::replica;
 
 /// Events per replication chunk.
@@ -167,6 +167,24 @@ fn spawn_chunk_stream(
             let (_, g) = dbn.cursor_changes(u64::MAX);
             g
         };
+        // Stream definitions likewise: the complete list on the first
+        // chunk this task sends (the opening one, or the first data
+        // chunk), the changes after.
+        let mut stream_rx = dbn.stream_notify.subscribe();
+        let mut stream_gen = 0;
+        let mut first = true;
+        let next_streams = |first: &mut bool, stream_gen: &mut u64| -> (Vec<pb::StreamDef>, bool) {
+            if *first {
+                *first = false;
+                let (_, g) = dbn.stream_changes(u64::MAX);
+                *stream_gen = g;
+                (dbn.stream_defs(), true)
+            } else {
+                let (s, g) = dbn.stream_changes(*stream_gen);
+                *stream_gen = g;
+                (s, false)
+            }
+        };
         if open_chunk {
             let db2 = db.clone();
             let all = match tokio::task::spawn_blocking(move || db2.cursors()).await {
@@ -199,6 +217,16 @@ fn spawn_chunk_stream(
                     })
                     .collect(),
                 all_cursors: true,
+                streams: Vec::new(),
+                all_streams: false,
+            };
+            let item = {
+                let (streams, all_streams) = next_streams(&mut first, &mut stream_gen);
+                pb::ReplicationChunk {
+                    streams,
+                    all_streams,
+                    ..item
+                }
             };
             if tx.send(Ok(item)).await.is_err() {
                 return;
@@ -247,6 +275,7 @@ fn spawn_chunk_stream(
                     }
                     let (cursors, g) = dbn.cursor_changes(sent_gen);
                     sent_gen = g;
+                    let (streams, all_streams) = next_streams(&mut first, &mut stream_gen);
                     let item = pb::ReplicationChunk {
                         db_id: db.id().as_bytes().to_vec(),
                         from: c.from,
@@ -258,6 +287,8 @@ fn spawn_chunk_stream(
                         confirmed: dbn.sync.majority(),
                         cursors,
                         all_cursors: false,
+                        streams,
+                        all_streams,
                     };
                     cursor = c.to;
                     if tx.send(Ok(item)).await.is_err() {
@@ -300,6 +331,7 @@ fn spawn_chunk_stream(
                             if cursors.is_empty() {
                                 continue;
                             }
+                            let (streams, all_streams) = next_streams(&mut first, &mut stream_gen);
                             let item = pb::ReplicationChunk {
                                 db_id: db.id().as_bytes().to_vec(),
                                 from: cursor,
@@ -310,7 +342,39 @@ fn spawn_chunk_stream(
                                 epoch_base: dbn.epoch_base.load(std::sync::atomic::Ordering::Acquire),
                                 confirmed: dbn.sync.majority(),
                                 cursors,
-                            all_cursors: false,
+                                all_cursors: false,
+                                streams,
+                                all_streams,
+                            };
+                            if tx.send(Ok(item)).await.is_err() {
+                                return;
+                            }
+                        }
+                        r = stream_rx.changed() => {
+                            // A stream was defined or removed with no new
+                            // events: an empty chunk carries it.
+                            if r.is_err() {
+                                return;
+                            }
+                            let (streams, all_streams) = next_streams(&mut first, &mut stream_gen);
+                            if streams.is_empty() && !all_streams {
+                                continue;
+                            }
+                            let (cursors, g) = dbn.cursor_changes(sent_gen);
+                            sent_gen = g;
+                            let item = pb::ReplicationChunk {
+                                db_id: db.id().as_bytes().to_vec(),
+                                from: cursor,
+                                to: cursor,
+                                frames: Vec::new(),
+                                head: db.head(),
+                                epoch: db.epoch(),
+                                epoch_base: dbn.epoch_base.load(std::sync::atomic::Ordering::Acquire),
+                                confirmed: dbn.sync.majority(),
+                                cursors,
+                                all_cursors: false,
+                                streams,
+                                all_streams,
                             };
                             if tx.send(Ok(item)).await.is_err() {
                                 return;
@@ -484,6 +548,62 @@ impl Chron for ChronService {
         )))
     }
 
+    type ReadStreamStream = EventStream;
+
+    async fn read_stream(
+        &self,
+        req: Request<pb::ReadStreamRequest>,
+    ) -> Result<Response<Self::ReadStreamStream>, Status> {
+        let dbn = self.db(&req)?;
+        let r = req.into_inner();
+        ops::check_stream(&dbn, &r.stream)?;
+        let mode = self.node.read_mode(r.consistency());
+        ops::wait_requested(&self.node, &dbn, mode, r.at_least, r.wait_timeout_ms).await?;
+        let read = Read::Stream {
+            name: r.stream,
+            backward: r.backward,
+        };
+        Ok(Response::new(finite(
+            dbn.db.clone(),
+            read,
+            r.from,
+            r.limit,
+            ops::cap(&self.node, &dbn, mode),
+            dbn.cancel.clone(),
+        )))
+    }
+
+    async fn create_stream(
+        &self,
+        req: Request<pb::CreateStreamRequest>,
+    ) -> Result<Response<pb::CreateStreamResponse>, Status> {
+        self.node.require_admin(req.metadata())?;
+        let dbn = self.db(&req)?;
+        let r = req.into_inner();
+        let stream = ops::create_stream(&self.node, &dbn, r.name, r.tags).await?;
+        Ok(Response::new(pb::CreateStreamResponse {
+            stream: Some(stream),
+        }))
+    }
+
+    async fn list_streams(
+        &self,
+        req: Request<pb::ListStreamsRequest>,
+    ) -> Result<Response<pb::ListStreamsResponse>, Status> {
+        let dbn = self.db(&req)?;
+        Ok(Response::new(ops::list_streams(&dbn)?))
+    }
+
+    async fn delete_stream(
+        &self,
+        req: Request<pb::DeleteStreamRequest>,
+    ) -> Result<Response<pb::DeleteStreamResponse>, Status> {
+        self.node.require_admin(req.metadata())?;
+        let dbn = self.db(&req)?;
+        let existed = ops::delete_stream(&self.node, &dbn, &req.into_inner().name).await?;
+        Ok(Response::new(pb::DeleteStreamResponse { existed }))
+    }
+
     async fn aggregate_len(
         &self,
         req: Request<pb::AggregateLenRequest>,
@@ -519,6 +639,21 @@ impl Chron for ChronService {
         let mut mode = self.node.read_mode(r.consistency());
         let mut from = r.from;
         let mut meta = Vec::new();
+        // The source is checked before a cursor is registered: a cursor
+        // on a stream that does not exist would be persisted for nothing.
+        let source = match (r.tag, r.stream.is_empty()) {
+            (Some(_), false) => {
+                return Err(Status::invalid_argument(
+                    "a subscription takes a tag or a stream, not both",
+                ));
+            }
+            (Some(tag), true) => Source::Tag(Bytes::from(tag)),
+            (None, false) => {
+                ops::check_stream(&dbn, &r.stream)?;
+                Source::Stream(r.stream)
+            }
+            (None, true) => Source::All,
+        };
         let cursor = if r.cursor.is_empty() {
             None
         } else {
@@ -536,7 +671,7 @@ impl Chron for ChronService {
                 cancel,
             })
         };
-        let rx = ops::subscribe(self.node.clone(), dbn, from, r.tag, mode, cursor);
+        let rx = ops::subscribe(self.node.clone(), dbn, from, source, mode, cursor)?;
         let mut resp: Response<Self::SubscribeStream> =
             Response::new(Box::pin(rx.map(|item| item.map(codec::event_to_wire))));
         for (key, v) in meta {

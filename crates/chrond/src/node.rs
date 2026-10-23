@@ -467,6 +467,19 @@ pub struct DbNode {
     /// The cursor log's generation, for streams idling with no new
     /// events.
     pub cursor_notify: watch::Sender<u64>,
+    /// Stream definition changes for the replication streams, like
+    /// `cursor_log`.
+    pub stream_log: Mutex<StreamLog>,
+    /// The stream log's generation.
+    pub stream_notify: watch::Sender<u64>,
+}
+
+/// Stream definition changes not yet sent on every replication stream.
+#[derive(Default)]
+pub struct StreamLog {
+    pub generation: u64,
+    /// Per stream: its latest definition and the generation it changed at.
+    pub entries: HashMap<String, (pb::StreamDef, u64)>,
 }
 
 /// A durable cursor's live subscription on a leader.
@@ -501,7 +514,50 @@ impl DbNode {
             cursor_sessions: Mutex::new(HashMap::new()),
             cursor_log: Mutex::new(CursorLog::default()),
             cursor_notify: watch::Sender::new(0),
+            stream_log: Mutex::new(StreamLog::default()),
+            stream_notify: watch::Sender::new(0),
         })
+    }
+
+    /// Records a stream definition change for the replication streams
+    /// and wakes them.
+    pub fn log_stream(&self, def: pb::StreamDef) {
+        let generation = {
+            let mut log = self.stream_log.lock().unwrap_or_else(|p| p.into_inner());
+            log.generation += 1;
+            let g = log.generation;
+            log.entries.insert(def.name.clone(), (def, g));
+            g
+        };
+        self.stream_notify.send_replace(generation);
+    }
+
+    /// The stream definition changes above generation `since`, and the
+    /// generation they bring a stream to.
+    pub fn stream_changes(&self, since: u64) -> (Vec<pb::StreamDef>, u64) {
+        let log = self.stream_log.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out: Vec<(u64, pb::StreamDef)> = log
+            .entries
+            .values()
+            .filter(|(_, g)| *g > since)
+            .map(|(s, g)| (*g, s.clone()))
+            .collect();
+        out.sort_by_key(|(g, _)| *g);
+        (out.into_iter().map(|(_, s)| s).collect(), log.generation)
+    }
+
+    /// Every stream the database defines, as definitions for a chunk.
+    pub fn stream_defs(&self) -> Vec<pb::StreamDef> {
+        self.db
+            .streams()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| pb::StreamDef {
+                name: s.name,
+                tags: s.tags.into_iter().map(|t| t.to_vec()).collect(),
+                deleted: false,
+            })
+            .collect()
     }
 
     /// Records a cursor change for the replication streams and wakes

@@ -25,6 +25,33 @@ crates share one version.
   archive holding a stream says `format` 3 in its header and a restore
   rebuilds the entries from the definitions.
 
+### chron-proto
+
+- `StreamDef`, `StreamInfo`; `CreateStream`, `ListStreams`,
+  `DeleteStream`, `ReadStream` (stream Event); `SubscribeRequest.stream`;
+  `ReplicationChunk.streams` and `all_streams`; `InfoResponse.streams`.
+
+### chrond
+
+- Streams: `CreateStream` (admin, leader only) defines a named subset
+  of the global order over a set of tags and returns once the earlier
+  events are indexed; `ReadStream`, `Subscribe` with `stream`, cursors
+  on a stream; `ListStreams`; `DeleteStream` (admin, leader only) ends
+  the stream's subscriptions UNAVAILABLE. Definitions ride on the
+  replication chunks, applied before the events: a follower fills a new
+  stream from what it holds off its apply path, takes the leader's
+  complete list on the first chunk of a Follow (dropping any stream the
+  leader lacks, replacing one defined with other tags), so every node
+  holds the same streams. A restore from a fetched backup keeps them.
+  Metric `chron_streams{db}`; `Info.streams`.
+
+### chron-client
+
+- `StreamInfo`, `Source`, `StreamChange`; `Client::create_stream`,
+  `streams`, `delete_stream`, `read_stream(_with/_backward/_stream)`,
+  `subscribe_stream`, `subscribe_source`, `subscribe_cursor_source`;
+  `ReplicationChunk.streams` and `all_streams`; `Info.streams`.
+
 ## 0.6.0 - 2026-10-23
 
 ### chron-db

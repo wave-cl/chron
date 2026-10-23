@@ -77,7 +77,11 @@ pub fn status(e: Error) -> Status {
         | Error::EmptyAppend { .. }
         | Error::RecordTooLarge { .. }
         | Error::CommitIdReused { .. }
-        | Error::InvalidTag(_) => Status::invalid_argument(e.to_string()),
+        | Error::InvalidTag(_)
+        | Error::InvalidStream(_) => Status::invalid_argument(e.to_string()),
+        Error::NoStream(_) => Status::not_found(e.to_string()),
+        Error::StreamExists(_) => Status::already_exists(e.to_string()),
+        Error::StreamNotReady(_) => Status::unavailable(e.to_string()),
         Error::PositionOutOfRange { position, head } => {
             let mut s = Status::out_of_range(e.to_string());
             insert(&mut s, chron_proto::POSITION_HEADER, *position);

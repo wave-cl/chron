@@ -205,6 +205,117 @@ fn cursor_host(node: &Node) -> Result<(), Status> {
     Ok(())
 }
 
+/// What a subscription delivers: everything, one tag's events, or a
+/// stream's members.
+pub enum Source {
+    All,
+    Tag(Bytes),
+    Stream(String),
+}
+
+fn valid_stream(name: &str) -> Result<(), Status> {
+    if chron_proto::valid_database_name(name) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(format!(
+            "stream {name:?}: 1 to 64 characters of a-z, 0-9, _ and -"
+        )))
+    }
+}
+
+/// Checks that a stream can be read: it exists and its fill finished.
+pub fn check_stream(dbn: &DbNode, name: &str) -> Result<(), Status> {
+    valid_stream(name)?;
+    match dbn.db.stream(name).map_err(codec::status)? {
+        None => Err(Status::not_found(format!("no stream {name:?}"))),
+        Some(s) if !s.ready => Err(Status::unavailable(format!(
+            "stream {name:?} is not ready: its fill has not finished"
+        ))),
+        Some(_) => Ok(()),
+    }
+}
+
+pub fn stream_info_to_wire(s: chron::StreamInfo) -> pb::StreamInfo {
+    pb::StreamInfo {
+        name: s.name,
+        tags: s.tags.into_iter().map(|t| t.to_vec()).collect(),
+        ready: s.ready,
+    }
+}
+
+/// Defines a stream (the caller checked the admin token): on the leader
+/// only, like a write. The definition is logged for the followers as
+/// soon as it is in force, before the fill, so they fill in parallel.
+pub async fn create_stream(
+    node: &Arc<Node>,
+    dbn: &Arc<DbNode>,
+    name: String,
+    tags: Vec<Vec<u8>>,
+) -> Result<pb::StreamInfo, Status> {
+    valid_stream(&name)?;
+    if let Some(s) = node.write_refusal() {
+        return Err(s);
+    }
+    let n = name.clone();
+    let info = blocking(&dbn.db, "begin_stream", move |db| {
+        db.begin_stream(&n, tags.into_iter().map(Bytes::from))
+    })
+    .await?;
+    dbn.log_stream(pb::StreamDef {
+        name: name.clone(),
+        tags: info.tags.iter().map(|t| t.to_vec()).collect(),
+        deleted: false,
+    });
+    let n = name.clone();
+    let filled = blocking(&dbn.db, "fill_stream", move |db| db.fill_stream(&n)).await?;
+    if !filled {
+        return Err(Status::not_found(format!(
+            "stream {name:?} was deleted while it was being filled"
+        )));
+    }
+    let info = dbn
+        .db
+        .stream(&name)
+        .map_err(codec::status)?
+        .ok_or_else(|| Status::not_found(format!("no stream {name:?}")))?;
+    Ok(stream_info_to_wire(info))
+}
+
+/// Every stream of the database.
+pub fn list_streams(dbn: &DbNode) -> Result<pb::ListStreamsResponse, Status> {
+    Ok(pb::ListStreamsResponse {
+        streams: dbn
+            .db
+            .streams()
+            .map_err(codec::status)?
+            .into_iter()
+            .map(stream_info_to_wire)
+            .collect(),
+    })
+}
+
+/// Removes a stream (the caller checked the admin token); leader only.
+pub async fn delete_stream(
+    node: &Arc<Node>,
+    dbn: &Arc<DbNode>,
+    name: &str,
+) -> Result<bool, Status> {
+    valid_stream(name)?;
+    if let Some(s) = node.write_refusal() {
+        return Err(s);
+    }
+    let n = name.to_string();
+    let existed = blocking(&dbn.db, "delete_stream", move |db| db.delete_stream(&n)).await?;
+    if existed {
+        dbn.log_stream(pb::StreamDef {
+            name: name.to_string(),
+            tags: Vec::new(),
+            deleted: true,
+        });
+    }
+    Ok(existed)
+}
+
 fn valid_cursor(name: &str) -> Result<(), Status> {
     if chron_proto::valid_database_name(name) {
         Ok(())
@@ -425,6 +536,7 @@ pub enum Read {
     Aggregate { id: Uuid, backward: bool },
     All { backward: bool },
     Tag { tag: Bytes, backward: bool },
+    Stream { name: String, backward: bool },
 }
 
 impl Read {
@@ -451,6 +563,14 @@ impl Read {
                 tag,
                 backward: true,
             } => db.read_tag_backward_upto(tag, cursor, n, upto),
+            Read::Stream {
+                name,
+                backward: false,
+            } => db.read_stream_bounded_upto(name, cursor, n, max_bytes, upto),
+            Read::Stream {
+                name,
+                backward: true,
+            } => db.read_stream_backward_upto(name, cursor, n, upto),
         }
     }
 
@@ -459,7 +579,9 @@ impl Read {
     pub fn next_cursor(&self, last: &Event) -> Option<u64> {
         let (key, backward) = match self {
             Read::Aggregate { backward, .. } => (last.index, *backward),
-            Read::All { backward } | Read::Tag { backward, .. } => (last.position, *backward),
+            Read::All { backward } | Read::Tag { backward, .. } | Read::Stream { backward, .. } => {
+                (last.position, *backward)
+            }
         };
         if backward {
             key.checked_sub(1)
@@ -487,17 +609,21 @@ pub fn subscribe(
     node: Arc<Node>,
     dbn: Arc<DbNode>,
     from: u64,
-    tag: Option<Vec<u8>>,
+    source: Source,
     mode: Mode,
     cursor: Option<CursorSub>,
-) -> ReceiverStream<Result<Event, Status>> {
+) -> Result<ReceiverStream<Result<Event, Status>>, Status> {
     // The reset watch is taken before the subscription so a cut between
     // the two is not missed.
     let mut reset = dbn.reset.subscribe();
     let mut conf = dbn.confirmed.subscribe();
-    let mut sub = match tag {
-        Some(tag) => dbn.db.subscribe_tag(tag, from),
-        None => dbn.db.subscribe(from),
+    let mut sub = match source {
+        Source::All => dbn.db.subscribe(from),
+        Source::Tag(tag) => dbn.db.subscribe_tag(tag, from),
+        Source::Stream(name) => dbn
+            .db
+            .subscribe_stream(&name, from)
+            .map_err(codec::status)?,
     }
     .batch(PAGE);
     let (tx, rx) = mpsc::channel(PAGE);
@@ -584,6 +710,14 @@ pub fn subscribe(
                     }
                     continue;
                 }
+                Err(chron::Error::NoStream(name)) => {
+                    let _ = tx
+                        .send(Err(Status::unavailable(format!(
+                            "stream {name:?} was deleted; subscribe again"
+                        ))))
+                        .await;
+                    return;
+                }
                 Err(e) => {
                     let _ = tx.send(Err(codec::status(e))).await;
                     return;
@@ -594,7 +728,7 @@ pub fn subscribe(
             }
         }
     });
-    ReceiverStream::new(rx)
+    Ok(ReceiverStream::new(rx))
 }
 
 /// Waits until the confirmed watch rises above `upto`; false once the
@@ -780,6 +914,7 @@ pub async fn info(node: &Node, dbn: &DbNode) -> Result<pb::InfoResponse, Status>
             .is_some()
             .then(|| cap(node, dbn, Mode::Confirmed)),
         read_consistency: node.read_mode(pb::Consistency::Unspecified).wire() as i32,
+        streams: dbn.db.streams().map_or(0, |v| v.len() as u64),
         members_version: members.current.version,
         members_epoch: members.current.epoch,
         members_committed: members.committed,

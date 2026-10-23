@@ -245,6 +245,9 @@ pub struct SubscribeRequest {
     /// `chron-cursor-from` (where it starts). Leader only.
     #[prost(string, tag = "4")]
     pub cursor: ::prost::alloc::string::String,
+    /// A stream: only its members are delivered. Not with `tag`.
+    #[prost(string, tag = "5")]
+    pub stream: ::prost::alloc::string::String,
 }
 /// What the daemon keeps per cursor: `next` is the position after the
 /// last acknowledged event, `session` the live subscription's (a new
@@ -302,6 +305,86 @@ pub struct DeleteCursorRequest {
 pub struct DeleteCursorResponse {
     #[prost(bool, tag = "1")]
     pub existed: bool,
+}
+/// A stream definition on the replication stream: a name and the tags it
+/// covers; `deleted` marks a removal.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StreamDef {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub tags: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bool, tag = "3")]
+    pub deleted: bool,
+}
+/// A stream as the daemon lists it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StreamInfo {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Sorted, without duplicates.
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub tags: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Whether the fill at creation finished: until then the stream cannot
+    /// be read.
+    #[prost(bool, tag = "3")]
+    pub ready: bool,
+}
+/// Defines a stream (admin, leader only): a named subset of the global
+/// order, every event committed before or after that carries any of
+/// `tags`. The call returns once the earlier events are indexed (new ones
+/// are indexed as they land). An existing name is ALREADY_EXISTS; a bad
+/// name (1 to 64 of a-z, 0-9, _ and -) or tag set (1 to 32 tags) is
+/// INVALID_ARGUMENT.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateStreamRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub tags: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateStreamResponse {
+    #[prost(message, optional, tag = "1")]
+    pub stream: ::core::option::Option<StreamInfo>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListStreamsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListStreamsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub streams: ::prost::alloc::vec::Vec<StreamInfo>,
+}
+/// Removes a stream (admin, leader only); its live subscriptions end
+/// UNAVAILABLE.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteStreamRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteStreamResponse {
+    #[prost(bool, tag = "1")]
+    pub existed: bool,
+}
+/// The stream's members in global order; the fields as ReadTagRequest.
+/// An unknown stream is NOT_FOUND, one still being filled UNAVAILABLE.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReadStreamRequest {
+    #[prost(string, tag = "1")]
+    pub stream: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub from: u64,
+    #[prost(uint64, tag = "3")]
+    pub limit: u64,
+    #[prost(bool, tag = "4")]
+    pub backward: bool,
+    #[prost(enumeration = "Consistency", tag = "5")]
+    pub consistency: i32,
+    #[prost(uint64, optional, tag = "6")]
+    pub at_least: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "7")]
+    pub wait_timeout_ms: ::core::option::Option<u64>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FlushRequest {}
@@ -392,6 +475,9 @@ pub struct InfoResponse {
     pub confirmed: ::core::option::Option<u64>,
     #[prost(enumeration = "Consistency", tag = "29")]
     pub read_consistency: i32,
+    /// Streams defined on the database, ready or not.
+    #[prost(uint64, tag = "30")]
+    pub streams: u64,
     /// On a leader: whether that generation is committed (a majority of it
     /// holds it and everything confirmed before it was made).
     #[prost(bool, tag = "26")]
@@ -800,6 +886,14 @@ pub struct ReplicationChunk {
     /// every cursor it holds that is not in it.
     #[prost(bool, tag = "10")]
     pub all_cursors: bool,
+    /// Stream definitions that changed since the previous chunk; a follower
+    /// applies them before the events (a new one fills from what it holds).
+    #[prost(message, repeated, tag = "11")]
+    pub streams: ::prost::alloc::vec::Vec<StreamDef>,
+    /// `streams` is the complete list (the first chunk of a stream): a
+    /// follower drops every stream it holds that is not in it.
+    #[prost(bool, tag = "12")]
+    pub all_streams: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PromoteRequest {}
@@ -939,8 +1033,9 @@ pub mod chron_client {
     /// epoch is FAILED_PRECONDITION with the metadata `chron-epoch`. A missing
     /// or wrong bearer token is UNAUTHENTICATED; an administrative call
     /// (Promote, Fence, Retain, Backup, ApplyBackup, Replicate, Follow,
-    /// FetchBackup, Fingerprints, ChangeMembers, the database calls and the
-    /// daemon-to-daemon Heartbeat and RequestVote) without the admin token,
+    /// FetchBackup, Fingerprints, ChangeMembers, the database calls,
+    /// CreateStream, DeleteStream and the daemon-to-daemon Heartbeat and
+    /// RequestVote) without the admin token,
     /// when the daemon has one, is PERMISSION_DENIED. A
     /// replication stream meets a transaction larger than the message limit
     /// with RESOURCE_EXHAUSTED. Subscribe and Replicate end with UNAVAILABLE
@@ -1237,6 +1332,101 @@ pub mod chron_client {
             req.extensions_mut()
                 .insert(GrpcMethod::new("chron.v1.Chron", "DeleteCursor"));
             self.inner.unary(req, path, codec).await
+        }
+        pub async fn create_stream(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CreateStreamRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CreateStreamResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/CreateStream",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("chron.v1.Chron", "CreateStream"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_streams(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListStreamsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListStreamsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/ListStreams",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("chron.v1.Chron", "ListStreams"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn delete_stream(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteStreamRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteStreamResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/DeleteStream",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("chron.v1.Chron", "DeleteStream"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn read_stream(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReadStreamRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::Event>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/chron.v1.Chron/ReadStream",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("chron.v1.Chron", "ReadStream"));
+            self.inner.server_streaming(req, path, codec).await
         }
         pub async fn flush(
             &mut self,
@@ -1740,6 +1930,37 @@ pub mod chron_server {
             tonic::Response<super::DeleteCursorResponse>,
             tonic::Status,
         >;
+        async fn create_stream(
+            &self,
+            request: tonic::Request<super::CreateStreamRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CreateStreamResponse>,
+            tonic::Status,
+        >;
+        async fn list_streams(
+            &self,
+            request: tonic::Request<super::ListStreamsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListStreamsResponse>,
+            tonic::Status,
+        >;
+        async fn delete_stream(
+            &self,
+            request: tonic::Request<super::DeleteStreamRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeleteStreamResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the ReadStream method.
+        type ReadStreamStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::Event, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn read_stream(
+            &self,
+            request: tonic::Request<super::ReadStreamRequest>,
+        ) -> std::result::Result<tonic::Response<Self::ReadStreamStream>, tonic::Status>;
         async fn flush(
             &self,
             request: tonic::Request<super::FlushRequest>,
@@ -1884,8 +2105,9 @@ pub mod chron_server {
     /// epoch is FAILED_PRECONDITION with the metadata `chron-epoch`. A missing
     /// or wrong bearer token is UNAUTHENTICATED; an administrative call
     /// (Promote, Fence, Retain, Backup, ApplyBackup, Replicate, Follow,
-    /// FetchBackup, Fingerprints, ChangeMembers, the database calls and the
-    /// daemon-to-daemon Heartbeat and RequestVote) without the admin token,
+    /// FetchBackup, Fingerprints, ChangeMembers, the database calls,
+    /// CreateStream, DeleteStream and the daemon-to-daemon Heartbeat and
+    /// RequestVote) without the admin token,
     /// when the daemon has one, is PERMISSION_DENIED. A
     /// replication stream meets a transaction larger than the message limit
     /// with RESOURCE_EXHAUSTED. Subscribe and Replicate end with UNAVAILABLE
@@ -2408,6 +2630,185 @@ pub mod chron_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/CreateStream" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateStreamSvc<T: Chron>(pub Arc<T>);
+                    impl<
+                        T: Chron,
+                    > tonic::server::UnaryService<super::CreateStreamRequest>
+                    for CreateStreamSvc<T> {
+                        type Response = super::CreateStreamResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CreateStreamRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::create_stream(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CreateStreamSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/ListStreams" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListStreamsSvc<T: Chron>(pub Arc<T>);
+                    impl<T: Chron> tonic::server::UnaryService<super::ListStreamsRequest>
+                    for ListStreamsSvc<T> {
+                        type Response = super::ListStreamsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListStreamsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::list_streams(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListStreamsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/DeleteStream" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteStreamSvc<T: Chron>(pub Arc<T>);
+                    impl<
+                        T: Chron,
+                    > tonic::server::UnaryService<super::DeleteStreamRequest>
+                    for DeleteStreamSvc<T> {
+                        type Response = super::DeleteStreamResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteStreamRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::delete_stream(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteStreamSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/chron.v1.Chron/ReadStream" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReadStreamSvc<T: Chron>(pub Arc<T>);
+                    impl<
+                        T: Chron,
+                    > tonic::server::ServerStreamingService<super::ReadStreamRequest>
+                    for ReadStreamSvc<T> {
+                        type Response = super::Event;
+                        type ResponseStream = T::ReadStreamStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReadStreamRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Chron>::read_stream(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReadStreamSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

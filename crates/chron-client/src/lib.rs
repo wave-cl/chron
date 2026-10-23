@@ -32,7 +32,7 @@ pub use client::{
     ByteStream, ChunkStream, Client, ClientConfig, CommitOptions, Consistency, Cursor,
     CursorChange, CursorInfo, CursorList, DatabaseInfo, DatabaseOptions, Discovered, EventStream,
     FollowAcks, FollowerStatus, Head, Identity, Info, Listing, Members, MembersStatus, Promoted,
-    ReadOptions, ReplicationChunk, Role, TlsConfig, Tombstone,
+    ReadOptions, ReplicationChunk, Role, Source, StreamChange, StreamInfo, TlsConfig, Tombstone,
 };
 pub use error::ClientError;
 pub use txn::{Append, Transaction};

@@ -419,7 +419,10 @@ async fn tail(
             })
         }
     };
-    let rx = ops::subscribe(st.node.clone(), dbn, from, tag, mode, cursor);
+    let source = tag.map_or(ops::Source::All, |t| {
+        ops::Source::Tag(bytes::Bytes::from(t))
+    });
+    let rx = ops::subscribe(st.node.clone(), dbn, from, source, mode, cursor)?;
     let stream = tokio_stream::iter(first.into_iter().map(Ok)).chain(rx.map(|item| {
         Ok(match item {
             Ok(ev) => SseEvent::default().data(event_json(&ev).to_string()),

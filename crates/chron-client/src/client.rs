@@ -189,6 +189,31 @@ pub struct CursorInfo {
     pub session: u64,
 }
 
+/// A stream as [`Client::streams`] lists it: a named subset of the
+/// global order, the events carrying any tag of a set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamInfo {
+    /// The stream's name.
+    pub name: String,
+    /// The tags it covers, sorted, without duplicates.
+    pub tags: Vec<Bytes>,
+    /// Whether the fill at creation finished: until then the stream
+    /// cannot be read.
+    pub ready: bool,
+}
+
+/// What a subscription delivers: everything, one tag's events, or a
+/// stream's members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// Every event.
+    All,
+    /// The events carrying the tag.
+    Tag(Bytes),
+    /// The members of the stream.
+    Stream(String),
+}
+
 /// [`Client::cursors`]: the cursors and the confirmed bound (a cursor's
 /// lag is `confirmed - next`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,6 +437,8 @@ pub struct Info {
     pub confirmed: Option<u64>,
     /// What reads get when they do not ask (never `Default`).
     pub read_consistency: Consistency,
+    /// Streams defined on the database, ready or not.
+    pub streams: u64,
     /// The membership generation the daemon holds (`(epoch, version)`).
     pub members_version: u64,
     /// The epoch half of that generation.
@@ -566,6 +593,22 @@ pub struct ReplicationChunk {
     /// `cursors` is the complete list: a follower drops every cursor it
     /// holds that is not in it.
     pub all_cursors: bool,
+    /// Stream definitions that changed (every one on the first chunk).
+    pub streams: Vec<StreamChange>,
+    /// `streams` is the complete list: a follower drops every stream it
+    /// holds that is not in it.
+    pub all_streams: bool,
+}
+
+/// A stream definition change on the replication stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamChange {
+    /// The stream's name.
+    pub name: String,
+    /// The tags it covers (empty when deleted).
+    pub tags: Vec<Bytes>,
+    /// A removal.
+    pub deleted: bool,
 }
 
 /// A durable cursor's state as the replication stream carries it.
@@ -809,6 +852,7 @@ enum Read {
     Aggregate(Uuid),
     All,
     Tag(Bytes),
+    Stream(String),
 }
 
 fn events(stream: tonic::Streaming<pb::Event>) -> EventStream {
@@ -1225,6 +1269,19 @@ impl Client {
                 })
                 .await?
                 .into_inner(),
+            Read::Stream(name) => self
+                .rpc()
+                .read_stream(pb::ReadStreamRequest {
+                    stream: name,
+                    from,
+                    limit,
+                    backward,
+                    consistency,
+                    at_least,
+                    wait_timeout_ms,
+                })
+                .await?
+                .into_inner(),
         };
         Ok(events(stream))
     }
@@ -1456,6 +1513,127 @@ impl Client {
         .await
     }
 
+    /// The members of the stream `name` from position `from` on, at most
+    /// `limit` (0 for all), in global order; below the floor, from the
+    /// floor. An unknown stream is [`ClientError::NotFound`]; one still
+    /// being filled [`ClientError::Unavailable`].
+    pub async fn read_stream(
+        &self,
+        name: &str,
+        from: u64,
+        limit: usize,
+    ) -> Result<Vec<Event>, ClientError> {
+        Self::collect(self.read_stream_stream(name, from, limit).await?).await
+    }
+
+    /// [`read_stream`](Client::read_stream) under [`ReadOptions`].
+    pub async fn read_stream_with(
+        &self,
+        name: &str,
+        from: u64,
+        limit: usize,
+        opts: ReadOptions,
+    ) -> Result<Vec<Event>, ClientError> {
+        Self::collect(
+            self.read(Read::Stream(name.to_string()), from, limit, false, opts)
+                .await?,
+        )
+        .await
+    }
+
+    /// Like [`read_stream`](Client::read_stream), newest first from
+    /// position `to` (inclusive; `u64::MAX` for the end).
+    pub async fn read_stream_backward(
+        &self,
+        name: &str,
+        to: u64,
+        limit: usize,
+    ) -> Result<Vec<Event>, ClientError> {
+        Self::collect(self.read_stream_backward_stream(name, to, limit).await?).await
+    }
+
+    /// [`read_stream`](Client::read_stream) as a stream.
+    pub async fn read_stream_stream(
+        &self,
+        name: &str,
+        from: u64,
+        limit: usize,
+    ) -> Result<EventStream, ClientError> {
+        self.read(
+            Read::Stream(name.to_string()),
+            from,
+            limit,
+            false,
+            ReadOptions::default(),
+        )
+        .await
+    }
+
+    /// [`read_stream_backward`](Client::read_stream_backward) as a stream.
+    pub async fn read_stream_backward_stream(
+        &self,
+        name: &str,
+        to: u64,
+        limit: usize,
+    ) -> Result<EventStream, ClientError> {
+        self.read(
+            Read::Stream(name.to_string()),
+            to,
+            limit,
+            true,
+            ReadOptions::default(),
+        )
+        .await
+    }
+
+    /// Defines a stream (admin, on the leader): every event, committed
+    /// before or after, carrying any of `tags` is a member. Returns once
+    /// the earlier events are indexed. An existing name is
+    /// [`ClientError::AlreadyExists`].
+    pub async fn create_stream<T: Into<Bytes>>(
+        &self,
+        name: &str,
+        tags: impl IntoIterator<Item = T>,
+    ) -> Result<StreamInfo, ClientError> {
+        let r = self
+            .admin()
+            .create_stream(pb::CreateStreamRequest {
+                name: name.to_string(),
+                tags: tags.into_iter().map(|t| t.into().to_vec()).collect(),
+            })
+            .await?
+            .into_inner();
+        r.stream
+            .map(stream_info)
+            .ok_or_else(|| ClientError::Decode("CreateStream answered no stream".into()))
+    }
+
+    /// Every stream of the database.
+    pub async fn streams(&self) -> Result<Vec<StreamInfo>, ClientError> {
+        Ok(self
+            .rpc()
+            .list_streams(pb::ListStreamsRequest {})
+            .await?
+            .into_inner()
+            .streams
+            .into_iter()
+            .map(stream_info)
+            .collect())
+    }
+
+    /// Removes a stream (admin, on the leader); its live subscriptions
+    /// end. Whether it existed.
+    pub async fn delete_stream(&self, name: &str) -> Result<bool, ClientError> {
+        Ok(self
+            .admin()
+            .delete_stream(pb::DeleteStreamRequest {
+                name: name.to_string(),
+            })
+            .await?
+            .into_inner()
+            .existed)
+    }
+
     /// How many events the aggregate has (0 for an unknown one).
     pub async fn aggregate_len(&self, id: Uuid) -> Result<u64, ClientError> {
         self.aggregate_len_with(id, ReadOptions::default()).await
@@ -1514,7 +1692,7 @@ impl Client {
     /// BelowFloor`] when `from` is below the floor, [`ClientError::
     /// Unavailable`] when the daemon is fenced or stops.
     pub async fn subscribe(&self, from: u64) -> Result<EventStream, ClientError> {
-        self.subscribe_inner(from, None, None).await
+        self.subscribe_inner(from, Source::All, None).await
     }
 
     /// Like [`subscribe`](Client::subscribe), only the events carrying
@@ -1524,7 +1702,20 @@ impl Client {
         tag: impl Into<Bytes>,
         from: u64,
     ) -> Result<EventStream, ClientError> {
-        self.subscribe_inner(from, Some(tag.into()), None).await
+        self.subscribe_inner(from, Source::Tag(tag.into()), None)
+            .await
+    }
+
+    /// Like [`subscribe`](Client::subscribe), only the members of the
+    /// stream `name`; below the floor it starts at the floor. The stream
+    /// ends with [`ClientError::Unavailable`] if the stream is deleted.
+    pub async fn subscribe_stream(
+        &self,
+        name: &str,
+        from: u64,
+    ) -> Result<EventStream, ClientError> {
+        self.subscribe_inner(from, Source::Stream(name.to_string()), None)
+            .await
     }
 
     /// [`subscribe`](Client::subscribe) (or, with `tag`,
@@ -1535,22 +1726,35 @@ impl Client {
         tag: Option<Bytes>,
         consistency: Consistency,
     ) -> Result<EventStream, ClientError> {
-        self.subscribe_inner(from, tag, Some(consistency)).await
+        let source = tag.map_or(Source::All, Source::Tag);
+        self.subscribe_inner(from, source, Some(consistency)).await
+    }
+
+    /// A subscription on any [`Source`] under a consistency.
+    pub async fn subscribe_source(
+        &self,
+        source: Source,
+        from: u64,
+        consistency: Consistency,
+    ) -> Result<EventStream, ClientError> {
+        self.subscribe_inner(from, source, Some(consistency)).await
     }
 
     async fn subscribe_inner(
         &self,
         from: u64,
-        tag: Option<Bytes>,
+        source: Source,
         consistency: Option<Consistency>,
     ) -> Result<EventStream, ClientError> {
+        let (tag, stream) = source_wire(source);
         let stream = self
             .rpc()
             .subscribe(pb::SubscribeRequest {
                 from,
-                tag: tag.map(|t| t.to_vec()),
+                tag,
                 consistency: consistency.unwrap_or(self.config.consistency).wire() as i32,
                 cursor: String::new(),
+                stream,
             })
             .await?
             .into_inner();
@@ -1574,11 +1778,26 @@ impl Client {
         from_if_new: u64,
         tag: Option<Bytes>,
     ) -> Result<(EventStream, Cursor), ClientError> {
+        self.subscribe_cursor_source(name, from_if_new, tag.map_or(Source::All, Source::Tag))
+            .await
+    }
+
+    /// [`subscribe_cursor`](Client::subscribe_cursor) on any [`Source`].
+    /// A cursor does not record its source: resuming it on another is
+    /// the caller's call.
+    pub async fn subscribe_cursor_source(
+        &self,
+        name: &str,
+        from_if_new: u64,
+        source: Source,
+    ) -> Result<(EventStream, Cursor), ClientError> {
+        let (tag, stream) = source_wire(source);
         let req = pb::SubscribeRequest {
             from: from_if_new,
-            tag: tag.map(|t| t.to_vec()),
+            tag,
             consistency: pb::Consistency::Confirmed as i32,
             cursor: name.to_string(),
+            stream,
         };
         let resp = match self.rpc().subscribe(req.clone()).await {
             Ok(r) => r,
@@ -1694,6 +1913,7 @@ impl Client {
             sync_commit: i.sync_commit,
             confirmed: i.confirmed,
             read_consistency: Consistency::from_wire(i.read_consistency),
+            streams: i.streams,
             members_version: i.members_version,
             members_epoch: i.members_epoch,
             members_committed: i.members_committed,
@@ -2066,6 +2286,24 @@ impl Client {
     }
 }
 
+/// A source as the wire carries it: the tag, and the stream name (empty
+/// for none).
+fn source_wire(source: Source) -> (Option<Vec<u8>>, String) {
+    match source {
+        Source::All => (None, String::new()),
+        Source::Tag(t) => (Some(t.to_vec()), String::new()),
+        Source::Stream(name) => (None, name),
+    }
+}
+
+fn stream_info(s: pb::StreamInfo) -> StreamInfo {
+    StreamInfo {
+        name: s.name,
+        tags: s.tags.into_iter().map(Bytes::from).collect(),
+        ready: s.ready,
+    }
+}
+
 /// Wire chunks as library chunks.
 fn chunks(stream: tonic::Streaming<pb::ReplicationChunk>) -> ChunkStream {
     Box::pin(stream.map(|item| {
@@ -2092,6 +2330,16 @@ fn chunks(stream: tonic::Streaming<pb::ReplicationChunk>) -> ChunkStream {
                 })
                 .collect(),
             all_cursors: c.all_cursors,
+            streams: c
+                .streams
+                .into_iter()
+                .map(|s| StreamChange {
+                    name: s.name,
+                    tags: s.tags.into_iter().map(Bytes::from).collect(),
+                    deleted: s.deleted,
+                })
+                .collect(),
+            all_streams: c.all_streams,
         })
     }))
 }

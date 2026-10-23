@@ -348,3 +348,29 @@ async fn fsync_histogram_and_checkpoints_are_reported() {
     );
     s.stop().await;
 }
+
+/// The streams gauge counts the database's definitions.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_streams_gauge_counts_definitions() {
+    let s = Server::start_with(with_metrics).await;
+    let client = chron_client::Client::connect(s.addr(), Default::default())
+        .await
+        .unwrap();
+    let maddr = s.running.as_ref().unwrap().metrics_addr.unwrap();
+    let body = tokio::task::spawn_blocking(move || scrape(maddr))
+        .await
+        .unwrap();
+    assert_eq!(
+        metric(&body, "chron_streams", &[("db", "default")]),
+        Some(0.0)
+    );
+    client.create_stream("s", ["a"]).await.unwrap();
+    client.create_stream("t", ["b"]).await.unwrap();
+    let body = tokio::task::spawn_blocking(move || scrape(maddr))
+        .await
+        .unwrap();
+    assert_eq!(
+        metric(&body, "chron_streams", &[("db", "default")]),
+        Some(2.0)
+    );
+}

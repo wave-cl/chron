@@ -15,5 +15,6 @@ mod reads;
 mod replication;
 mod round5;
 mod security;
+mod streams;
 mod subscribe;
 mod sync_commit;
