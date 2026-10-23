@@ -6,7 +6,18 @@ crates share one version.
 
 ## Unreleased
 
-Nothing yet.
+### chron-db
+
+- Streams: `Db::create_stream(name, tags)` defines a named subset of the
+  global order, the events carrying any tag of the set, committed before
+  or after; `read_stream`, `read_stream_bounded(_upto)`,
+  `read_stream_backward(_upto)`, `iter_stream`, `subscribe_stream`,
+  `stream`, `streams`, `delete_stream`; `StreamInfo`; errors `NoStream`,
+  `StreamExists`, `StreamNotReady`, `InvalidStream`; `Info.streams`. The
+  index gains `stream` and `stream_pos` tables (an older index reads as
+  having no streams); members are indexed as records land and, at
+  creation, from the tag entries a chunk at a time without holding up
+  commits.
 
 ## 0.6.0 - 2026-10-23
 

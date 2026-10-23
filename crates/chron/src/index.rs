@@ -32,6 +32,22 @@ pub(crate) const TXN_ID: TableDefinition<&[u8; 16], (u64, u64)> = TableDefinitio
 /// Durable cursors: name -> (next, session). Absent on an index from
 /// before 0.6.0, which reads as empty.
 pub(crate) const CURSOR: TableDefinition<&str, (u64, u64)> = TableDefinition::new("cursor");
+/// Streams: name -> (id, ready, the head the fill runs up to, tag set as
+/// `(u8 len, bytes)` per tag). Absent on an index from before 0.7.0,
+/// which reads as empty.
+pub(crate) const STREAM: TableDefinition<&str, (u32, bool, u64, &[u8])> =
+    TableDefinition::new("stream");
+/// (stream id, position) → (): the stream's members.
+pub(crate) const STREAM_POS: TableDefinition<(u32, u64), ()> = TableDefinition::new("stream_pos");
+/// `"stream_next_id"` → the next stream id to allocate.
+pub(crate) const STREAM_NEXT_ID_KEY: &str = "stream_next_id";
+
+/// A `STREAM` row.
+pub(crate) struct StreamRow {
+    pub(crate) id: u32,
+    pub(crate) ready: bool,
+    pub(crate) tagset: Vec<u8>,
+}
 
 pub(crate) const DB_ID_KEY: &str = "db_id";
 /// `"epoch"` → the fencing epoch; absent means 0.
@@ -141,6 +157,8 @@ impl Index {
             txn.open_table(TAG)?;
             txn.open_table(TXN_ID)?;
             txn.open_table(CURSOR)?;
+            txn.open_table(STREAM)?;
+            txn.open_table(STREAM_POS)?;
         }
         txn.commit()?;
         Ok(())
@@ -273,6 +291,94 @@ impl Index {
         txn.delete_table(CURSOR)?;
         txn.commit()?;
         Ok(())
+    }
+
+    /// Every stream row, by name.
+    pub(crate) fn stream_rows(&self) -> Result<Vec<(String, StreamRow)>> {
+        let txn = self.begin_read()?;
+        let table = match txn.open_table(STREAM) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            let (id, ready, _, tagset) = v.value();
+            out.push((
+                k.value().to_string(),
+                StreamRow {
+                    id,
+                    ready,
+                    tagset: tagset.to_vec(),
+                },
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Deletes the stream tables (for tests of an index from before them).
+    pub(crate) fn drop_stream_tables(&self) -> Result<()> {
+        let txn = self.begin_write_durable()?;
+        txn.delete_table(STREAM)?;
+        txn.delete_table(STREAM_POS)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Positions of the stream's members from `from` (and the floor) and
+    /// below `upto`, ascending.
+    pub(crate) fn stream_positions(
+        txn: &ReadTransaction,
+        id: u32,
+        from: u64,
+        limit: usize,
+        upto: u64,
+    ) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        let table = match txn.open_table(STREAM_POS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        let from = from.max(Self::floor_in(txn)?);
+        if upto <= from {
+            return Ok(out);
+        }
+        for item in table.range((id, from)..(id, upto))?.take(limit) {
+            let (k, _) = item?;
+            out.push(k.value().1);
+        }
+        Ok(out)
+    }
+
+    /// Positions of the stream's members at `<= from` and below `upto`,
+    /// newest first, down to the floor.
+    pub(crate) fn stream_positions_rev(
+        txn: &ReadTransaction,
+        id: u32,
+        from: u64,
+        limit: usize,
+        upto: u64,
+    ) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        let table = match txn.open_table(STREAM_POS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        let Some(hi) = upto.checked_sub(1).map(|u| u.min(from)) else {
+            return Ok(out);
+        };
+        let floor = Self::floor_in(txn)?;
+        if hi < floor {
+            return Ok(out);
+        }
+        for item in table.range((id, floor)..=(id, hi))?.rev().take(limit) {
+            let (k, _) = item?;
+            out.push(k.value().1);
+        }
+        Ok(out)
     }
 
     /// Removes a cursor; whether it existed.

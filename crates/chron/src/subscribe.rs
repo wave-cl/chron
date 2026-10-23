@@ -2,6 +2,7 @@
 //! they land.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -9,6 +10,7 @@ use bytes::Bytes;
 use crate::db::Db;
 use crate::error::Result;
 use crate::event::Event;
+use crate::stream::StreamDef;
 
 /// Events read from the index per catch-up step.
 const DEFAULT_BATCH: usize = 256;
@@ -18,6 +20,7 @@ const WAIT_ROUND: Duration = Duration::from_secs(60);
 enum Filter {
     All,
     Tag(Bytes),
+    Stream(Arc<StreamDef>),
 }
 
 /// Yields committed events from a position onward, in global order,
@@ -29,8 +32,11 @@ enum Filter {
 /// [`Iterator`] ends only when retention dropped the positions it would
 /// deliver next (see [`Iterator::next`] below); use
 /// [`next_timeout`](Subscription::next_timeout) from a thread that must
-/// also watch a stop flag. A tag subscription from below the floor starts
-/// at the floor, as [`Db::read_tag`] does.
+/// also watch a stop flag. A tag or stream subscription from below the
+/// floor starts at the floor, as [`Db::read_tag`] does. A stream
+/// subscription ends with [`Error::NoStream`](crate::Error::NoStream)
+/// once the stream is deleted: at once for an async waiter, at the next
+/// event or wait round for a blocking one.
 pub struct Subscription {
     db: Db,
     filter: Filter,
@@ -45,6 +51,8 @@ pub struct Subscription {
     head_seen: u64,
     #[cfg(feature = "tokio")]
     head_rx: tokio::sync::watch::Receiver<u64>,
+    #[cfg(feature = "tokio")]
+    streams_rx: tokio::sync::watch::Receiver<u64>,
 }
 
 impl Subscription {
@@ -56,9 +64,15 @@ impl Subscription {
         Self::new(db, Filter::Tag(tag), from)
     }
 
+    pub(crate) fn stream(db: Db, def: Arc<StreamDef>, from: u64) -> Self {
+        Self::new(db, Filter::Stream(def), from)
+    }
+
     fn new(db: Db, filter: Filter, from: u64) -> Self {
         #[cfg(feature = "tokio")]
         let head_rx = db.inner.head_tx.subscribe();
+        #[cfg(feature = "tokio")]
+        let streams_rx = db.inner.streams_tx.subscribe();
         Subscription {
             db,
             filter,
@@ -69,6 +83,8 @@ impl Subscription {
             head_seen: 0,
             #[cfg(feature = "tokio")]
             head_rx,
+            #[cfg(feature = "tokio")]
+            streams_rx,
         }
     }
 
@@ -152,9 +168,37 @@ impl Subscription {
                 return Ok(None);
             }
             let min = self.cursor.saturating_add(1);
-            // Err only if the sender is gone, which `self.db` prevents.
-            let _ = self.head_rx.wait_for(|h| *h >= min).await;
+            self.wait_head_or_streams(min).await;
         }
+    }
+
+    /// Waits for the head to reach `min`, or, on a stream subscription,
+    /// for the stream definitions to change (a delete ends it). The
+    /// senders outlive this: `self.db` holds them.
+    #[cfg(feature = "tokio")]
+    async fn wait_head_or_streams(&mut self, min: u64) {
+        use std::future::poll_fn;
+        use std::task::Poll;
+        let Subscription {
+            head_rx,
+            streams_rx,
+            filter,
+            ..
+        } = self;
+        let mut head = std::pin::pin!(head_rx.wait_for(|h| *h >= min));
+        if !matches!(filter, Filter::Stream(_)) {
+            let _ = head.await;
+            return;
+        }
+        let mut streams = std::pin::pin!(streams_rx.changed());
+        poll_fn(|cx| {
+            if head.as_mut().poll(cx).is_ready() || streams.as_mut().poll(cx).is_ready() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
     }
 
     /// One catch-up step: reads the next batch below `upto` into the
@@ -167,7 +211,7 @@ impl Subscription {
         if self.cursor < floor {
             match self.filter {
                 // Like `read_tag`: what survives, from the floor on.
-                Filter::Tag(_) => self.cursor = floor,
+                Filter::Tag(_) | Filter::Stream(_) => self.cursor = floor,
                 Filter::All => {
                     self.ended = true;
                     return Err(crate::Error::BelowFloor {
@@ -176,6 +220,12 @@ impl Subscription {
                     });
                 }
             }
+        }
+        if let Filter::Stream(def) = &self.filter
+            && !self.db.inner.stream_alive(def.id)
+        {
+            self.ended = true;
+            return Err(crate::Error::NoStream(def.name.clone()));
         }
         let head = self.db.head();
         if head < self.head_seen && self.cursor > head {
@@ -205,6 +255,10 @@ impl Subscription {
             Filter::Tag(tag) => self
                 .db
                 .tag_page(tag, self.cursor, self.batch, max_bytes, bound)?,
+            Filter::Stream(def) => {
+                self.db
+                    .stream_page(def, self.cursor, self.batch, max_bytes, bound)?
+            }
         };
         if let Some(last) = page.events.last() {
             self.cursor = last.position + 1;
@@ -270,10 +324,11 @@ impl std::fmt::Debug for Subscription {
             .field("position", &self.position())
             .field("buffered", &self.buffer.len())
             .field(
-                "tag",
+                "filter",
                 &match &self.filter {
-                    Filter::All => None,
-                    Filter::Tag(t) => Some(t),
+                    Filter::All => "all".to_string(),
+                    Filter::Tag(t) => format!("tag {t:?}"),
+                    Filter::Stream(s) => format!("stream {:?}", s.name),
                 },
             )
             .finish()

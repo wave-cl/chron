@@ -18,6 +18,7 @@ mod replicate;
 mod retention;
 mod review;
 mod rotation;
+mod streams;
 mod subscribe;
 mod transactions;
 mod truncate;

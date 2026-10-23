@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
@@ -21,6 +21,7 @@ use crate::recover;
 use crate::replicate::{self, Chunk};
 use crate::retain::{self, Retained};
 use crate::segment::{self, SegmentWriter};
+use crate::stream::{self, StreamDef, StreamInfo};
 use crate::subscribe::Subscription;
 use crate::truncate::{self, Truncated};
 use crate::txn::{self, Committed, Mode, Transaction};
@@ -114,9 +115,16 @@ pub(crate) struct Inner {
     /// is flushing (a read of a file under `F_FULLFSYNC` waits for the
     /// flush). Filled under the writer lock, cleared by a truncation.
     pub(crate) recent: Mutex<Recent>,
+    /// Every stream definition, ready or not: what the commit path indexes
+    /// for. Replaced under the writer lock (`stream::begin`, `delete`),
+    /// read once per batch.
+    pub(crate) streams: RwLock<Arc<Vec<Arc<StreamDef>>>>,
     head_watch: (Mutex<u64>, Condvar),
     #[cfg(feature = "tokio")]
     pub(crate) head_tx: tokio::sync::watch::Sender<u64>,
+    /// Bumped when a stream is begun or deleted: wakes stream subscribers.
+    #[cfg(feature = "tokio")]
+    pub(crate) streams_tx: tokio::sync::watch::Sender<u64>,
     files: Mutex<FileCache>,
     _lock: Lock,
 }
@@ -265,6 +273,7 @@ impl Db {
         }
         let db_id = index.ensure_db_id()?;
         let epoch = index.epoch()?;
+        let streams = stream::load(&index)?;
 
         let opts_max_open = opts.max_open_segments.max(1);
         // The chunk ring: four batches' worth, a mebibyte at least.
@@ -288,9 +297,12 @@ impl Db {
                 commits: Mutex::new(VecDeque::new()),
                 counters: Counters::default(),
                 recent: Mutex::new(Recent::new(recent_cap)),
+                streams: RwLock::new(Arc::new(streams)),
                 head_watch: (Mutex::new(head), Condvar::new()),
                 #[cfg(feature = "tokio")]
                 head_tx: tokio::sync::watch::channel(head).0,
+                #[cfg(feature = "tokio")]
+                streams_tx: tokio::sync::watch::channel(0).0,
                 files: Mutex::new(FileCache::new(opts_max_open)),
                 _lock: lock,
             }),
@@ -409,6 +421,15 @@ impl Db {
         self.inner.index.drop_cursor_table()
     }
 
+    /// Removes the stream tables: the state of an index written before
+    /// streams existed. For tests of the upgrade path.
+    #[doc(hidden)]
+    pub fn debug_drop_stream_tables(&self) -> Result<()> {
+        self.inner.index.drop_stream_tables()?;
+        self.inner.replace_streams(|v| v.clear());
+        Ok(())
+    }
+
     /// Head, floor, and what the segment directory holds.
     pub fn info(&self) -> Result<Info> {
         let dir = self.inner.layout.segments_dir();
@@ -427,6 +448,7 @@ impl Db {
             db_id: self.id(),
             epoch: self.epoch(),
             fsync: self.inner.opts.fsync,
+            streams: self.inner.streams().len(),
         })
     }
 
@@ -772,6 +794,34 @@ impl Db {
         })
     }
 
+    /// A forward page of one stream, bounded like [`Db::all_page`].
+    pub(crate) fn stream_page(
+        &self,
+        def: &StreamDef,
+        from: u64,
+        limit: usize,
+        max_bytes: usize,
+        upto: u64,
+    ) -> Result<Page> {
+        let limit = all_if_zero(limit);
+        let txn = self.inner.index.begin_read()?;
+        let positions = Index::stream_positions(&txn, def.id, from, limit, upto)?;
+        let short = positions.len() < limit;
+        let locations = Index::locate_many(&txn, &positions)?;
+        let mut items: Vec<(u64, Option<Location>)> =
+            positions.into_iter().zip(locations).collect();
+        let cut = cut_by_bytes(
+            &mut items,
+            |(_, l)| l.as_ref().map_or(0, |l| u64::from(l.frame_len)),
+            max_bytes,
+        );
+        let (positions, locations): (Vec<u64>, Vec<Option<Location>>) = items.into_iter().unzip();
+        Ok(Page {
+            events: self.assemble_stream_located(def, positions, locations)?,
+            exhausted: short && !cut,
+        })
+    }
+
     /// `read_all` with a hook run between the head check and the read
     /// snapshot; the floor is read inside that snapshot, so a retention
     /// landing in the hook is seen. For tests of that ordering.
@@ -907,6 +957,164 @@ impl Db {
         Ok(out)
     }
 
+    fn assemble_stream_located(
+        &self,
+        def: &StreamDef,
+        positions: Vec<u64>,
+        locations: Vec<Option<Location>>,
+    ) -> Result<Vec<Event>> {
+        let mut out = Vec::with_capacity(positions.len());
+        for (position, loc) in positions.into_iter().zip(locations) {
+            let ev = self.read_located(position, loc)?;
+            if !def.member(&ev.tags) {
+                return Err(self.mismatch(
+                    position,
+                    "stream index lists a record that carries none of the stream's tags",
+                ));
+            }
+            out.push(ev);
+        }
+        Ok(out)
+    }
+
+    /// The members of the stream `name` from global position `from`, at
+    /// most `limit`, in global order; from the floor when `from` is below
+    /// it. [`Error::NoStream`] without one, [`Error::StreamNotReady`]
+    /// while its fill runs.
+    pub fn read_stream(&self, name: &str, from: u64, limit: usize) -> Result<Vec<Event>> {
+        self.read_stream_bounded_upto(name, from, limit, usize::MAX, u64::MAX)
+    }
+
+    /// [`read_stream`](Db::read_stream) cut at `max_bytes` like
+    /// [`read_all_bounded`](Db::read_all_bounded).
+    pub fn read_stream_bounded(
+        &self,
+        name: &str,
+        from: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Event>> {
+        self.read_stream_bounded_upto(name, from, limit, max_bytes, u64::MAX)
+    }
+
+    /// [`read_stream_bounded`](Db::read_stream_bounded) over the events
+    /// at positions below `upto` only.
+    pub fn read_stream_bounded_upto(
+        &self,
+        name: &str,
+        from: u64,
+        limit: usize,
+        max_bytes: usize,
+        upto: u64,
+    ) -> Result<Vec<Event>> {
+        let def = self.inner.resolve_stream(name)?;
+        Ok(self.stream_page(&def, from, limit, max_bytes, upto)?.events)
+    }
+
+    /// Members of the stream at positions `<= from`, newest first, at
+    /// most `limit`. `u64::MAX` means "from the end".
+    pub fn read_stream_backward(&self, name: &str, from: u64, limit: usize) -> Result<Vec<Event>> {
+        self.read_stream_backward_upto(name, from, limit, u64::MAX)
+    }
+
+    /// [`read_stream_backward`](Db::read_stream_backward) over the events
+    /// at positions below `upto` only.
+    pub fn read_stream_backward_upto(
+        &self,
+        name: &str,
+        from: u64,
+        limit: usize,
+        upto: u64,
+    ) -> Result<Vec<Event>> {
+        let def = self.inner.resolve_stream(name)?;
+        let limit = all_if_zero(limit);
+        let txn = self.inner.index.begin_read()?;
+        let positions = Index::stream_positions_rev(&txn, def.id, from, limit, upto)?;
+        let locations = Index::locate_many(&txn, &positions)?;
+        self.assemble_stream_located(&def, positions, locations)
+    }
+
+    /// The stream named `name`, if one is defined (ready or not).
+    pub fn stream(&self, name: &str) -> Result<Option<StreamInfo>> {
+        Ok(self
+            .inner
+            .streams()
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| d.info()))
+    }
+
+    /// Every stream, by name, ready or not.
+    pub fn streams(&self) -> Result<Vec<StreamInfo>> {
+        let mut out: Vec<StreamInfo> = self.inner.streams().iter().map(|d| d.info()).collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// Defines the stream `name` over `tags` and indexes its members: every
+    /// event, committed before or after, that carries any of the tags. The
+    /// definition is written first (every record landing from then on is
+    /// indexed for it), then the earlier positions are filled a chunk at a
+    /// time without holding up commits, backups or chunk cuts; the call
+    /// returns once the stream is ready. Tags are sorted and deduplicated;
+    /// at most [`MAX_STREAM_TAGS`](crate::MAX_STREAM_TAGS) of them, the
+    /// name at most [`MAX_STREAM_NAME_BYTES`](crate::MAX_STREAM_NAME_BYTES)
+    /// bytes ([`Error::InvalidStream`]). An existing name is
+    /// [`Error::StreamExists`]. A creation interrupted by a crash leaves
+    /// nothing behind.
+    pub fn create_stream<T: Into<Bytes>>(
+        &self,
+        name: &str,
+        tags: impl IntoIterator<Item = T>,
+    ) -> Result<StreamInfo> {
+        let def = stream::begin(
+            &self.inner,
+            name,
+            tags.into_iter().map(Into::into).collect(),
+        )?;
+        if !stream::fill(&self.inner, &def)? {
+            return Err(Error::NoStream(name.to_string()));
+        }
+        Ok(def.info())
+    }
+
+    /// The first half of [`create_stream`](Db::create_stream): the
+    /// definition, durable and in force for new commits, not yet filled.
+    #[doc(hidden)]
+    pub fn begin_stream<T: Into<Bytes>>(
+        &self,
+        name: &str,
+        tags: impl IntoIterator<Item = T>,
+    ) -> Result<StreamInfo> {
+        Ok(stream::begin(
+            &self.inner,
+            name,
+            tags.into_iter().map(Into::into).collect(),
+        )?
+        .info())
+    }
+
+    /// The second half of [`create_stream`](Db::create_stream): fills a
+    /// begun stream and marks it ready. `Ok(false)` if it was deleted
+    /// meanwhile; [`Error::NoStream`] if it was never begun.
+    #[doc(hidden)]
+    pub fn fill_stream(&self, name: &str) -> Result<bool> {
+        let def = self
+            .inner
+            .streams()
+            .iter()
+            .find(|d| d.name == name)
+            .cloned()
+            .ok_or_else(|| Error::NoStream(name.to_string()))?;
+        stream::fill(&self.inner, &def)
+    }
+
+    /// Removes the stream and its index entries; whether it existed. A
+    /// subscription on it ends with [`Error::NoStream`].
+    pub fn delete_stream(&self, name: &str) -> Result<bool> {
+        stream::delete(&self.inner, name)
+    }
+
     /// Committed events in global order from `from`, then new ones as they
     /// are committed. `from` may be past the head: the subscription then
     /// waits for that position.
@@ -918,6 +1126,14 @@ impl Db {
     /// ones as they are committed.
     pub fn subscribe_tag(&self, tag: impl AsRef<[u8]>, from: u64) -> Subscription {
         Subscription::tag(self.clone(), Bytes::copy_from_slice(tag.as_ref()), from)
+    }
+
+    /// The members of the stream `name`, in global order from `from`, then
+    /// new ones as they are committed. [`Error::NoStream`] without one,
+    /// [`Error::StreamNotReady`] while its fill runs.
+    pub fn subscribe_stream(&self, name: &str, from: u64) -> Result<Subscription> {
+        let def = self.inner.resolve_stream(name)?;
+        Ok(Subscription::stream(self.clone(), def, from))
     }
 
     /// Every event from global position `from` to the head, a page at a
@@ -940,6 +1156,13 @@ impl Db {
             Paged::Tag(Bytes::copy_from_slice(tag.as_ref())),
             from,
         )
+    }
+
+    /// The members of the stream `name` from `from` to the head, a page at
+    /// a time.
+    pub fn iter_stream(&self, name: &str, from: u64) -> Result<EventIter> {
+        let def = self.inner.resolve_stream(name)?;
+        Ok(EventIter::new(self.clone(), Paged::Stream(def), from))
     }
 
     /// Starts a transaction. Nothing happens until `commit`.
@@ -1226,6 +1449,8 @@ pub struct Info {
     pub epoch: u64,
     /// Whether commits sync to disk.
     pub fsync: Fsync,
+    /// Streams defined, ready or not.
+    pub streams: usize,
 }
 
 /// A read, usize::MAX when the caller asked for everything with 0.
@@ -1267,6 +1492,7 @@ enum Paged {
     All,
     Aggregate(Uuid),
     Tag(Bytes),
+    Stream(Arc<StreamDef>),
 }
 
 /// A finite, paged walk over committed events; created by
@@ -1304,6 +1530,10 @@ impl EventIter {
             Paged::Tag(tag) => self
                 .db
                 .tag_page(tag, self.cursor, PAGE, max_bytes, u64::MAX)?,
+            Paged::Stream(def) => {
+                self.db
+                    .stream_page(def, self.cursor, PAGE, max_bytes, u64::MAX)?
+            }
         };
         if page.exhausted {
             self.done = true;
@@ -1400,6 +1630,48 @@ impl Inner {
             inner: self,
             w: Some(w),
         })
+    }
+
+    /// The stream definitions in force, ready or not.
+    pub(crate) fn streams(&self) -> Arc<Vec<Arc<StreamDef>>> {
+        self.streams
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Replaces the definitions with `f`'s edit of them. Called under the
+    /// writer lock, so a batch sees either the old set or the new one.
+    pub(crate) fn replace_streams(&self, f: impl FnOnce(&mut Vec<Arc<StreamDef>>)) {
+        let mut guard = self.streams.write().unwrap_or_else(|p| p.into_inner());
+        let mut v = (**guard).clone();
+        f(&mut v);
+        *guard = Arc::new(v);
+    }
+
+    /// Wakes stream subscribers after a definition change.
+    pub(crate) fn notify_streams(&self) {
+        #[cfg(feature = "tokio")]
+        self.streams_tx.send_modify(|g| *g += 1);
+    }
+
+    /// Whether a stream with this id is still defined.
+    pub(crate) fn stream_alive(&self, id: u32) -> bool {
+        self.streams().iter().any(|d| d.id == id)
+    }
+
+    /// The ready stream `name`, for a read.
+    pub(crate) fn resolve_stream(&self, name: &str) -> Result<Arc<StreamDef>> {
+        let def = self
+            .streams()
+            .iter()
+            .find(|d| d.name == name)
+            .cloned()
+            .ok_or_else(|| Error::NoStream(name.to_string()))?;
+        if !def.is_ready() {
+            return Err(Error::StreamNotReady(name.to_string()));
+        }
+        Ok(def)
     }
 
     /// A durable index write with the segment bytes synced first, so the

@@ -16,7 +16,7 @@ use crate::event::{
     self, Event, FLAG_COMMIT_ID, FLAG_FIRST_IN_TXN, FLAG_FREE, FLAG_LAST_IN_TXN, MAX_TAG_BYTES,
     MAX_TAGS_PER_EVENT, NewEvent,
 };
-use crate::index::{AGG_INDEX, AGG_LEN, HEAD_KEY, Location, META, POS, TAG, TXN_ID};
+use crate::index::{AGG_INDEX, AGG_LEN, HEAD_KEY, Location, META, POS, STREAM_POS, TAG, TXN_ID};
 use crate::options::Fsync;
 use crate::segment::{self, FRAME_LEN, SegmentWriter};
 
@@ -340,12 +340,21 @@ fn land_index(
             std::io::Error::other("injected failure before the index commit"),
         ));
     }
+    // The stream definitions as of this batch, once: a stream begun
+    // under the writer lock before this batch took it sees every record
+    // from here on.
+    let streams = inner.streams();
     {
         let mut pos = wtxn.open_table(POS)?;
         let mut agg_index = wtxn.open_table(AGG_INDEX)?;
         let mut tag = wtxn.open_table(TAG)?;
         let mut agg_len = wtxn.open_table(AGG_LEN)?;
         let mut meta = wtxn.open_table(META)?;
+        let mut stream_pos = if streams.is_empty() {
+            None
+        } else {
+            Some(wtxn.open_table(STREAM_POS)?)
+        };
         for e in entries {
             pos.insert(e.position, (base, at + e.rel_offset, e.frame_len))?;
             if let Some(id) = &e.aggregate {
@@ -353,6 +362,11 @@ fn land_index(
             }
             for t in &e.tags {
                 tag.insert((t.as_ref(), e.position), ())?;
+            }
+            if let Some(sp) = stream_pos.as_mut() {
+                for s in streams.iter().filter(|s| s.member(&e.tags)) {
+                    sp.insert((s.id, e.position), ())?;
+                }
             }
         }
         for (id, len) in lens {

@@ -103,6 +103,22 @@ pub enum Error {
     #[error("refused: {0}")]
     Refused(String),
 
+    /// No stream of that name (see [`Db::create_stream`](crate::Db::create_stream)).
+    #[error("no stream {0:?}")]
+    NoStream(String),
+
+    /// A stream of that name exists already.
+    #[error("stream {0:?} exists already")]
+    StreamExists(String),
+
+    /// The stream's fill has not finished: it cannot be read yet.
+    #[error("stream {0:?} is not ready: its fill has not finished")]
+    StreamNotReady(String),
+
+    /// A stream's name or tag set is unusable.
+    #[error("invalid stream: {0}")]
+    InvalidStream(String),
+
     /// A commit id seen before, on a transaction of another shape (other
     /// aggregates, or other event counts per append). A resend of the
     /// same transaction is answered with its first landing instead.
